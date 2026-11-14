@@ -17,8 +17,12 @@ pub use step30::{
 
 mod step31;
 pub use step31::{
-    GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, GetrandomFlags, Step31GlibcCall,
-    decode_getrandom_flags,
+    GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, GetrandomFlags, IOVEC_BYTES, IoVec,
+    KERNEL_TERMIOS_BYTES, MAX_RW_COUNT, RLIM_NLIMITS, RLIM64_INFINITY, RLIMIT64_BYTES, Rlimit64,
+    RlimitResource, Step31GlibcCall, TCGETS, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ,
+    UIO_MAXIOV, UTSNAME_BYTES, UTSNAME_FIELD_BYTES, WINSIZE_BYTES, WinSize, decode_getrandom_flags,
+    decode_iovcnt, decode_rlimit_resource, default_rlimit64, encode_default_serial_termios,
+    encode_linux_aarch64_utsname, validate_iovec_slice,
 };
 
 /// Linux exposes at most six direct syscall argument registers on the supported 64-bit ABIs.
@@ -241,6 +245,7 @@ impl Errno {
     pub const EINVAL: Self = Self(22);
     pub const ENFILE: Self = Self(23);
     pub const EMFILE: Self = Self(24);
+    pub const ENOTTY: Self = Self(25);
     pub const ENOSPC: Self = Self(28);
     pub const ESPIPE: Self = Self(29);
     pub const EROFS: Self = Self(30);

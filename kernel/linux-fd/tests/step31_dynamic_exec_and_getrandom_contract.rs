@@ -36,9 +36,14 @@ fn step31_glibc_syscalls_route_getrandom_through_csprng_and_rseq_to_enosys() {
             && STEP31_RUNTIME.contains("decode_getrandom_flags")
             && STEP31_RUNTIME.contains("fill_getrandom")
             && STEP31_RUNTIME.contains("copy_to_user")
+            && STEP31_RUNTIME.contains("handle_uname")
+            && STEP31_RUNTIME.contains("handle_prlimit64")
+            && STEP31_RUNTIME.contains("handle_ioctl")
+            && STEP31_RUNTIME.contains("handle_writev")
+            && STEP31_RUNTIME.contains("handle_readv")
             && STEP31_RUNTIME.contains(
-                "Step31GlibcCall::Rseq { .. } => Ok(Some(SyscallReturn::error(Errno::ENOSYS)))"
+                "Step31GlibcCall::Rseq { .. } => return Ok(Some(SyscallReturn::error(Errno::ENOSYS)))"
             ),
-        "Step-31 runtime must serve getrandom via the CSPRNG + audited usercopy and reject rseq with -ENOSYS"
+        "Step-31 runtime must serve getrandom/uname/prlimit64/ioctl/readv/writev via audited owners and reject rseq with -ENOSYS"
     );
 }
