@@ -779,6 +779,9 @@ dependencies = [
 [[package]]
 name = "kernal-linux-x86-64-abi"
 version = "0.1.0"
+dependencies = [
+ "kernal-linux-abi",
+]
 
 [[package]]
 name = "kernal-load-plan"

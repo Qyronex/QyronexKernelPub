@@ -74,6 +74,72 @@ pub(super) fn handle(call: MinimumRuntimeCall) -> Result<Result<u64, VmError>, (
     Ok(vm_result)
 }
 
+/// Executes one Step-31 dynamic linker `mmap(2)` transaction (`MAP_PRIVATE`, `MAP_FIXED`,
+/// `MAP_DENYWRITE`, `PROT_NONE`, `PROT_EXEC`, and file-backed segment population) through the
+/// exact persistent owners.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn handle_step31_dynamic_mmap(
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+    backing: kernal_linux_vm::MmapFileBacking<'_>,
+) -> Result<Result<u64, VmError>, ()> {
+    // SAFETY: same synchronous lower-EL trap owner window as `handle`.
+    let memory_result = unsafe {
+        RuntimeTablePool::with_live(|page_tables| {
+            memory::with_live_frame_pool(|frame_pool| {
+                runtime::with_linux_runtime(|linux| {
+                    // SAFETY: outer live-table borrow is the canonical hierarchy-mutation owner.
+                    unsafe {
+                        kmap::with_kmap(|zeroer| {
+                            let (frames, reserved) = frame_pool.split();
+                            let (_vm, process, objects, space) = linux.minimum_vm_parts();
+                            // SAFETY: exact Process/CSpace, bound address space, live table cursor,
+                            // reservation set, frame allocator and persistent KMap zeroer are held.
+                            unsafe {
+                                kernal_linux_vm_aarch64::handle_step31_dynamic_mmap::<
+                                    { runtime::STEP15_RUNTIME_VM_TX_PAGES },
+                                    _,
+                                    _,
+                                    _,
+                                    _,
+                                    _,
+                                    _,
+                                    _,
+                                >(
+                                    &*process,
+                                    &*objects,
+                                    space,
+                                    page_tables,
+                                    reserved,
+                                    frames,
+                                    zeroer,
+                                    address,
+                                    length,
+                                    protection,
+                                    flags,
+                                    fd,
+                                    offset,
+                                    backing,
+                                )
+                            }
+                        })
+                    }
+                })
+            })
+        })
+    }
+    .map_err(|_| ())?;
+
+    let runtime_result = memory_result.map_err(|_| ())?;
+    let kmap_result = runtime_result.map_err(|_| ())?;
+    let vm_result = kmap_result.map_err(|_| ())?;
+    Ok(vm_result)
+}
+
 /// Runs the canonical private-fork transaction for one legacy AArch64 `clone(SIGCHLD, 0, 0, 0, 0)`.
 ///
 /// This is orchestration only. Process/AddressSpace snapshot ownership remains in `step30_fork`,

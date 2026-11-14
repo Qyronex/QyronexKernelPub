@@ -165,6 +165,60 @@ pub const fn encode_linux_aarch64_utsname() -> [u8; UTSNAME_BYTES] {
     buf
 }
 
+/// Encodes the deterministic 390-byte `struct new_utsname` for `uname(2)` on x86_64.
+pub const fn encode_linux_x86_64_utsname() -> [u8; UTSNAME_BYTES] {
+    let mut buf = [0u8; UTSNAME_BYTES];
+    write_uts_field(&mut buf, 0, b"Linux");
+    write_uts_field(&mut buf, 1, b"qyronex");
+    write_uts_field(&mut buf, 2, b"6.12.0-qyronex");
+    write_uts_field(&mut buf, 3, b"#1 SMP PREEMPT Qyronex");
+    write_uts_field(&mut buf, 4, b"x86_64");
+    write_uts_field(&mut buf, 5, b"(none)");
+    buf
+}
+
+/// Linux x86_64 `arch_prctl(2)` subfunction codes (`<asm/prctl.h>`).
+pub const ARCH_SET_GS: u32 = 0x1001;
+pub const ARCH_SET_FS: u32 = 0x1002;
+pub const ARCH_GET_FS: u32 = 0x1003;
+pub const ARCH_GET_GS: u32 = 0x1004;
+
+/// 48-bit canonical lower-half user address ceiling on x86_64 (`0x0000_8000_0000_0000`).
+pub const X86_64_CANONICAL_USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// Validated x86_64 `arch_prctl(2)` TLS/GS base operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchPrctlOp {
+    SetGs(u64),
+    SetFs(u64),
+    GetFs(u64),
+    GetGs(u64),
+}
+
+/// Decodes and validates an x86_64 `arch_prctl(int code, unsigned long addr)` request.
+///
+/// `ARCH_SET_FS` and `ARCH_SET_GS` reject non-canonical or upper-half addresses (`>= 1 << 47`)
+/// with `EPERM` per Linux x86_64 `do_arch_prctl_64`.
+pub const fn decode_arch_prctl(raw_code: u64, addr: u64) -> Result<ArchPrctlOp, Errno> {
+    match linux_unsigned_int(raw_code) {
+        ARCH_SET_GS => {
+            if addr >= X86_64_CANONICAL_USER_LIMIT {
+                return Err(Errno::EPERM);
+            }
+            Ok(ArchPrctlOp::SetGs(addr))
+        }
+        ARCH_SET_FS => {
+            if addr >= X86_64_CANONICAL_USER_LIMIT {
+                return Err(Errno::EPERM);
+            }
+            Ok(ArchPrctlOp::SetFs(addr))
+        }
+        ARCH_GET_FS => Ok(ArchPrctlOp::GetFs(addr)),
+        ARCH_GET_GS => Ok(ArchPrctlOp::GetGs(addr)),
+        _ => Err(Errno::EINVAL),
+    }
+}
+
 /// Linux `prlimit64(2)` resource selector (`0..16`).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -448,6 +502,19 @@ mod tests {
         assert_eq!(&uts[65..73], b"qyronex\0");
         assert_eq!(&uts[130..145], b"6.12.0-qyronex\0");
         assert_eq!(&uts[260..268], b"aarch64\0");
+
+        let x86_uts = encode_linux_x86_64_utsname();
+        assert_eq!(&x86_uts[260..267], b"x86_64\0");
+
+        assert_eq!(
+            decode_arch_prctl(ARCH_SET_FS as u64, 0x0000_7fff_ffff_e000),
+            Ok(ArchPrctlOp::SetFs(0x0000_7fff_ffff_e000))
+        );
+        assert_eq!(
+            decode_arch_prctl(ARCH_SET_FS as u64, X86_64_CANONICAL_USER_LIMIT),
+            Err(Errno::EPERM)
+        );
+        assert_eq!(decode_arch_prctl(0x9999, 0), Err(Errno::EINVAL));
 
         assert_eq!(decode_rlimit_resource(3), Ok(RlimitResource::Stack));
         assert_eq!(decode_rlimit_resource(7), Ok(RlimitResource::Nofile));

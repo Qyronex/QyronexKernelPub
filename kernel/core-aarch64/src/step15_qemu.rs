@@ -825,15 +825,26 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     }
 
     if request.number == 222 {
-        let call = MinimumRuntimeCall::Mmap {
-            address: request.args[0],
-            length: request.args[1],
-            protection: request.args[2],
-            flags: request.args[3],
-            fd: request.args[4],
-            offset: request.args[5],
-        };
-        match live_vm::handle(call) {
+        let vm_outcome = step31_runtime::try_handle_dynamic_mmap(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+            request.args[5],
+        )
+        .unwrap_or_else(|| {
+            let call = MinimumRuntimeCall::Mmap {
+                address: request.args[0],
+                length: request.args[1],
+                protection: request.args[2],
+                flags: request.args[3],
+                fd: request.args[4],
+                offset: request.args[5],
+            };
+            live_vm::handle(call)
+        });
+        match vm_outcome {
             Ok(Ok(address)) => {
                 frame.x[0] = address;
                 if let Some(serial) = step15_svc_serial() {

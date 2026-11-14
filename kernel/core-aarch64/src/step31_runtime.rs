@@ -816,3 +816,137 @@ fn map_usercopy_error(error: UsercopyError) -> Result<Errno, ()> {
         UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => Err(()),
     }
 }
+
+/// Routes Step-31 dynamic linker `mmap(2)` requests (`MAP_FIXED`, `MAP_DENYWRITE`, `PROT_NONE`,
+/// `PROT_EXEC`, or file-backed `MAP_PRIVATE`) through the Step-31 VM transaction owner while
+/// leaving standard anonymous `MAP_PRIVATE | MAP_ANONYMOUS` (`PROT_READ` / `PROT_READ | PROT_WRITE`)
+/// requests to the baseline `live_vm::handle` path.
+pub(super) fn try_handle_dynamic_mmap(
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+) -> Option<Result<Result<u64, kernal_linux_vm::Error>, ()>> {
+    use kernal_linux_vm::{
+        MAP_ANONYMOUS, MAP_PRIVATE, MmapFileBacking, PROT_READ, PROT_WRITE,
+        validate_step31_mmap_spec,
+    };
+
+    if flags == (MAP_PRIVATE | MAP_ANONYMOUS)
+        && (protection == PROT_READ || protection == (PROT_READ | PROT_WRITE))
+    {
+        return None;
+    }
+
+    let Ok(spec) = validate_step31_mmap_spec(protection, flags, fd, offset) else {
+        return None;
+    };
+
+    if spec.anonymous {
+        return Some(super::live_vm::handle_step31_dynamic_mmap(
+            address,
+            length,
+            protection,
+            flags,
+            fd,
+            offset,
+            MmapFileBacking::Anonymous,
+        ));
+    }
+
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    {
+        Some(Ok(Err(kernal_linux_vm::Error::Linux(Errno::EBADF))))
+    }
+
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        Some(handle_file_backed_mmap(
+            address, length, protection, flags, fd, offset,
+        ))
+    }
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn handle_file_backed_mmap(
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    raw_fd: u64,
+    offset: u64,
+) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
+    use kernal_linux_abi::linux_signed_int;
+    use kernal_linux_fd::O_ACCMODE;
+    use kernal_linux_fd::O_WRONLY;
+    use kernal_linux_vfs::{InitramfsRoot, NodeKind, OverlayNodeHandle};
+    use kernal_linux_vm::{Error as VmError, MmapFileBacking};
+
+    let process = match current_process_id() {
+        Ok(id) => id,
+        Err(_) => return Err(()),
+    };
+    let fd = linux_signed_int(raw_fd);
+    let resolved = super::step29_runtime::with_process(process, |runtime| {
+        let (initrd, root_id) = {
+            let (initrd, root_id, _fds) = runtime.parts();
+            (initrd, root_id)
+        };
+        let status = match runtime.fds().status_flags(fd) {
+            Ok(flags) => flags,
+            Err(FdError::BadFd) => return Ok(Err(VmError::Linux(Errno::EBADF))),
+            Err(_) => return Err(()),
+        };
+        if status & O_ACCMODE == O_WRONLY {
+            return Ok(Err(VmError::Linux(Errno::EACCES)));
+        }
+        if let Ok(handle) = runtime.fds().retained_readonly(fd) {
+            return match handle {
+                OverlayNodeHandle::Immutable {
+                    root,
+                    kind: NodeKind::Regular,
+                    file: Some(file),
+                    ..
+                } if root == root_id => Ok(Ok((initrd, root_id, file))),
+                _ => Ok(Err(VmError::Linux(Errno::EACCES))),
+            };
+        }
+        let (_initrd, _root_id, fds) = runtime.parts();
+        match fds.prepare_read(fd, 0) {
+            Ok(plan) => Ok(Ok((initrd, root_id, plan.file()))),
+            Err(FdError::BadFd) => Ok(Err(VmError::Linux(Errno::EBADF))),
+            Err(FdError::NotFile) => Ok(Err(VmError::Linux(Errno::EACCES))),
+            Err(_) => Err(()),
+        }
+    })
+    .map_err(|_| ())??;
+
+    let (initrd, root_id, file) = match resolved {
+        Ok(parts) => parts,
+        Err(vm_err) => return Ok(Err(vm_err)),
+    };
+    if file.root_id() != root_id {
+        return Err(());
+    }
+    initrd
+        .with_bytes(|archive_bytes| {
+            let archive = kernal_cpio::Archive::parse(archive_bytes).map_err(|_| ())?;
+            let root = InitramfsRoot::new(archive, root_id);
+            let file_bytes = root.read_at(file, 0, usize::MAX).map_err(|_| ())?;
+            super::live_vm::handle_step31_dynamic_mmap(
+                address,
+                length,
+                protection,
+                flags,
+                raw_fd,
+                offset,
+                MmapFileBacking::FileSlice {
+                    bytes: file_bytes,
+                    file_offset: offset,
+                },
+            )
+        })
+        .map_err(|_| ())?
+}

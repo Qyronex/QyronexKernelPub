@@ -6,7 +6,10 @@ use kernal_address_space_aarch64::Error as AddressSpaceError;
 use kernal_frame_allocator::{Error as FrameError, ExtentAllocator, FrameRange};
 use kernal_kmap_aarch64::{Error as KmapError, KmapController};
 use kernal_linux_abi::MinimumRuntimeCall;
-use kernal_linux_vm::{BackendFailure, Error, LinuxVmRuntime, PageBackend};
+use kernal_linux_vm::{
+    BackendFailure, DynamicPageBackend, Error, LinuxVmRuntime, MmapFileBacking, PageBackend,
+    mmap_step31_dynamic,
+};
 use kernal_memory::{PhysFrame, ReservationSet};
 use kernal_object::ObjectTable;
 use kernal_page_table_aarch64::Backend;
@@ -45,6 +48,23 @@ pub trait AnonymousPageZeroer<B: Backend> {
         backend: &mut B,
         physical_address: u64,
     ) -> Result<(), AnonymousPageZeroFailure>;
+
+    /// Overwrites one still-unexposed physical frame with an exact 4-KiB page image through the
+    /// supplied canonical backend before user exposure.
+    ///
+    /// # Safety
+    /// Same global hierarchy-mutation authority contract as [`Self::zero_page`].
+    unsafe fn write_page(
+        &mut self,
+        backend: &mut B,
+        physical_address: u64,
+        bytes: &[u8; PAGE_SIZE as usize],
+    ) -> Result<(), AnonymousPageZeroFailure> {
+        let _ = (backend, physical_address, bytes);
+        Err(AnonymousPageZeroFailure::ReclaimSafe(
+            BackendFailure::Invariant,
+        ))
+    }
 }
 
 /// The integrated AArch64 KMap controller is the concrete Step-15 anonymous-page zeroing owner.
@@ -61,6 +81,18 @@ impl<B: Backend> AnonymousPageZeroer<B> for KmapController {
         // SAFETY: delegated trait contract is the same global TTBR1 hierarchy-mutation contract
         // required by KmapController::zero_frame for this exact backend.
         unsafe { self.zero_frame(backend, physical_address) }.map_err(classify_kmap_zero_error)
+    }
+
+    unsafe fn write_page(
+        &mut self,
+        backend: &mut B,
+        physical_address: u64,
+        bytes: &[u8; PAGE_SIZE as usize],
+    ) -> Result<(), AnonymousPageZeroFailure> {
+        // SAFETY: delegated trait contract is the same global TTBR1 hierarchy-mutation contract
+        // required by KmapController::write_frame for this exact backend.
+        unsafe { self.write_frame(backend, physical_address, bytes) }
+            .map_err(classify_kmap_zero_error)
     }
 }
 
@@ -301,6 +333,91 @@ impl<
     fn poison(&mut self) {
         self.space.poison();
     }
+}
+
+impl<
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    const EXTENTS: usize,
+    B: Backend,
+    Z: AnonymousPageZeroer<B>,
+> DynamicPageBackend for Aarch64VmBackend<'_, CAPS, OBJECTS, VMAS, RESERVED, EXTENTS, B, Z>
+{
+    fn allocate_initialized_page(
+        &mut self,
+        bytes: &[u8; PAGE_SIZE as usize],
+    ) -> Result<u64, BackendFailure> {
+        let frame = self.frames.allocate_page().map_err(classify_frame_error)?;
+        // SAFETY: construction of this adapter requires one exclusive hierarchy owner window for
+        // this exact `page_tables` backend and keeps that authority live for the adapter lifetime.
+        if let Err(failure) = unsafe { self.zeroer.write_page(self.page_tables, frame, bytes) } {
+            let frames = &mut self.frames;
+            let space = &mut self.space;
+            let error =
+                resolve_zero_failure(failure, || reclaim_frame(frames, frame), || space.poison());
+            return Err(error);
+        }
+        Ok(frame)
+    }
+}
+
+/// Executes one Step-31 dynamic `mmap(2)` transaction (`MAP_PRIVATE`, `MAP_FIXED`,
+/// `MAP_DENYWRITE`, `PROT_NONE`, `PROT_EXEC`, and file-backed private mappings) for the current
+/// process.
+///
+/// # Safety
+/// Same exclusive hierarchy-mutation and quiescence contract as [`handle_current`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn handle_step31_dynamic_mmap<
+    const TX_PAGES: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    const EXTENTS: usize,
+    B: Backend,
+    Z: AnonymousPageZeroer<B>,
+>(
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    page_tables: &mut B,
+    reserved: &ReservationSet<RESERVED>,
+    frames: &mut ExtentAllocator<EXTENTS>,
+    zeroer: &mut Z,
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+    backing: MmapFileBacking<'_>,
+) -> Result<u64, Error> {
+    // SAFETY: delegated caller contract establishes the exclusive hierarchy owner window for the
+    // exact backend/zeroer pair for the full lifetime of the transaction adapter.
+    let mut backend = unsafe {
+        Aarch64VmBackend::new(
+            process,
+            objects,
+            space,
+            page_tables,
+            reserved,
+            frames,
+            zeroer,
+        )
+    };
+    mmap_step31_dynamic::<TX_PAGES, _>(
+        address,
+        length,
+        protection,
+        flags,
+        fd,
+        offset,
+        backing,
+        &mut backend,
+    )
 }
 
 /// Executes one canonical Step-15 VM call for the current process through the existing AArch64

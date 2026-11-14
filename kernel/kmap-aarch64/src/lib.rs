@@ -214,6 +214,99 @@ impl KmapController {
         }
     }
 
+    /// Writes a caller-prepared 4-KiB page image into one physical frame through a temporary
+    /// supervisor-only RW-NX alias, removing and invalidating the alias before returning.
+    ///
+    /// # Safety
+    /// The caller must satisfy the same exclusive active-TTBR1 mutation, local quiescence, and
+    /// non-migration contract as [`Self::zero_frame`].
+    pub unsafe fn write_frame<B: Backend>(
+        &self,
+        backend: &mut B,
+        physical_address: u64,
+        bytes: &[u8; PAGE_SIZE as usize],
+    ) -> Result<(), Error> {
+        #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+        {
+            let _ = (backend, physical_address, bytes);
+            Err(Error::UnsupportedHostArchitecture)
+        }
+
+        #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+        {
+            if self.is_poisoned() {
+                return Err(Error::Poisoned);
+            }
+
+            let request = MappingRequest {
+                physical_address,
+                writable: true,
+                cache: CachePolicy::WriteBack,
+            };
+            kernal_page_table_aarch64::leaf_descriptor(
+                physical_address,
+                request.page_flags(),
+                MemoryType::NormalWriteBack,
+            )?;
+
+            let lease = self.window.claim(request)?;
+            let virtual_address = lease.virtual_address();
+
+            let map_result = match Mapper::new(backend, self.root_table) {
+                Ok(mut mapper) => mapper.map_page_with_type(
+                    virtual_address,
+                    physical_address,
+                    request.page_flags(),
+                    MemoryType::NormalWriteBack,
+                ),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = map_result {
+                if map_failure_requires_poison(error) {
+                    self.poisoned.store(true, Ordering::Release);
+                    drop(lease);
+                    return Err(Error::CleanupFailed);
+                }
+                drop(lease);
+                return Err(Error::PageTable(error));
+            }
+
+            // SAFETY: the caller's hierarchy-mutation contract owns this active TTBR1 root and this
+            // lease exclusively owns the newly published supervisor kmap leaf.
+            unsafe { kernal_page_table_aarch64::invalidate_page_el1(virtual_address) };
+
+            // SAFETY: the leaf above maps exactly one writable Normal-memory physical frame at this
+            // CPU-local supervisor VA. The mapping is NX and inaccessible to EL0.
+            unsafe {
+                copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    virtual_address as *mut u8,
+                    PAGE_SIZE as usize,
+                )
+            };
+
+            let cleanup = match Mapper::new(backend, self.root_table) {
+                Ok(mut mapper) => mapper.unmap_page(virtual_address),
+                Err(error) => Err(error),
+            };
+
+            match cleanup {
+                Ok(unmapped) if unmapped == physical_address => {
+                    // SAFETY: the exact kmap leaf was cleared. This broadcast invalidation completes
+                    // the break-before-reuse boundary and orders the preceding stores.
+                    unsafe { kernal_page_table_aarch64::invalidate_page_el1(virtual_address) };
+                    drop(lease);
+                    Ok(())
+                }
+                Ok(_) | Err(_) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    drop(lease);
+                    Err(Error::CleanupFailed)
+                }
+            }
+        }
+    }
+
     /// Copies exactly one physical 4-KiB frame through two temporary supervisor-only aliases.
     ///
     /// The source alias is read-only and the destination alias is writable. Both aliases are NX,

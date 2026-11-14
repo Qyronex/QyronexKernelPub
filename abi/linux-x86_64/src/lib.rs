@@ -2,6 +2,8 @@
 #![cfg_attr(not(test), no_std)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use kernal_linux_abi::{Step31GlibcCall, SyscallRequest};
+
 /// Initial Linux x86_64 syscall surface. Numeric values follow the stable x86_64 Linux ABI.
 pub mod nr {
     pub const READ: u64 = 0;
@@ -13,6 +15,9 @@ pub mod nr {
     pub const BRK: u64 = 12;
     pub const RT_SIGACTION: u64 = 13;
     pub const RT_SIGPROCMASK: u64 = 14;
+    pub const IOCTL: u64 = 16;
+    pub const READV: u64 = 19;
+    pub const WRITEV: u64 = 20;
     pub const SCHED_YIELD: u64 = 24;
     pub const NANOSLEEP: u64 = 35;
     pub const GETPID: u64 = 39;
@@ -30,6 +35,7 @@ pub mod nr {
     pub const ARCH_PRCTL: u64 = 158;
     pub const GETTID: u64 = 186;
     pub const FUTEX: u64 = 202;
+    pub const SET_TID_ADDRESS: u64 = 218;
     pub const CLOCK_GETTIME: u64 = 228;
     pub const EXIT_GROUP: u64 = 231;
     pub const EPOLL_WAIT: u64 = 232;
@@ -41,13 +47,83 @@ pub mod nr {
     pub const ACCEPT4: u64 = 288;
     pub const DUP3: u64 = 292;
     pub const PIPE2: u64 = 293;
+    pub const PRLIMIT64: u64 = 302;
     pub const GETRANDOM: u64 = 318;
     pub const STATX: u64 = 332;
+    pub const RSEQ: u64 = 334;
     pub const CLONE3: u64 = 435;
     pub const CLOSE_RANGE: u64 = 436;
     pub const OPENAT2: u64 = 437;
     pub const EPOLL_PWAIT2: u64 = 441;
     pub const FUTEX_WAITV: u64 = 449;
+}
+
+/// Step-31 dynamic glibc and coreutil startup syscall numbers on Linux x86_64.
+pub mod step31_nr {
+    pub const IOCTL: u64 = super::nr::IOCTL;
+    pub const READV: u64 = super::nr::READV;
+    pub const WRITEV: u64 = super::nr::WRITEV;
+    pub const UNAME: u64 = super::nr::UNAME;
+    pub const ARCH_PRCTL: u64 = super::nr::ARCH_PRCTL;
+    pub const SET_TID_ADDRESS: u64 = super::nr::SET_TID_ADDRESS;
+    pub const SET_ROBUST_LIST: u64 = super::nr::SET_ROBUST_LIST;
+    pub const PRLIMIT64: u64 = super::nr::PRLIMIT64;
+    pub const GETRANDOM: u64 = super::nr::GETRANDOM;
+    pub const RSEQ: u64 = super::nr::RSEQ;
+}
+
+/// Decoded Step-31 x86_64 dynamic glibc startup syscall (either shared [`Step31GlibcCall`] or
+/// x86_64-specific `arch_prctl(2)` TLS setup).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum X86_64Step31Call {
+    Shared(Step31GlibcCall),
+    ArchPrctl { code: u64, addr: u64 },
+}
+
+/// Classifies an x86_64 [`SyscallRequest`] into the Step-31 dynamic glibc startup surface.
+pub const fn classify_step31_glibc_x86_64(request: SyscallRequest) -> Option<X86_64Step31Call> {
+    match request.number {
+        step31_nr::IOCTL => Some(X86_64Step31Call::Shared(Step31GlibcCall::Ioctl {
+            fd: request.args[0],
+            request: request.args[1],
+            arg: request.args[2],
+        })),
+        step31_nr::READV => Some(X86_64Step31Call::Shared(Step31GlibcCall::Readv {
+            fd: request.args[0],
+            user_iov: request.args[1],
+            iovcnt: request.args[2],
+        })),
+        step31_nr::WRITEV => Some(X86_64Step31Call::Shared(Step31GlibcCall::Writev {
+            fd: request.args[0],
+            user_iov: request.args[1],
+            iovcnt: request.args[2],
+        })),
+        step31_nr::UNAME => Some(X86_64Step31Call::Shared(Step31GlibcCall::Uname {
+            user_utsname: request.args[0],
+        })),
+        step31_nr::PRLIMIT64 => Some(X86_64Step31Call::Shared(Step31GlibcCall::Prlimit64 {
+            pid: request.args[0],
+            resource: request.args[1],
+            user_new_rlim: request.args[2],
+            user_old_rlim: request.args[3],
+        })),
+        step31_nr::GETRANDOM => Some(X86_64Step31Call::Shared(Step31GlibcCall::Getrandom {
+            user_buffer: request.args[0],
+            count: request.args[1],
+            flags: request.args[2],
+        })),
+        step31_nr::RSEQ => Some(X86_64Step31Call::Shared(Step31GlibcCall::Rseq {
+            rseq_abi: request.args[0],
+            rseq_len: request.args[1],
+            flags: request.args[2],
+            sig: request.args[3],
+        })),
+        step31_nr::ARCH_PRCTL => Some(X86_64Step31Call::ArchPrctl {
+            code: request.args[0],
+            addr: request.args[1],
+        }),
+        _ => None,
+    }
 }
 
 pub mod errno {
@@ -178,5 +254,42 @@ mod tests {
     fn wx_requests_are_detectable_before_mapping() {
         assert!(prot_is_wx(prot::READ | prot::WRITE | prot::EXEC));
         assert!(!prot_is_wx(prot::READ | prot::EXEC));
+    }
+
+    #[test]
+    fn step31_x86_64_classifier_routes_dynamic_glibc_and_arch_prctl_calls() {
+        assert_eq!(
+            classify_step31_glibc_x86_64(SyscallRequest::new(
+                step31_nr::ARCH_PRCTL,
+                [arch_prctl::SET_FS, 0x0000_7fff_ffff_e000, 0, 0, 0, 0]
+            )),
+            Some(X86_64Step31Call::ArchPrctl {
+                code: arch_prctl::SET_FS,
+                addr: 0x0000_7fff_ffff_e000,
+            })
+        );
+        assert_eq!(
+            classify_step31_glibc_x86_64(SyscallRequest::new(
+                step31_nr::GETRANDOM,
+                [0x1000, 32, 1, 0, 0, 0]
+            )),
+            Some(X86_64Step31Call::Shared(Step31GlibcCall::Getrandom {
+                user_buffer: 0x1000,
+                count: 32,
+                flags: 1,
+            }))
+        );
+        assert_eq!(
+            classify_step31_glibc_x86_64(SyscallRequest::new(
+                step31_nr::RSEQ,
+                [0x2000, 32, 0, 0x5305_3053, 0, 0]
+            )),
+            Some(X86_64Step31Call::Shared(Step31GlibcCall::Rseq {
+                rseq_abi: 0x2000,
+                rseq_len: 32,
+                flags: 0,
+                sig: 0x5305_3053,
+            }))
+        );
     }
 }

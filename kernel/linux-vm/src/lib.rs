@@ -6,6 +6,13 @@ use kernal_capability::ObjectId;
 use kernal_linux_abi::{Errno, MinimumRuntimeCall};
 use kernal_vm::{Backing, PAGE_SIZE, USER_MAX_EXCLUSIVE, USER_MIN, VmPerms, Vma};
 
+mod step31_mmap;
+pub use step31_mmap::{
+    DynamicPageBackend, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MmapFileBacking, PROT_NONE,
+    STEP31_ALLOWED_MMAP_FLAGS, Step31MmapSpec, mmap_step31_dynamic, mprotect_step31,
+    parse_step31_perms, validate_step31_mmap_spec,
+};
+
 pub const PROT_READ: u64 = 0x1;
 pub const PROT_WRITE: u64 = 0x2;
 pub const PROT_EXEC: u64 = 0x4;
