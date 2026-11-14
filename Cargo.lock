@@ -223,6 +223,7 @@ dependencies = [
  "kernal-linux-abi",
  "kernal-linux-bootstrap",
  "kernal-linux-bootstrap-aarch64",
+ "kernal-linux-cgroup",
  "kernal-linux-clone",
  "kernal-linux-clone-aarch64",
  "kernal-linux-clone-exit-aarch64",
@@ -230,12 +231,15 @@ dependencies = [
  "kernal-linux-clone-trap-aarch64",
  "kernal-linux-credentials",
  "kernal-linux-dev",
+ "kernal-linux-events",
  "kernal-linux-exec",
  "kernal-linux-exit-lifecycle",
  "kernal-linux-fd",
  "kernal-linux-futex-runtime",
  "kernal-linux-futex-trap-aarch64",
  "kernal-linux-identity",
+ "kernal-linux-mounts",
+ "kernal-linux-net",
  "kernal-linux-pipe",
  "kernal-linux-signal",
  "kernal-linux-vfs",
@@ -469,6 +473,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernal-linux-cgroup"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
+]
+
+[[package]]
 name = "kernal-linux-clone"
 version = "0.1.0"
 dependencies = [
@@ -567,6 +579,13 @@ name = "kernal-linux-dev"
 version = "0.1.0"
 dependencies = [
  "kernal-capability",
+ "kernal-linux-abi",
+]
+
+[[package]]
+name = "kernal-linux-events"
+version = "0.1.0"
+dependencies = [
  "kernal-linux-abi",
 ]
 
@@ -701,6 +720,21 @@ dependencies = [
  "kernal-process",
  "kernal-process-aarch64",
  "kernal-scheduler-cpu",
+]
+
+[[package]]
+name = "kernal-linux-mounts"
+version = "0.1.0"
+dependencies = [
+ "kernal-linux-abi",
+]
+
+[[package]]
+name = "kernal-linux-net"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
 ]
 
 [[package]]

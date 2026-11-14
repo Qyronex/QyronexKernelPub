@@ -488,7 +488,13 @@ fn handle_openat_if_proc_or_sys(user_path: u64, flags: u64) -> Result<Option<Sys
         let snap = build_live_snapshot(&state.hostname[..state.hostname_len], state.boot_id_seed);
         let len = match target_fs {
             FilesystemType::Procfs => read_procfs_node(rel, &state.mounts, &snap, &mut node_buf)?,
-            FilesystemType::Sysfs => read_sysfs_node(rel, &snap, &mut node_buf)?,
+            FilesystemType::Sysfs => {
+                if let Some(cg_rel) = rel.strip_prefix(b"fs/cgroup/") {
+                    super::step35_events_cgroup::read_cgroup_control_file(cg_rel, &mut node_buf)?
+                } else {
+                    read_sysfs_node(rel, &snap, &mut node_buf)?
+                }
+            }
             _ => return Err(Errno::ENOENT),
         };
         let Some((slot_idx, slot)) = state.fds.iter_mut().enumerate().find(|(_, e)| !e.live) else {
