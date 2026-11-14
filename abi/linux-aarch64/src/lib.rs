@@ -20,6 +20,9 @@ pub use step30::{
     classify_step30_runtime, decode_sigmask_how, nr as step30_nr, valid_rt_sigset_size,
 };
 
+mod step31;
+pub use step31::{classify_step31_glibc, nr as step31_nr};
+
 mod waitid_siginfo;
 pub use waitid_siginfo::{KERNEL_SIGINFO_BYTES, WaitIdSiginfo};
 

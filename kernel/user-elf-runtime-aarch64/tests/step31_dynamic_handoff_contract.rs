@@ -1,19 +1,24 @@
 use kernal_elf::{Image, Machine};
 use kernal_user_elf::{
-    DEFAULT_DYN_LOAD_BIAS, LoadPolicy, UserLoadPlan,
+    DEFAULT_DYN_LOAD_BIAS, DEFAULT_INTERP_LOAD_BIAS, DynamicLoadPolicy, DynamicUserLoadPlan,
+    LoadPolicy, UserLoadPlan,
     linux_stack::{LinuxInitialStackSpec, plan_linux_initial_stack},
 };
 use kernal_user_elf_runtime_aarch64::{
-    LinuxProcessStart, plan_aarch64_elf, plan_aarch64_linux_initial_stack,
+    Error as RuntimeError, LinuxProcessStart, plan_aarch64_dynamic_elf,
+    plan_aarch64_dynamic_linux_initial_stack, plan_aarch64_elf, plan_aarch64_linux_initial_stack,
 };
 
 const ET_DYN: u16 = 3;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PHOFF: usize = 64;
 const PHENT: usize = 56;
 const ENTRY_OFFSET: u64 = 0x200;
+const INTERP_ENTRY_OFFSET: u64 = 0x180;
 const ARGV0: &[u8] = b"/bin/step31-dynamic";
+const AARCH64_INTERP_NUL: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
 const RANDOM: [u8; 16] = [
     0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xa9, 0xba, 0xcb, 0xdc, 0xed, 0xfe, 0x0f,
 ];
@@ -48,6 +53,54 @@ fn dynamic_aarch64_elf() -> [u8; 0x400] {
     bytes
 }
 
+fn dynamic_aarch64_elf_with_interp() -> [u8; 0x400] {
+    let mut bytes = [0u8; 0x400];
+    bytes[0..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+    bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&ENTRY_OFFSET.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(PHOFF as u64).to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&(PHENT as u16).to_le_bytes());
+    bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+    let interp_offset = 0x120usize;
+    bytes[interp_offset..interp_offset + AARCH64_INTERP_NUL.len()]
+        .copy_from_slice(AARCH64_INTERP_NUL);
+
+    let ph0 = PHOFF;
+    bytes[ph0..ph0 + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+    bytes[ph0 + 4..ph0 + 8].copy_from_slice(&4u32.to_le_bytes());
+    bytes[ph0 + 8..ph0 + 16].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+    bytes[ph0 + 16..ph0 + 24].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+    bytes[ph0 + 24..ph0 + 32].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph0 + 32..ph0 + 40].copy_from_slice(&(AARCH64_INTERP_NUL.len() as u64).to_le_bytes());
+    bytes[ph0 + 40..ph0 + 48].copy_from_slice(&(AARCH64_INTERP_NUL.len() as u64).to_le_bytes());
+    bytes[ph0 + 48..ph0 + 56].copy_from_slice(&1u64.to_le_bytes());
+
+    let ph1 = PHOFF + PHENT;
+    bytes[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    bytes[ph1 + 4..ph1 + 8].copy_from_slice(&5u32.to_le_bytes());
+    bytes[ph1 + 8..ph1 + 16].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph1 + 16..ph1 + 24].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph1 + 24..ph1 + 32].copy_from_slice(&0u64.to_le_bytes());
+    let file_size = bytes.len() as u64;
+    bytes[ph1 + 32..ph1 + 40].copy_from_slice(&file_size.to_le_bytes());
+    bytes[ph1 + 40..ph1 + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes
+}
+
+fn interpreter_aarch64_elf() -> [u8; 0x400] {
+    let mut bytes = dynamic_aarch64_elf();
+    bytes[24..32].copy_from_slice(&INTERP_ENTRY_OFFSET.to_le_bytes());
+    bytes
+}
+
 fn expected_layout(
     bytes: &[u8],
     policy: LoadPolicy,
@@ -70,7 +123,13 @@ fn expected_layout(
         program_headers: expected_headers,
         program_header_entry_size: headers.entry_size() as u64,
         program_header_count: headers.entry_count() as u64,
+        interpreter_base: 0,
         entry: owner_plan.entry(),
+        uid: start.uid,
+        euid: start.euid,
+        gid: start.gid,
+        egid: start.egid,
+        secure: start.secure,
         random: start.random,
     };
     let layout = plan_linux_initial_stack(owner_plan.stack(), expected_spec).unwrap();
@@ -113,4 +172,56 @@ fn custom_et_dyn_policy_is_driven_through_the_public_linux_runtime_planner() {
     assert_eq!(runtime_plan.load_bias(), custom_bias);
     assert_eq!(runtime_plan.entry(), owner_plan.entry());
     assert_eq!(runtime_plan.stack(), owner_plan.stack());
+}
+
+#[test]
+fn dynamic_pt_interp_handoff_publishes_interpreter_base_and_rejects_standalone_stack_plan() {
+    let exec_bytes = dynamic_aarch64_elf_with_interp();
+    let interp_bytes = interpreter_aarch64_elf();
+    let start =
+        LinuxProcessStart::new(ARGV0, RANDOM).with_credentials(1000, 1000, 1000, 1000, false);
+
+    assert_eq!(
+        plan_aarch64_linux_initial_stack::<4>(&exec_bytes, LoadPolicy::default(), start),
+        Err(RuntimeError::InterpreterRequired)
+    );
+
+    let policy = DynamicLoadPolicy::default();
+    let runtime_layout =
+        plan_aarch64_dynamic_linux_initial_stack::<4>(&exec_bytes, &interp_bytes, policy, start)
+            .unwrap();
+    let runtime_plan = plan_aarch64_dynamic_elf::<4>(&exec_bytes, &interp_bytes, policy).unwrap();
+
+    let parsed_exec = Image::parse_for_machine(&exec_bytes, Machine::Aarch64).unwrap();
+    let parsed_interp = Image::parse_for_machine(&interp_bytes, Machine::Aarch64).unwrap();
+    let headers = parsed_exec.program_header_table().unwrap();
+    let owner_plan =
+        DynamicUserLoadPlan::<4>::from_images(&parsed_exec, &parsed_interp, policy).unwrap();
+    let expected_spec = LinuxInitialStackSpec {
+        argv0: start.argv0,
+        argv_tail: start.argv_tail,
+        envp: start.envp,
+        program_headers: headers.virtual_addr() + owner_plan.executable().load_bias(),
+        program_header_entry_size: headers.entry_size() as u64,
+        program_header_count: headers.entry_count() as u64,
+        interpreter_base: DEFAULT_INTERP_LOAD_BIAS,
+        entry: owner_plan.program_entry(),
+        uid: 1000,
+        euid: 1000,
+        gid: 1000,
+        egid: 1000,
+        secure: false,
+        random: start.random,
+    };
+    let expected_layout = plan_linux_initial_stack(owner_plan.stack(), expected_spec).unwrap();
+    assert_eq!(runtime_layout, expected_layout);
+    assert_eq!(runtime_plan.interpreter_base(), DEFAULT_INTERP_LOAD_BIAS);
+    assert_eq!(
+        runtime_plan.program_entry(),
+        DEFAULT_DYN_LOAD_BIAS + ENTRY_OFFSET
+    );
+    assert_eq!(
+        runtime_plan.initial_pc(),
+        DEFAULT_INTERP_LOAD_BIAS + INTERP_ENTRY_OFFSET
+    );
 }

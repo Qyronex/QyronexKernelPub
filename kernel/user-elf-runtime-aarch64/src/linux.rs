@@ -4,7 +4,7 @@ use super::Error;
 use kernal_elf::{Image, Machine};
 use kernal_user_elf::{DEFAULT_STACK_GUARD_PAGES, DEFAULT_STACK_PAGES};
 use kernal_user_elf::{
-    LoadPolicy, UserLoadPlan,
+    DynamicLoadPolicy, DynamicUserLoadPlan, LoadPolicy, UserLoadPlan,
     linux_stack::{LinuxInitialStackSpec, initialize_linux_stack_page, plan_linux_initial_stack},
 };
 use kernal_vm::{PAGE_SIZE, USER_MAX_EXCLUSIVE};
@@ -48,6 +48,11 @@ pub struct LinuxProcessStart<'a> {
     pub argv0: &'a [u8],
     pub argv_tail: &'a [&'a [u8]],
     pub envp: &'a [&'a [u8]],
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure: bool,
     pub random: [u8; 16],
 }
 
@@ -57,6 +62,11 @@ impl<'a> LinuxProcessStart<'a> {
             argv0,
             argv_tail: &[],
             envp: &[],
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            secure: false,
             random,
         }
     }
@@ -71,8 +81,29 @@ impl<'a> LinuxProcessStart<'a> {
             argv0,
             argv_tail,
             envp,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            secure: false,
             random,
         }
+    }
+
+    pub const fn with_credentials(
+        mut self,
+        uid: u32,
+        euid: u32,
+        gid: u32,
+        egid: u32,
+        secure: bool,
+    ) -> Self {
+        self.uid = uid;
+        self.euid = euid;
+        self.gid = gid;
+        self.egid = egid;
+        self.secure = secure;
+        self
     }
 }
 
@@ -88,6 +119,22 @@ pub fn plan_aarch64_linux_initial_stack<const SEGMENTS: usize>(
     start: LinuxProcessStart<'_>,
 ) -> Result<LinuxInitialStackLayout, Error> {
     let (_, _, layout) = prepare_linux_image::<SEGMENTS>(image, policy, start)?;
+    Ok(layout)
+}
+
+/// Plans the Linux AArch64 process-start stack for a dynamic executable (`PT_INTERP`) and its
+/// `ET_DYN` interpreter without mutating an address space.
+///
+/// `AT_PHDR`, `AT_PHENT`, `AT_PHNUM` and `AT_ENTRY` describe the main executable (relocated by its
+/// load bias), while `AT_BASE` publishes the interpreter's load bias.
+pub fn plan_aarch64_dynamic_linux_initial_stack<const SEGMENTS: usize>(
+    executable: &[u8],
+    interpreter: &[u8],
+    policy: DynamicLoadPolicy,
+    start: LinuxProcessStart<'_>,
+) -> Result<LinuxInitialStackLayout, Error> {
+    let (_, _, layout) =
+        prepare_dynamic_linux_image::<SEGMENTS>(executable, interpreter, policy, start)?;
     Ok(layout)
 }
 
@@ -295,6 +342,9 @@ fn prepare_linux_image<'a, const SEGMENTS: usize>(
     Error,
 > {
     let parsed = Image::parse_for_machine(image, Machine::Aarch64)?;
+    if parsed.interpreter_path()?.is_some() {
+        return Err(Error::InterpreterRequired);
+    }
     let program_header_table = parsed.program_header_table()?;
     let plan = UserLoadPlan::from_image(&parsed, policy)?;
     validate_signal_trampoline_gap(&plan)?;
@@ -313,11 +363,65 @@ fn prepare_linux_image<'a, const SEGMENTS: usize>(
         program_headers,
         program_header_entry_size,
         program_header_count,
+        interpreter_base: 0,
         entry: plan.entry(),
+        uid: start.uid,
+        euid: start.euid,
+        gid: start.gid,
+        egid: start.egid,
+        secure: start.secure,
         random: start.random,
     };
     let layout = plan_linux_initial_stack(plan.stack(), spec)?;
     preflight_linux_stack(&plan, spec, layout)?;
+    Ok((plan, spec, layout))
+}
+
+fn prepare_dynamic_linux_image<'a, const SEGMENTS: usize>(
+    executable: &[u8],
+    interpreter: &[u8],
+    policy: DynamicLoadPolicy,
+    start: LinuxProcessStart<'a>,
+) -> Result<
+    (
+        DynamicUserLoadPlan<SEGMENTS>,
+        LinuxInitialStackSpec<'a>,
+        LinuxInitialStackLayout,
+    ),
+    Error,
+> {
+    let parsed_exec = Image::parse_for_machine(executable, Machine::Aarch64)?;
+    let parsed_interp = Image::parse_for_machine(interpreter, Machine::Aarch64)?;
+    let program_header_table = parsed_exec.program_header_table()?;
+    let plan = DynamicUserLoadPlan::from_images(&parsed_exec, &parsed_interp, policy)?;
+    validate_signal_trampoline_gap(plan.executable())?;
+    validate_signal_trampoline_gap(plan.interpreter())?;
+    let program_headers = program_header_table
+        .virtual_addr()
+        .checked_add(plan.executable().load_bias())
+        .ok_or(Error::AddressOverflow)?;
+    let program_header_entry_size =
+        u64::try_from(program_header_table.entry_size()).map_err(|_| Error::AddressOverflow)?;
+    let program_header_count =
+        u64::try_from(program_header_table.entry_count()).map_err(|_| Error::AddressOverflow)?;
+    let spec = LinuxInitialStackSpec {
+        argv0: start.argv0,
+        argv_tail: start.argv_tail,
+        envp: start.envp,
+        program_headers,
+        program_header_entry_size,
+        program_header_count,
+        interpreter_base: plan.interpreter_base(),
+        entry: plan.program_entry(),
+        uid: start.uid,
+        euid: start.euid,
+        gid: start.gid,
+        egid: start.egid,
+        secure: start.secure,
+        random: start.random,
+    };
+    let layout = plan_linux_initial_stack(plan.stack(), spec)?;
+    preflight_linux_stack(plan.executable(), spec, layout)?;
     Ok((plan, spec, layout))
 }
 

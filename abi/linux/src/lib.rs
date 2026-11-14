@@ -15,6 +15,12 @@ pub use step30::{
     decode_wait4_options, decode_wait4_selector, decode_waitid_options, decode_waitid_type,
 };
 
+mod step31;
+pub use step31::{
+    GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, GetrandomFlags, Step31GlibcCall,
+    decode_getrandom_flags,
+};
+
 /// Linux exposes at most six direct syscall argument registers on the supported 64-bit ABIs.
 pub const MAX_SYSCALL_ARGS: usize = 6;
 

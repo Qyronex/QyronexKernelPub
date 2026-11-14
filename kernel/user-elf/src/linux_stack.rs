@@ -2,6 +2,7 @@
 
 use crate::InitialStackPlan;
 use kernal_load_plan::PAGE_SIZE;
+use kernal_vm::{USER_MAX_EXCLUSIVE, USER_MIN};
 
 const STACK_ALIGNMENT: u64 = 16;
 const WORD_BYTES: u64 = 8;
@@ -12,16 +13,22 @@ pub const MAX_ENVC: usize = 16;
 pub const MAX_STRING_BYTES: usize = 2048;
 const MAX_INITIAL_IMAGE_BYTES: usize = 4096;
 
-const AT_NULL: u64 = 0;
-const AT_PHDR: u64 = 3;
-const AT_PHENT: u64 = 4;
-const AT_PHNUM: u64 = 5;
-const AT_PAGESZ: u64 = 6;
-const AT_ENTRY: u64 = 9;
-const AT_RANDOM: u64 = 25;
-const AT_EXECFN: u64 = 31;
+pub const AT_NULL: u64 = 0;
+pub const AT_PHDR: u64 = 3;
+pub const AT_PHENT: u64 = 4;
+pub const AT_PHNUM: u64 = 5;
+pub const AT_PAGESZ: u64 = 6;
+pub const AT_BASE: u64 = 7;
+pub const AT_ENTRY: u64 = 9;
+pub const AT_UID: u64 = 11;
+pub const AT_EUID: u64 = 12;
+pub const AT_GID: u64 = 13;
+pub const AT_EGID: u64 = 14;
+pub const AT_SECURE: u64 = 23;
+pub const AT_RANDOM: u64 = 25;
+pub const AT_EXECFN: u64 = 31;
 
-const AUX_ENTRIES_WITH_NULL: u64 = 8;
+const AUX_ENTRIES_WITH_NULL: u64 = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -33,6 +40,8 @@ pub enum Error {
     VectorStringContainsNul,
     VectorStringsTooLarge,
     InvalidElfMetadata,
+    InvalidInterpreterBase,
+    AllZeroRandom,
     AddressOverflow,
     StackTooSmall,
     PageSizeMismatch,
@@ -53,9 +62,17 @@ pub struct LinuxInitialStackSpec<'a> {
     pub program_headers: u64,
     pub program_header_entry_size: u64,
     pub program_header_count: u64,
+    /// Dynamic interpreter load bias (`AT_BASE`), or `0` when no interpreter is mapped.
+    pub interpreter_base: u64,
     pub entry: u64,
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure: bool,
     /// Sixteen caller-supplied bytes exposed through AT_RANDOM. The stack encoder does not claim
     /// that these bytes are cryptographically random; production callers must supply real entropy.
+    /// All-zero payloads are rejected (`Error::AllZeroRandom`).
     pub random: [u8; RANDOM_BYTES],
 }
 
@@ -259,7 +276,13 @@ fn build_stack(
         (AT_PHENT, spec.program_header_entry_size),
         (AT_PHNUM, spec.program_header_count),
         (AT_PAGESZ, PAGE_SIZE),
+        (AT_BASE, spec.interpreter_base),
         (AT_ENTRY, spec.entry),
+        (AT_UID, u64::from(spec.uid)),
+        (AT_EUID, u64::from(spec.euid)),
+        (AT_GID, u64::from(spec.gid)),
+        (AT_EGID, u64::from(spec.egid)),
+        (AT_SECURE, u64::from(spec.secure)),
         (AT_RANDOM, random),
         (AT_EXECFN, argv_addresses[0]),
         (AT_NULL, 0),
@@ -351,6 +374,16 @@ fn validate_spec(spec: LinuxInitialStackSpec<'_>) -> Result<(), Error> {
     {
         return Err(Error::InvalidElfMetadata);
     }
+    if spec.interpreter_base != 0
+        && (!spec.interpreter_base.is_multiple_of(PAGE_SIZE)
+            || spec.interpreter_base < USER_MIN
+            || spec.interpreter_base >= USER_MAX_EXCLUSIVE)
+    {
+        return Err(Error::InvalidInterpreterBase);
+    }
+    if spec.random == [0u8; RANDOM_BYTES] {
+        return Err(Error::AllZeroRandom);
+    }
     Ok(())
 }
 
@@ -434,7 +467,13 @@ mod tests {
             program_headers: 0x0000_0000_0040_0040,
             program_header_entry_size: 56,
             program_header_count: 7,
+            interpreter_base: 0,
             entry: 0x0000_0000_0040_1000,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            secure: false,
             random: RANDOM,
         }
     }
@@ -473,7 +512,13 @@ mod tests {
             (AT_PHENT, 56),
             (AT_PHNUM, 7),
             (AT_PAGESZ, PAGE_SIZE),
+            (AT_BASE, 0),
             (AT_ENTRY, spec().entry),
+            (AT_UID, 0),
+            (AT_EUID, 0),
+            (AT_GID, 0),
+            (AT_EGID, 0),
+            (AT_SECURE, 0),
             (AT_RANDOM, layout.random()),
             (AT_EXECFN, layout.argv0()),
             (AT_NULL, 0),
@@ -571,6 +616,35 @@ mod tests {
         assert_eq!(
             plan_linux_initial_stack(stack(), bad),
             Err(Error::InvalidElfMetadata)
+        );
+    }
+
+    #[test]
+    fn all_zero_at_random_is_rejected_without_mutating_destination() {
+        let mut bad = spec();
+        bad.random = [0; RANDOM_BYTES];
+        let mut page = [0xa5u8; PAGE_SIZE as usize];
+        assert_eq!(
+            initialize_linux_stack_page(stack(), bad, STACK_PAGES - 1, &mut page),
+            Err(Error::AllZeroRandom)
+        );
+        assert!(page.iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[test]
+    fn invalid_interpreter_base_is_rejected() {
+        let mut unaligned = spec();
+        unaligned.interpreter_base = USER_MIN + 1;
+        assert_eq!(
+            plan_linux_initial_stack(stack(), unaligned),
+            Err(Error::InvalidInterpreterBase)
+        );
+
+        let mut kernel_half = spec();
+        kernel_half.interpreter_base = USER_MAX_EXCLUSIVE;
+        assert_eq!(
+            plan_linux_initial_stack(stack(), kernel_half),
+            Err(Error::InvalidInterpreterBase)
         );
     }
 }

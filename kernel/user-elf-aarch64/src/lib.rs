@@ -8,7 +8,7 @@ use kernal_object::ObjectTable;
 use kernal_page_table_aarch64::Backend;
 use kernal_process::Process;
 use kernal_process_aarch64::{BoundProcessAddressSpace, Error as ProcessAddressSpaceError};
-use kernal_user_elf::{Error as UserElfError, UserLoadPlan};
+use kernal_user_elf::{DynamicUserLoadPlan, Error as UserElfError, UserLoadPlan};
 use kernal_vm::{Backing, Error as VmError, PAGE_SIZE, VmPerms, Vma};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +62,24 @@ pub fn required_pages<const SEGMENTS: usize>(
 ) -> Result<usize, Error> {
     let mut pages = plan.stack().stack_pages();
     for segment in plan.segments() {
+        pages = pages
+            .checked_add(segment.page_count)
+            .ok_or(Error::PageCountOverflow)?;
+    }
+    Ok(pages)
+}
+
+/// Returns the number of distinct physical frames required to map a dynamic executable, its
+/// `ET_DYN` interpreter and the shared guarded initial stack.
+pub fn required_dynamic_pages<const SEGMENTS: usize>(
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+) -> Result<usize, Error> {
+    let mut pages = plan.stack().stack_pages();
+    for segment in plan
+        .executable()
+        .segments()
+        .chain(plan.interpreter().segments())
+    {
         pages = pages
             .checked_add(segment.page_count)
             .ok_or(Error::PageCountOverflow)?;
@@ -147,6 +165,94 @@ pub fn map_user_image_pages<
             frame,
         ) {
             rollback_or_fail(plan, mapped_pages, process, objects, space, backend)?;
+            return Err(error);
+        }
+        frame_cursor += 1;
+        mapped_pages += 1;
+    }
+
+    Ok(MappedImage {
+        segment_pages,
+        stack_pages: stack.stack_pages(),
+    })
+}
+
+/// Maps a validated Step-31 dynamic executable, its `ET_DYN` interpreter and the shared initial
+/// stack through the accepted Step-11 process/CSpace authority path.
+///
+/// Frames are consumed in `plan.executable().segments()` order, then `plan.interpreter().segments()`
+/// order, and finally the stack pages in ascending virtual-page order. All frame-count, duplicate,
+/// reservation and permission checks run before page-table mutation, and any mapping error rolls
+/// back all earlier pages installed by this call.
+#[allow(clippy::too_many_arguments)]
+pub fn map_dynamic_user_image_pages<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    B: Backend,
+>(
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+    frames: &[PhysFrame],
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+    reserved: &ReservationSet<RESERVED>,
+) -> Result<MappedImage, Error> {
+    let expected = required_dynamic_pages(plan)?;
+    if frames.len() != expected {
+        return Err(Error::FrameCountMismatch {
+            expected,
+            actual: frames.len(),
+        });
+    }
+    validate_frames(frames, reserved)?;
+    validate_plan(plan.executable())?;
+    validate_plan(plan.interpreter())?;
+
+    let mut frame_cursor = 0usize;
+    let mut mapped_pages = 0usize;
+    let mut segment_pages = 0usize;
+
+    for segment in plan
+        .executable()
+        .segments()
+        .chain(plan.interpreter().segments())
+    {
+        let perms = UserLoadPlan::<SEGMENTS>::vm_perms(segment)?;
+        for page_index in 0..segment.page_count {
+            let address = page_address(segment, page_index)?;
+            let frame = frames[frame_cursor];
+            if let Err(error) = map_page(
+                process, objects, space, backend, reserved, address, perms, frame,
+            ) {
+                rollback_dynamic_or_fail(plan, mapped_pages, process, objects, space, backend)?;
+                return Err(error);
+            }
+            frame_cursor += 1;
+            mapped_pages += 1;
+            segment_pages += 1;
+        }
+    }
+
+    let stack = plan.stack();
+    let stack_perms = VmPerms::READ.union(VmPerms::WRITE);
+    for page_index in 0..stack.stack_pages() {
+        let address = stack_page_address(stack.stack_start(), page_index)?;
+        let frame = frames[frame_cursor];
+        if let Err(error) = map_page(
+            process,
+            objects,
+            space,
+            backend,
+            reserved,
+            address,
+            stack_perms,
+            frame,
+        ) {
+            rollback_dynamic_or_fail(plan, mapped_pages, process, objects, space, backend)?;
             return Err(error);
         }
         frame_cursor += 1;
@@ -320,19 +426,106 @@ fn rollback_prefix<
     }
 }
 
+fn rollback_dynamic_or_fail<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    B: Backend,
+>(
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+    mapped_pages: usize,
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+) -> Result<(), Error> {
+    if rollback_dynamic_prefix(plan, mapped_pages, process, objects, space, backend).is_err() {
+        space.poison();
+        return Err(Error::RollbackFailed);
+    }
+    Ok(())
+}
+
+fn rollback_dynamic_prefix<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    B: Backend,
+>(
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+    mapped_pages: usize,
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+) -> Result<(), Error> {
+    let mut remaining = mapped_pages;
+    for segment in plan
+        .executable()
+        .segments()
+        .chain(plan.interpreter().segments())
+    {
+        for page_index in 0..segment.page_count {
+            if remaining == 0 {
+                return Ok(());
+            }
+            let address = page_address(segment, page_index)?;
+            space
+                .unmap_user_page_coalescing_anonymous(
+                    process,
+                    objects,
+                    process.address_space_handle(),
+                    backend,
+                    address,
+                )
+                .map_err(Error::from)?;
+            remaining -= 1;
+        }
+    }
+
+    let stack = plan.stack();
+    for page_index in 0..stack.stack_pages() {
+        if remaining == 0 {
+            return Ok(());
+        }
+        let address = stack_page_address(stack.stack_start(), page_index)?;
+        space
+            .unmap_user_page_coalescing_anonymous(
+                process,
+                objects,
+                process.address_space_handle(),
+                backend,
+                address,
+            )
+            .map_err(Error::from)?;
+        remaining -= 1;
+    }
+
+    if remaining == 0 {
+        Ok(())
+    } else {
+        Err(Error::RollbackFailed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use kernal_elf::{Image, Machine};
     use kernal_process::Personality;
-    use kernal_user_elf::LoadPolicy;
+    use kernal_user_elf::{DynamicLoadPolicy, LoadPolicy};
     use kernal_vm::USER_MIN;
 
     const TABLES: usize = 64;
     const TABLE_BASE: u64 = 0x10_0000;
     const ET_EXEC: u16 = 2;
+    const ET_DYN: u16 = 3;
     const EM_AARCH64: u16 = 183;
     const PT_LOAD: u32 = 1;
+    const PT_INTERP: u32 = 3;
+    const INTERP_PATH: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
 
     struct TestBackend {
         tables: [[u64; 512]; TABLES],
@@ -602,6 +795,161 @@ mod tests {
                 segment_address,
             ),
             Err(ProcessAddressSpaceError::Poisoned)
+        );
+    }
+
+    fn minimal_aarch64_exec_with_interp() -> [u8; 0x400] {
+        let mut bytes = [0u8; 0x400];
+        let vaddr = USER_MIN + 0x20_000;
+        let interp_offset = 0x180usize;
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(vaddr + 0x100).to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+        let interp = 64;
+        bytes[interp..interp + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+        bytes[interp + 4..interp + 8].copy_from_slice(&4u32.to_le_bytes());
+        bytes[interp + 8..interp + 16].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+        bytes[interp + 16..interp + 24]
+            .copy_from_slice(&(vaddr + interp_offset as u64).to_le_bytes());
+        bytes[interp + 32..interp + 40].copy_from_slice(&(INTERP_PATH.len() as u64).to_le_bytes());
+        bytes[interp + 40..interp + 48].copy_from_slice(&(INTERP_PATH.len() as u64).to_le_bytes());
+        bytes[interp + 48..interp + 56].copy_from_slice(&1u64.to_le_bytes());
+        bytes[interp_offset..interp_offset + INTERP_PATH.len()].copy_from_slice(INTERP_PATH);
+
+        let p = 64 + 56;
+        bytes[p..p + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        bytes[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes());
+        bytes[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
+        bytes[p + 16..p + 24].copy_from_slice(&vaddr.to_le_bytes());
+        bytes[p + 24..p + 32].copy_from_slice(&0u64.to_le_bytes());
+        bytes[p + 32..p + 40].copy_from_slice(&0x200u64.to_le_bytes());
+        bytes[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes
+    }
+
+    fn minimal_aarch64_interp() -> [u8; 0x400] {
+        let mut bytes = [0u8; 0x400];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x180u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+
+        let p = 64;
+        bytes[p..p + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        bytes[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes());
+        bytes[p + 8..p + 16].copy_from_slice(&0u64.to_le_bytes());
+        bytes[p + 16..p + 24].copy_from_slice(&0u64.to_le_bytes());
+        bytes[p + 24..p + 32].copy_from_slice(&0u64.to_le_bytes());
+        bytes[p + 32..p + 40].copy_from_slice(&0x200u64.to_le_bytes());
+        bytes[p + 40..p + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[p + 48..p + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn maps_dynamic_executable_and_interpreter_segments_and_stack() {
+        let exec_bytes = minimal_aarch64_exec_with_interp();
+        let interp_bytes = minimal_aarch64_interp();
+        let exec_image = Image::parse_for_machine(&exec_bytes, Machine::Aarch64).unwrap();
+        let interp_image = Image::parse_for_machine(&interp_bytes, Machine::Aarch64).unwrap();
+        let plan = DynamicUserLoadPlan::<4>::from_images(
+            &exec_image,
+            &interp_image,
+            DynamicLoadPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(required_dynamic_pages(&plan), Ok(6));
+
+        let frames: [PhysFrame; 6] = core::array::from_fn(|index| {
+            PhysFrame::from_start_address(0x40_0000 + index as u64 * PAGE_SIZE).unwrap()
+        });
+        let mut objects = ObjectTable::<8>::new();
+        let process = Process::<8>::create(&mut objects, Personality::Native).unwrap();
+        let mut backend = TestBackend::new();
+        let mut space =
+            BoundProcessAddressSpace::<8>::create(&process, &objects, &mut backend).unwrap();
+        let reserved = ReservationSet::<1>::new();
+
+        let mapped = map_dynamic_user_image_pages(
+            &plan,
+            &frames,
+            &process,
+            &objects,
+            &mut space,
+            &mut backend,
+            &reserved,
+        )
+        .unwrap();
+        assert_eq!(mapped.segment_pages, 2);
+        assert_eq!(mapped.stack_pages, 4);
+        assert_eq!(mapped.total_pages(), Ok(6));
+
+        let exec_va = plan
+            .executable()
+            .segments()
+            .next()
+            .unwrap()
+            .virtual_page_start;
+        let interp_va = plan
+            .interpreter()
+            .segments()
+            .next()
+            .unwrap()
+            .virtual_page_start;
+        assert_eq!(
+            space
+                .translate_user(
+                    &process,
+                    &objects,
+                    process.address_space_handle(),
+                    &mut backend,
+                    exec_va,
+                )
+                .unwrap(),
+            frames[0].start_address()
+        );
+        assert_eq!(
+            space
+                .translate_user(
+                    &process,
+                    &objects,
+                    process.address_space_handle(),
+                    &mut backend,
+                    interp_va,
+                )
+                .unwrap(),
+            frames[1].start_address()
+        );
+        assert_eq!(
+            space
+                .translate_user(
+                    &process,
+                    &objects,
+                    process.address_space_handle(),
+                    &mut backend,
+                    plan.stack().stack_start(),
+                )
+                .unwrap(),
+            frames[2].start_address()
         );
     }
 }

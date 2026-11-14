@@ -8,16 +8,18 @@ pub use kernal_user_elf::linux_stack::{MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_
 pub use linux::load_aarch64_linux_elf;
 pub use linux::{
     AARCH64_LINUX_RT_SIGRETURN_TRAMPOLINE, LinuxInitialStackLayout, LinuxProcessStart,
-    plan_aarch64_linux_initial_stack,
+    plan_aarch64_dynamic_linux_initial_stack, plan_aarch64_linux_initial_stack,
 };
 
 use kernal_elf::{Error as ElfError, Image, Machine};
 use kernal_memory::{PhysFrame, ReservationSet};
 use kernal_user_elf::{
-    Error as UserElfError, LoadPolicy, UserLoadPlan,
+    DynamicLoadPolicy, DynamicUserLoadPlan, Error as UserElfError, LoadPolicy, UserLoadPlan,
     initialization::{InitializationError, initialize_segment_page, initialize_stack_page},
 };
-use kernal_user_elf_aarch64::{Error as MappingError, MappedImage, required_pages};
+use kernal_user_elf_aarch64::{
+    Error as MappingError, MappedImage, required_dynamic_pages, required_pages,
+};
 use kernal_vm::PAGE_SIZE;
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
@@ -37,6 +39,7 @@ use kernal_vm::{Backing, VmPerms, Vma};
 pub enum Error {
     Elf(ElfError),
     UserPolicy(UserElfError),
+    InterpreterRequired,
     Initialization(InitializationError),
     LinuxStack(kernal_user_elf::linux_stack::Error),
     LinuxStackInvariant,
@@ -100,6 +103,67 @@ pub fn plan_aarch64_elf<const SEGMENTS: usize>(
 ) -> Result<UserLoadPlan<SEGMENTS>, Error> {
     let parsed = Image::parse_for_machine(image, Machine::Aarch64)?;
     Ok(UserLoadPlan::from_image(&parsed, policy)?)
+}
+
+/// Parses a dynamic AArch64 executable (`PT_INTERP`) and its `ET_DYN` interpreter with explicit
+/// `EM_AARCH64` selection and builds the composed Step-31 load plan.
+pub fn plan_aarch64_dynamic_elf<const SEGMENTS: usize>(
+    executable: &[u8],
+    interpreter: &[u8],
+    policy: DynamicLoadPolicy,
+) -> Result<DynamicUserLoadPlan<SEGMENTS>, Error> {
+    let parsed_exec = Image::parse_for_machine(executable, Machine::Aarch64)?;
+    let parsed_interp = Image::parse_for_machine(interpreter, Machine::Aarch64)?;
+    Ok(DynamicUserLoadPlan::from_images(
+        &parsed_exec,
+        &parsed_interp,
+        policy,
+    )?)
+}
+
+/// Validates the complete frame and initialization plan for a dynamic executable plus interpreter
+/// before the first page-table mutation.
+pub fn preflight_dynamic<const SEGMENTS: usize, const RESERVED: usize>(
+    executable: &[u8],
+    interpreter: &[u8],
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+    frames: &[PhysFrame],
+    reserved: &ReservationSet<RESERVED>,
+) -> Result<usize, Error> {
+    let expected = required_dynamic_pages(plan)?;
+    if frames.len() != expected {
+        return Err(Error::FrameCountMismatch {
+            expected,
+            actual: frames.len(),
+        });
+    }
+
+    for (index, frame) in frames.iter().copied().enumerate() {
+        if reserved.contains(frame) {
+            return Err(Error::ReservedFrame);
+        }
+        if frames[..index].contains(&frame) {
+            return Err(Error::DuplicateFrame);
+        }
+    }
+
+    let mut scratch = [0u8; PAGE_SIZE as usize];
+    for segment in plan.executable().segments() {
+        for page_index in 0..segment.page_count {
+            initialize_segment_page(executable, *segment, page_index, &mut scratch)?;
+        }
+    }
+    for segment in plan.interpreter().segments() {
+        for page_index in 0..segment.page_count {
+            initialize_segment_page(interpreter, *segment, page_index, &mut scratch)?;
+        }
+    }
+    let stack = plan.stack();
+    for page_index in 0..stack.stack_pages() {
+        initialize_stack_page(stack, page_index, &mut scratch)?;
+    }
+
+    Ok(expected)
 }
 
 /// Validates the complete frame and initialization plan before the first page-table mutation.

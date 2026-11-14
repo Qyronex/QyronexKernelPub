@@ -139,6 +139,7 @@ impl ProgramHeaderTable {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Image<'a> {
     bytes: &'a [u8],
+    machine: Machine,
     image_type: ImageType,
     entry: u64,
     phoff: usize,
@@ -195,6 +196,7 @@ impl<'a> Image<'a> {
 
         let image = Self {
             bytes,
+            machine,
             image_type,
             entry: read_u64(bytes, 24)?,
             phoff,
@@ -203,6 +205,10 @@ impl<'a> Image<'a> {
         image.validate_load_layout()?;
         image.interpreter_path()?;
         Ok(image)
+    }
+
+    pub const fn machine(&self) -> Machine {
+        self.machine
     }
 
     pub const fn image_type(&self) -> ImageType {

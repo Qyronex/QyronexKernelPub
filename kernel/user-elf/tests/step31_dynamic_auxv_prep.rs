@@ -2,14 +2,23 @@
 
 use kernal_elf::{Image, Machine};
 use kernal_load_plan::PAGE_SIZE;
-use kernal_user_elf::linux_stack::{LinuxInitialStackSpec, initialize_linux_stack_page};
-use kernal_user_elf::{DEFAULT_DYN_LOAD_BIAS, LoadPolicy, UserLoadPlan};
+use kernal_user_elf::linux_stack::{
+    Error as LinuxStackError, LinuxInitialStackSpec, initialize_linux_stack_page,
+    plan_linux_initial_stack,
+};
+use kernal_user_elf::{
+    DEFAULT_DYN_LOAD_BIAS, DEFAULT_INTERP_LOAD_BIAS, DynamicLoadPolicy, DynamicUserLoadPlan,
+    Error as PlanError, LoadPolicy, UserLoadPlan,
+};
 
+const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_AARCH64: u16 = 183;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
+const AARCH64_INTERP_NUL: &[u8] = b"/lib/ld-linux-aarch64.so.1\0";
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;
@@ -51,6 +60,48 @@ fn dynamic_aarch64_elf() -> [u8; 0x200] {
     bytes[ph + 32..ph + 40].copy_from_slice(&image_len.to_le_bytes());
     bytes[ph + 40..ph + 48].copy_from_slice(&0x1000u64.to_le_bytes());
     bytes[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes
+}
+
+fn dynamic_aarch64_elf_with_interp() -> [u8; 0x300] {
+    let mut bytes = [0u8; 0x300];
+    bytes[0..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+    bytes[18..20].copy_from_slice(&EM_AARCH64.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0x180u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&(ELF64_EHDR_SIZE as u64).to_le_bytes());
+    bytes[52..54].copy_from_slice(&(ELF64_EHDR_SIZE as u16).to_le_bytes());
+    bytes[54..56].copy_from_slice(&(ELF64_PHDR_SIZE as u16).to_le_bytes());
+    bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+    let interp_offset = 0x120usize;
+    bytes[interp_offset..interp_offset + AARCH64_INTERP_NUL.len()]
+        .copy_from_slice(AARCH64_INTERP_NUL);
+
+    let ph0 = ELF64_EHDR_SIZE;
+    bytes[ph0..ph0 + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
+    bytes[ph0 + 4..ph0 + 8].copy_from_slice(&4u32.to_le_bytes());
+    bytes[ph0 + 8..ph0 + 16].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+    bytes[ph0 + 16..ph0 + 24].copy_from_slice(&(interp_offset as u64).to_le_bytes());
+    bytes[ph0 + 24..ph0 + 32].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph0 + 32..ph0 + 40].copy_from_slice(&(AARCH64_INTERP_NUL.len() as u64).to_le_bytes());
+    bytes[ph0 + 40..ph0 + 48].copy_from_slice(&(AARCH64_INTERP_NUL.len() as u64).to_le_bytes());
+    bytes[ph0 + 48..ph0 + 56].copy_from_slice(&1u64.to_le_bytes());
+
+    let image_len = bytes.len() as u64;
+    let ph1 = ELF64_EHDR_SIZE + ELF64_PHDR_SIZE;
+    bytes[ph1..ph1 + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+    bytes[ph1 + 4..ph1 + 8].copy_from_slice(&5u32.to_le_bytes());
+    bytes[ph1 + 8..ph1 + 16].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph1 + 16..ph1 + 24].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph1 + 24..ph1 + 32].copy_from_slice(&0u64.to_le_bytes());
+    bytes[ph1 + 32..ph1 + 40].copy_from_slice(&image_len.to_le_bytes());
+    bytes[ph1 + 40..ph1 + 48].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes[ph1 + 48..ph1 + 56].copy_from_slice(&0x1000u64.to_le_bytes());
     bytes
 }
 
@@ -114,7 +165,13 @@ fn et_dyn_metadata_flows_into_current_linux_auxv_without_fabricating_at_base() {
         program_headers,
         program_header_entry_size: headers.entry_size() as u64,
         program_header_count: headers.entry_count() as u64,
+        interpreter_base: 0,
         entry: plan.entry(),
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        secure: false,
         random,
     };
 
@@ -124,6 +181,7 @@ fn et_dyn_metadata_flows_into_current_linux_auxv_without_fabricating_at_base() {
     let mut page = [0u8; PAGE_SIZE as usize];
     let layout = initialize_linux_stack_page(stack, spec, last_page, &mut page).unwrap();
     let auxv = encoded_auxv(&plan, spec);
+    assert_eq!(auxv.len(), 13);
 
     assert_eq!(auxv_value(&auxv, AT_PHDR), Some(program_headers));
     assert_eq!(
@@ -135,14 +193,15 @@ fn et_dyn_metadata_flows_into_current_linux_auxv_without_fabricating_at_base() {
         Some(headers.entry_count() as u64)
     );
     assert_eq!(auxv_value(&auxv, AT_PAGESZ), Some(PAGE_SIZE));
+    assert_eq!(auxv_value(&auxv, AT_BASE), Some(0));
     assert_eq!(auxv_value(&auxv, AT_ENTRY), Some(plan.entry()));
+    assert_eq!(auxv_value(&auxv, AT_UID), Some(0));
+    assert_eq!(auxv_value(&auxv, AT_EUID), Some(0));
+    assert_eq!(auxv_value(&auxv, AT_GID), Some(0));
+    assert_eq!(auxv_value(&auxv, AT_EGID), Some(0));
+    assert_eq!(auxv_value(&auxv, AT_SECURE), Some(0));
     assert_eq!(auxv_value(&auxv, AT_RANDOM), Some(layout.random()));
     assert_eq!(auxv_value(&auxv, AT_EXECFN), Some(layout.argv0()));
-
-    // Step 31 runtime composition still owns interpreter mapping and AT_BASE publication. PREP
-    // records the current boundary explicitly instead of fabricating a loader base before that owner
-    // is released after Step 30.7.
-    assert_eq!(auxv_value(&auxv, AT_BASE), None);
 
     let random_offset = usize::try_from(layout.random() - page_start).unwrap();
     assert_eq!(&page[random_offset..random_offset + random.len()], &random);
@@ -171,18 +230,24 @@ fn custom_et_dyn_load_bias_is_preserved_in_auxv_metadata() {
         program_headers,
         program_header_entry_size: headers.entry_size() as u64,
         program_header_count: headers.entry_count() as u64,
+        interpreter_base: DEFAULT_INTERP_LOAD_BIAS,
         entry: plan.entry(),
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        secure: false,
         random: [0x5a; 16],
     };
     let auxv = encoded_auxv(&plan, spec);
 
     assert_eq!(auxv_value(&auxv, AT_PHDR), Some(program_headers));
     assert_eq!(auxv_value(&auxv, AT_ENTRY), Some(custom_bias + 0x100));
-    assert_eq!(auxv_value(&auxv, AT_BASE), None);
+    assert_eq!(auxv_value(&auxv, AT_BASE), Some(DEFAULT_INTERP_LOAD_BIAS));
 }
 
 #[test]
-fn identity_and_secure_auxv_entries_remain_explicit_step31_integration_deltas() {
+fn identity_and_secure_auxv_entries_match_step31_contract() {
     let bytes = dynamic_aarch64_elf();
     let image = Image::parse_for_machine(&bytes, Machine::Aarch64).unwrap();
     let headers = image.program_header_table().unwrap();
@@ -194,22 +259,26 @@ fn identity_and_secure_auxv_entries_remain_explicit_step31_integration_deltas() 
         program_headers: plan.load_bias() + headers.virtual_addr(),
         program_header_entry_size: headers.entry_size() as u64,
         program_header_count: headers.entry_count() as u64,
+        interpreter_base: 0,
         entry: plan.entry(),
+        uid: 1000,
+        euid: 1001,
+        gid: 2000,
+        egid: 2001,
+        secure: true,
         random: [0xa5; 16],
     };
     let auxv = encoded_auxv(&plan, spec);
 
-    for kind in [AT_UID, AT_EUID, AT_GID, AT_EGID, AT_SECURE] {
-        assert_eq!(
-            auxv_value(&auxv, kind),
-            None,
-            "identity/security auxv kind {kind} became visible during PREP; replace this delta assertion with its final Step-31 value contract"
-        );
-    }
+    assert_eq!(auxv_value(&auxv, AT_UID), Some(1000));
+    assert_eq!(auxv_value(&auxv, AT_EUID), Some(1001));
+    assert_eq!(auxv_value(&auxv, AT_GID), Some(2000));
+    assert_eq!(auxv_value(&auxv, AT_EGID), Some(2001));
+    assert_eq!(auxv_value(&auxv, AT_SECURE), Some(1));
 }
 
 #[test]
-fn all_zero_at_random_remains_an_explicit_step31_integration_delta() {
+fn all_zero_at_random_is_rejected_by_step31_stack_contract() {
     let bytes = dynamic_aarch64_elf();
     let image = Image::parse_for_machine(&bytes, Machine::Aarch64).unwrap();
     let headers = image.program_header_table().unwrap();
@@ -221,18 +290,86 @@ fn all_zero_at_random_remains_an_explicit_step31_integration_delta() {
         program_headers: plan.load_bias() + headers.virtual_addr(),
         program_header_entry_size: headers.entry_size() as u64,
         program_header_count: headers.entry_count() as u64,
+        interpreter_base: 0,
         entry: plan.entry(),
+        uid: 0,
+        euid: 0,
+        gid: 0,
+        egid: 0,
+        secure: false,
         random: [0; 16],
     };
 
     let stack = plan.stack();
     let last_page = stack.stack_pages() - 1;
-    let page_start = stack.stack_start() + (last_page as u64 * PAGE_SIZE);
-    let mut page = [0u8; PAGE_SIZE as usize];
-    let layout = initialize_linux_stack_page(stack, spec, last_page, &mut page).unwrap();
-    let auxv = encoded_auxv(&plan, spec);
-    assert_eq!(auxv_value(&auxv, AT_RANDOM), Some(layout.random()));
+    let mut page = [0xa5u8; PAGE_SIZE as usize];
+    assert_eq!(
+        plan_linux_initial_stack(stack, spec),
+        Err(LinuxStackError::AllZeroRandom)
+    );
+    assert_eq!(
+        initialize_linux_stack_page(stack, spec, last_page, &mut page),
+        Err(LinuxStackError::AllZeroRandom)
+    );
+    assert!(page.iter().all(|byte| *byte == 0xa5));
+}
 
-    let random_offset = usize::try_from(layout.random() - page_start).unwrap();
-    assert_eq!(&page[random_offset..random_offset + 16], &[0; 16]);
+#[test]
+fn dynamic_load_plan_composes_executable_with_pt_interp_and_et_dyn_interpreter() {
+    let exec_bytes = dynamic_aarch64_elf_with_interp();
+    let interp_bytes = dynamic_aarch64_elf();
+    let exec_image = Image::parse_for_machine(&exec_bytes, Machine::Aarch64).unwrap();
+    let interp_image = Image::parse_for_machine(&interp_bytes, Machine::Aarch64).unwrap();
+
+    let composed = DynamicUserLoadPlan::<4>::from_images(
+        &exec_image,
+        &interp_image,
+        DynamicLoadPolicy::default(),
+    )
+    .unwrap();
+
+    assert_eq!(composed.executable().load_bias(), DEFAULT_DYN_LOAD_BIAS);
+    assert_eq!(composed.interpreter_base(), DEFAULT_INTERP_LOAD_BIAS);
+    assert_eq!(composed.program_entry(), DEFAULT_DYN_LOAD_BIAS + 0x180);
+    assert_eq!(composed.initial_pc(), DEFAULT_INTERP_LOAD_BIAS + 0x100);
+}
+
+#[test]
+fn dynamic_load_plan_rejects_overlap_nested_interp_and_et_exec_interpreter() {
+    let exec_bytes = dynamic_aarch64_elf_with_interp();
+    let interp_bytes = dynamic_aarch64_elf();
+    let exec_image = Image::parse_for_machine(&exec_bytes, Machine::Aarch64).unwrap();
+    let interp_image = Image::parse_for_machine(&interp_bytes, Machine::Aarch64).unwrap();
+
+    let overlapping = DynamicLoadPolicy {
+        executable: LoadPolicy::default(),
+        interpreter_load_bias: DEFAULT_DYN_LOAD_BIAS,
+    };
+    assert_eq!(
+        DynamicUserLoadPlan::<4>::from_images(&exec_image, &interp_image, overlapping).map(|_| ()),
+        Err(PlanError::InterpreterOverlap)
+    );
+
+    assert_eq!(
+        DynamicUserLoadPlan::<4>::from_images(
+            &exec_image,
+            &exec_image,
+            DynamicLoadPolicy::default()
+        )
+        .map(|_| ()),
+        Err(PlanError::NestedInterpreterForbidden)
+    );
+
+    let mut et_exec_interp = dynamic_aarch64_elf();
+    et_exec_interp[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+    let et_exec_image = Image::parse_for_machine(&et_exec_interp, Machine::Aarch64).unwrap();
+    assert_eq!(
+        DynamicUserLoadPlan::<4>::from_images(
+            &exec_image,
+            &et_exec_image,
+            DynamicLoadPolicy::default()
+        )
+        .map(|_| ()),
+        Err(PlanError::InvalidInterpreterImageType)
+    );
 }

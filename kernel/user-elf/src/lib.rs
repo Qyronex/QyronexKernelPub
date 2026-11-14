@@ -10,6 +10,7 @@ use kernal_load_plan::{Error as LoadPlanError, LoadPlan, PAGE_SIZE, PlannedSegme
 use kernal_vm::{USER_MAX_EXCLUSIVE, USER_MIN, VmPerms};
 
 pub const DEFAULT_DYN_LOAD_BIAS: u64 = USER_MIN + 0x0100_0000;
+pub const DEFAULT_INTERP_LOAD_BIAS: u64 = USER_MIN + 0x4000_0000;
 pub const DEFAULT_STACK_PAGES: usize = 4;
 pub const DEFAULT_STACK_GUARD_PAGES: usize = 1;
 const STACK_ALIGNMENT: u64 = 16;
@@ -18,6 +19,12 @@ const STACK_ALIGNMENT: u64 = 16;
 pub enum Error {
     LoadPlan(LoadPlanError),
     InvalidDynamicLoadBias,
+    InvalidInterpreterLoadBias,
+    MissingInterpreterPath,
+    InvalidInterpreterImageType,
+    NestedInterpreterForbidden,
+    InterpreterMachineMismatch,
+    InterpreterOverlap,
     SegmentOutsideUserRange,
     EntryOutsideUserRange,
     UnsupportedPermissions,
@@ -44,6 +51,21 @@ impl Default for LoadPolicy {
             dynamic_load_bias: DEFAULT_DYN_LOAD_BIAS,
             stack_pages: DEFAULT_STACK_PAGES,
             stack_guard_pages: DEFAULT_STACK_GUARD_PAGES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicLoadPolicy {
+    pub executable: LoadPolicy,
+    pub interpreter_load_bias: u64,
+}
+
+impl Default for DynamicLoadPolicy {
+    fn default() -> Self {
+        Self {
+            executable: LoadPolicy::default(),
+            interpreter_load_bias: DEFAULT_INTERP_LOAD_BIAS,
         }
     }
 }
@@ -175,6 +197,98 @@ impl<const N: usize> UserLoadPlan<N> {
             perms = perms.union(VmPerms::EXECUTE);
         }
         perms.validate().map_err(|_| Error::UnsupportedPermissions)
+    }
+}
+
+/// Composed Step-31 load plan for a dynamic executable (`PT_INTERP`) and its `ET_DYN` interpreter.
+///
+/// The main executable (`ET_EXEC` or `ET_DYN`) must declare a valid `PT_INTERP` path; the
+/// interpreter must be an `ET_DYN` shared object for the same architecture without a nested
+/// `PT_INTERP`. Both images are planned against the same user range and guarded stack, and their
+/// planned page ranges must be strictly disjoint. Control enters EL0 at `initial_pc()` (the
+/// interpreter's biased entry point), while `AT_ENTRY` publishes `program_entry()` (the main
+/// executable's biased entry point) and `AT_BASE` publishes `interpreter_base()`.
+pub struct DynamicUserLoadPlan<const N: usize> {
+    executable: UserLoadPlan<N>,
+    interpreter: UserLoadPlan<N>,
+}
+
+impl<const N: usize> DynamicUserLoadPlan<N> {
+    pub fn from_images(
+        executable: &Image<'_>,
+        interpreter: &Image<'_>,
+        policy: DynamicLoadPolicy,
+    ) -> Result<Self, Error> {
+        executable
+            .interpreter_path()
+            .map_err(|_| Error::MissingInterpreterPath)?
+            .ok_or(Error::MissingInterpreterPath)?;
+        if interpreter.image_type() != ImageType::SharedObject {
+            return Err(Error::InvalidInterpreterImageType);
+        }
+        if interpreter
+            .interpreter_path()
+            .map_err(|_| Error::NestedInterpreterForbidden)?
+            .is_some()
+        {
+            return Err(Error::NestedInterpreterForbidden);
+        }
+        if executable.machine() != interpreter.machine() {
+            return Err(Error::InterpreterMachineMismatch);
+        }
+
+        let executable_plan = UserLoadPlan::<N>::from_image(executable, policy.executable)?;
+        let interpreter_policy = LoadPolicy {
+            dynamic_load_bias: policy.interpreter_load_bias,
+            stack_pages: policy.executable.stack_pages,
+            stack_guard_pages: policy.executable.stack_guard_pages,
+        };
+        let interpreter_plan = UserLoadPlan::<N>::from_image(interpreter, interpreter_policy)
+            .map_err(|error| match error {
+                Error::InvalidDynamicLoadBias => Error::InvalidInterpreterLoadBias,
+                other => other,
+            })?;
+
+        for exec_segment in executable_plan.segments() {
+            let exec_end = exec_segment.virtual_end()?;
+            for interp_segment in interpreter_plan.segments() {
+                let interp_end = interp_segment.virtual_end()?;
+                if exec_segment.virtual_page_start < interp_end
+                    && interp_segment.virtual_page_start < exec_end
+                {
+                    return Err(Error::InterpreterOverlap);
+                }
+            }
+        }
+
+        Ok(Self {
+            executable: executable_plan,
+            interpreter: interpreter_plan,
+        })
+    }
+
+    pub const fn executable(&self) -> &UserLoadPlan<N> {
+        &self.executable
+    }
+
+    pub const fn interpreter(&self) -> &UserLoadPlan<N> {
+        &self.interpreter
+    }
+
+    pub const fn interpreter_base(&self) -> u64 {
+        self.interpreter.load_bias()
+    }
+
+    pub const fn program_entry(&self) -> u64 {
+        self.executable.entry()
+    }
+
+    pub const fn initial_pc(&self) -> u64 {
+        self.interpreter.entry()
+    }
+
+    pub const fn stack(&self) -> InitialStackPlan {
+        self.executable.stack()
     }
 }
 
