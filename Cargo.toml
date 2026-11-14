@@ -77,6 +77,7 @@ members = [
     "kernel/linux-identity",
     "kernel/linux-minimum-runtime-aarch64",
     "kernel/linux-minimum-runtime-core-aarch64",
+    "kernel/linux-mounts",
     "kernel/linux-pipe",
     "kernel/linux-signal",
     "kernel/linux-vfs",

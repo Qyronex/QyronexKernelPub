@@ -72,6 +72,8 @@ mod step30_runtime;
 mod step31_runtime;
 #[path = "step32_dev.rs"]
 mod step32_dev;
+#[path = "step33_mounts.rs"]
+mod step33_mounts;
 #[path = "step15_write.rs"]
 mod write;
 
@@ -668,6 +670,29 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         Err(()) => {
             if let Some(serial) = step15_svc_serial() {
                 serial.write_str("KERNAL/ARM64: Step 32 /dev invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
+    match step33_mounts::try_handle_syscall(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 33 mounts/proc/sys syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 33 mounts/proc/sys invariant failed nr=");
                 serial.write_u64(request.number);
                 serial.write_str("\n");
             }

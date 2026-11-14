@@ -243,6 +243,7 @@ impl Errno {
     pub const EFAULT: Self = Self(14);
     pub const EBUSY: Self = Self(16);
     pub const EEXIST: Self = Self(17);
+    pub const ENODEV: Self = Self(19);
     pub const ENOTDIR: Self = Self(20);
     pub const EISDIR: Self = Self(21);
     pub const EINVAL: Self = Self(22);
@@ -257,6 +258,23 @@ impl Errno {
     pub const ENOSYS: Self = Self(38);
     pub const ELOOP: Self = Self(40);
     pub const EOVERFLOW: Self = Self(75);
+    pub const ENOTSOCK: Self = Self(88);
+    pub const EDESTADDRREQ: Self = Self(89);
+    pub const EMSGSIZE: Self = Self(90);
+    pub const ENOPROTOOPT: Self = Self(92);
+    pub const EPROTONOSUPPORT: Self = Self(93);
+    pub const EOPNOTSUPP: Self = Self(95);
+    pub const EAFNOSUPPORT: Self = Self(97);
+    pub const EADDRINUSE: Self = Self(98);
+    pub const EADDRNOTAVAIL: Self = Self(99);
+    pub const ENETUNREACH: Self = Self(101);
+    pub const ECONNABORTED: Self = Self(103);
+    pub const ECONNRESET: Self = Self(104);
+    pub const ENOBUFS: Self = Self(105);
+    pub const EISCONN: Self = Self(106);
+    pub const ENOTCONN: Self = Self(107);
+    pub const ETIMEDOUT: Self = Self(110);
+    pub const ECONNREFUSED: Self = Self(111);
 
     pub const fn new(value: u16) -> Option<Self> {
         if value == 0 || value > MAX_ERRNO {
