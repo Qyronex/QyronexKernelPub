@@ -19,9 +19,10 @@ mod step31;
 pub use step31::{
     GRND_INSECURE, GRND_NONBLOCK, GRND_RANDOM, GetrandomFlags, IOVEC_BYTES, IoVec,
     KERNEL_TERMIOS_BYTES, MAX_RW_COUNT, RLIM_NLIMITS, RLIM64_INFINITY, RLIMIT64_BYTES, Rlimit64,
-    RlimitResource, Step31GlibcCall, TCGETS, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ,
-    UIO_MAXIOV, UTSNAME_BYTES, UTSNAME_FIELD_BYTES, WINSIZE_BYTES, WinSize, decode_getrandom_flags,
-    decode_iovcnt, decode_rlimit_resource, default_rlimit64, encode_default_serial_termios,
+    RlimitResource, Step31GlibcCall, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGPTN,
+    TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK, TIOCSWINSZ, UIO_MAXIOV, UTSNAME_BYTES,
+    UTSNAME_FIELD_BYTES, WINSIZE_BYTES, WinSize, decode_getrandom_flags, decode_iovcnt,
+    decode_rlimit_resource, default_rlimit64, encode_default_serial_termios,
     encode_linux_aarch64_utsname, validate_iovec_slice,
 };
 
@@ -230,6 +231,7 @@ impl Errno {
     pub const ESRCH: Self = Self(3);
     pub const EINTR: Self = Self(4);
     pub const EIO: Self = Self(5);
+    pub const ENXIO: Self = Self(6);
     pub const E2BIG: Self = Self(7);
     pub const ENOEXEC: Self = Self(8);
     pub const EBADF: Self = Self(9);

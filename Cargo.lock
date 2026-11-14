@@ -229,6 +229,7 @@ dependencies = [
  "kernal-linux-clone-runtime-aarch64",
  "kernal-linux-clone-trap-aarch64",
  "kernal-linux-credentials",
+ "kernal-linux-dev",
  "kernal-linux-exec",
  "kernal-linux-exit-lifecycle",
  "kernal-linux-fd",
@@ -559,6 +560,14 @@ dependencies = [
  "kernal-object",
  "kernal-process",
  "kernal-usercopy",
+]
+
+[[package]]
+name = "kernal-linux-dev"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
 ]
 
 [[package]]

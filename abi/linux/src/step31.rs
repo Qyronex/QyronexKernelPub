@@ -28,10 +28,16 @@ pub const RLIM_NLIMITS: u32 = 16;
 /// Linux TTY/console `ioctl(2)` request numbers observed during Debian 13 glibc/busybox/systemd
 /// startup (`<asm-generic/ioctls.h>`).
 pub const TCGETS: u32 = 0x5401;
+pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
+pub const TIOCSCTTY: u32 = 0x540e;
 pub const TIOCGPGRP: u32 = 0x540f;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
+pub const TIOCGPTN: u32 = 0x8004_5430;
+pub const TIOCSPTLCK: u32 = 0x4004_5431;
 
 /// Linux `struct winsize` byte size (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`).
 pub const WINSIZE_BYTES: usize = 8;

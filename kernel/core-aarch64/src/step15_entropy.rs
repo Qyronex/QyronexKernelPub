@@ -426,9 +426,15 @@ pub unsafe fn publish_qemu_at_random() -> Result<(), Error> {
 }
 
 /// Fills `dest` with forward-secure ChaCha20 random bytes derived from the DTB seed for Step-31
-/// `getrandom(2)`.
+/// `getrandom(2)` and Step-32 `/dev/random` / `/dev/urandom`.
 pub fn fill_getrandom(dest: &mut [u8]) -> Result<(), Error> {
     QEMU_GETRANDOM.fill(dest)
+}
+
+/// Reports whether the DTB-seeded ChaCha20 CSPRNG has been initialized and is ready to serve
+/// Step-31 `getrandom(2)` and Step-32 `/dev/random` / `/dev/urandom` reads.
+pub fn is_csprng_ready() -> bool {
+    QEMU_GETRANDOM.state.load(Ordering::Acquire) == CSPRNG_READY
 }
 
 /// Consumes the next of exactly two boot-provided Linux `AT_RANDOM` payloads.

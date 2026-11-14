@@ -35,6 +35,7 @@ kernal-linux-clone-runtime-aarch64 = { path = "../linux-clone-runtime-aarch64" }
 kernal-linux-clone-exit-aarch64 = { path = "../linux-clone-exit-aarch64" }
 kernal-linux-clone-trap-aarch64 = { path = "../linux-clone-trap-aarch64" }
 kernal-linux-credentials = { path = "../linux-credentials" }
+kernal-linux-dev = { path = "../linux-dev" }
 kernal-linux-exec = { path = "../linux-exec" }
 kernal-linux-exit-lifecycle = { path = "../linux-exit-lifecycle" }
 kernal-linux-fd = { path = "../linux-fd" }

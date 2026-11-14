@@ -66,6 +66,7 @@ members = [
     "kernel/linux-clone-trap-aarch64",
     "kernel/linux-clone-usercopy-aarch64",
     "kernel/linux-credentials",
+    "kernel/linux-dev",
     "kernel/linux-exec",
     "kernel/linux-exit-lifecycle",
     "kernel/linux-fd",

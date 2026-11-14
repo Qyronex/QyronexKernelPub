@@ -4,12 +4,13 @@ use core::num::NonZeroU32;
 use kernal_capability::ObjectId;
 use kernal_linux_aarch64_abi::classify_step31_glibc;
 use kernal_linux_abi::{
-    Errno, IOVEC_BYTES, IoVec, MAX_RW_COUNT, RLIMIT64_BYTES, Rlimit64, Step31GlibcCall,
-    SyscallRequest, SyscallReturn, TCGETS, TIOCGPGRP, TIOCGWINSZ, TIOCSPGRP, TIOCSWINSZ,
-    WINSIZE_BYTES, WinSize, decode_getrandom_flags, decode_iovcnt, decode_rlimit_resource,
-    default_rlimit64, encode_default_serial_termios, encode_linux_aarch64_utsname,
-    linux_signed_int, linux_unsigned_int,
+    Errno, IOVEC_BYTES, IoVec, KERNEL_TERMIOS_BYTES, MAX_RW_COUNT, RLIMIT64_BYTES, Rlimit64,
+    Step31GlibcCall, SyscallRequest, SyscallReturn, TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP,
+    TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, WINSIZE_BYTES, WinSize, decode_getrandom_flags,
+    decode_iovcnt, decode_rlimit_resource, default_rlimit64, encode_default_serial_termios,
+    encode_linux_aarch64_utsname, linux_signed_int, linux_unsigned_int,
 };
+use kernal_linux_dev::Termios;
 #[cfg(feature = "step29-qemu-proof")]
 use kernal_linux_fd::{Error as FdError, ExternalObject, OpenObjectKind};
 use kernal_linux_write_aarch64::{WriteError, write_from_user};
@@ -237,6 +238,18 @@ fn handle_ioctl(raw_fd: u64, raw_request: u64, arg: u64) -> Result<i64, Step31Er
         TCGETS => {
             let termios = encode_default_serial_termios();
             kernal_usercopy_aarch64::copy_to_user(arg, &termios).map_err(map_usercopy_step31)?;
+            Ok(0)
+        }
+        TCSETS | TCSETSW | TCSETSF => {
+            let mut raw = [0u8; KERNEL_TERMIOS_BYTES];
+            kernal_usercopy_aarch64::copy_from_user(&mut raw, arg).map_err(map_usercopy_step31)?;
+            let _ = Termios::from_le_bytes(raw);
+            Ok(0)
+        }
+        TIOCSCTTY => {
+            if _pid != pgid {
+                return Err(Step31Error::Linux(Errno::EPERM));
+            }
             Ok(0)
         }
         TIOCGWINSZ => {
