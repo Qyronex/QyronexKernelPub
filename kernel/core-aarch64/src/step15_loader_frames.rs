@@ -15,10 +15,11 @@ use kernal_process::Process;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_process_aarch64::BoundProcessAddressSpace;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-use kernal_user_elf_aarch64::required_pages;
+use kernal_user_elf_aarch64::{required_dynamic_pages, required_pages};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_user_elf_runtime_aarch64::{
-    LinuxProcessStart, LoadedImage, load_aarch64_linux_elf, plan_aarch64_elf,
+    LinuxProcessStart, LoadedImage, load_aarch64_dynamic_linux_elf, load_aarch64_linux_elf,
+    plan_aarch64_dynamic_elf, plan_aarch64_dynamic_linux_initial_stack, plan_aarch64_elf,
     plan_aarch64_linux_initial_stack,
 };
 
@@ -221,11 +222,62 @@ fn plan_initial_linux_load<const SEGMENTS: usize>(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn plan_dynamic_linux_load<const SEGMENTS: usize>(
+    executable: &[u8],
+    interpreter: &[u8],
+    start: LinuxProcessStart<'_>,
+) -> Result<(usize, u64), Error> {
+    plan_aarch64_dynamic_linux_initial_stack::<SEGMENTS>(
+        executable,
+        interpreter,
+        Default::default(),
+        start,
+    )
+    .map_err(Error::Loader)?;
+    let plan = plan_aarch64_dynamic_elf::<SEGMENTS>(executable, interpreter, Default::default())
+        .map_err(Error::Loader)?;
+    let required = required_dynamic_pages(&plan)
+        .map_err(Error::Mapping)?
+        .checked_add(1)
+        .ok_or(Error::InitialBreak)?;
+
+    let mut initial_break = None;
+    for segment in plan.executable().segments() {
+        let in_page = u64::try_from(segment.in_page_offset).map_err(|_| Error::InitialBreak)?;
+        let memory = u64::try_from(segment.memory_size).map_err(|_| Error::InitialBreak)?;
+        let segment_start = segment
+            .virtual_page_start
+            .checked_add(in_page)
+            .ok_or(Error::InitialBreak)?;
+        let segment_end = segment_start
+            .checked_add(memory)
+            .ok_or(Error::InitialBreak)?;
+        initial_break =
+            Some(initial_break.map_or(segment_end, |current: u64| current.max(segment_end)));
+    }
+    let initial_break = initial_break.ok_or(Error::InitialBreak)?;
+    Ok((required, initial_break))
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn plan_exec_linux_load<const SEGMENTS: usize>(
+    image: &[u8],
+    interpreter: Option<&[u8]>,
+    start: LinuxProcessStart<'_>,
+) -> Result<(usize, u64), Error> {
+    match interpreter {
+        Some(interpreter) => plan_dynamic_linux_load::<SEGMENTS>(image, interpreter, start),
+        None => plan_initial_linux_load::<SEGMENTS>(image, start),
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub(super) fn preflight_exec_linux_load<const SEGMENTS: usize>(
     image: &[u8],
+    interpreter: Option<&[u8]>,
     start: LinuxProcessStart<'_>,
 ) -> Result<(), Error> {
-    plan_initial_linux_load::<SEGMENTS>(image, start).map(|_| ())
+    plan_exec_linux_load::<SEGMENTS>(image, interpreter, start).map(|_| ())
 }
 
 /// Allocates the exact initial image/stack frame batch from Core's sole live pool and invokes the
@@ -318,6 +370,7 @@ pub(super) unsafe fn load_exec_linux_elf_with_core_frames<
     B: Backend,
 >(
     image: &[u8],
+    interpreter: Option<&[u8]>,
     start: LinuxProcessStart<'_>,
     pool: &mut Step15FramePool,
     process: &Process<CAPS>,
@@ -325,10 +378,11 @@ pub(super) unsafe fn load_exec_linux_elf_with_core_frames<
     space: &mut BoundProcessAddressSpace<VMAS>,
     backend: &mut B,
 ) -> Result<LoadedInitialLinuxImage, ExecLoadFailure<FRAMES>> {
-    let (required, initial_break) = match plan_initial_linux_load::<SEGMENTS>(image, start) {
-        Ok(plan) => plan,
-        Err(error) => return Err(ExecLoadFailure::new(error, InitialFrameBatch::new())),
-    };
+    let (required, initial_break) =
+        match plan_exec_linux_load::<SEGMENTS>(image, interpreter, start) {
+            Ok(plan) => plan,
+            Err(error) => return Err(ExecLoadFailure::new(error, InitialFrameBatch::new())),
+        };
     let (allocator, reservations) = pool.split();
     let batch = match InitialFrameBatch::<FRAMES>::allocate(allocator, required) {
         Ok(batch) => batch,
@@ -337,19 +391,36 @@ pub(super) unsafe fn load_exec_linux_elf_with_core_frames<
 
     // SAFETY: identical owner/quiescence contract to the boot wrapper above. The batch remains linear
     // Core authority until successful mapping publication; on error it is returned intact below.
-    match unsafe {
-        load_aarch64_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
-            image,
-            Default::default(),
-            start,
-            batch.frames(),
-            process,
-            objects,
-            space,
-            backend,
-            reservations,
-        )
-    } {
+    let result = match interpreter {
+        Some(interpreter) => unsafe {
+            load_aarch64_dynamic_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
+                image,
+                interpreter,
+                Default::default(),
+                start,
+                batch.frames(),
+                process,
+                objects,
+                space,
+                backend,
+                reservations,
+            )
+        },
+        None => unsafe {
+            load_aarch64_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
+                image,
+                Default::default(),
+                start,
+                batch.frames(),
+                process,
+                objects,
+                space,
+                backend,
+                reservations,
+            )
+        },
+    };
+    match result {
         Ok(loaded) => Ok(LoadedInitialLinuxImage {
             loaded,
             initial_break,

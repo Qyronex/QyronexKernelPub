@@ -68,6 +68,8 @@ mod step30_exec_source;
 mod step30_fork;
 #[path = "step30_runtime.rs"]
 mod step30_runtime;
+#[path = "step31_runtime.rs"]
+mod step31_runtime;
 #[path = "step15_write.rs"]
 mod write;
 
@@ -1274,6 +1276,29 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         Err(()) => {
             if let Some(serial) = step15_svc_serial() {
                 serial.write_str("KERNAL/ARM64: Step 30 runtime invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
+    match step31_runtime::handle(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 31 glibc syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 31 glibc syscall invariant failed nr=");
                 serial.write_u64(request.number);
                 serial.write_str("\n");
             }

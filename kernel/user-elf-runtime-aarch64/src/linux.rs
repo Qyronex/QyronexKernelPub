@@ -24,7 +24,9 @@ const RT_SIGRETURN_TRAMPOLINE_BYTES: [u8; 12] = [
 ];
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-use super::{Error as LoaderError, LoadedImage, load_aarch64_elf_prepared};
+use super::{
+    Error as LoaderError, LoadedImage, load_aarch64_dynamic_elf_prepared, load_aarch64_elf_prepared,
+};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_memory::{PhysFrame, ReservationSet};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
@@ -197,6 +199,87 @@ pub unsafe fn load_aarch64_linux_elf<
 
     // The base image is now final and TTBR0 is inactive. Install the one extra anonymous page through
     // the same Process/AddressSpace owner. Any failure poisons the staged image at the caller boundary.
+    unsafe {
+        install_rt_sigreturn_trampoline(
+            trampoline_address,
+            trampoline_frame,
+            process,
+            objects,
+            space,
+            backend,
+            reserved,
+        )?;
+    }
+    Ok(loaded)
+}
+
+/// Loads one validated dynamic AArch64 ELF executable (`PT_INTERP`) together with its `ET_DYN`
+/// interpreter and populates the initial Linux stack (`argc`, `argv`, `envp`, 13-entry `auxv`
+/// with `AT_BASE = interpreter_base` and `AT_ENTRY = program_entry`) before installing the
+/// `rt_sigreturn` trampoline page.
+///
+/// # Safety
+/// Same owner/quiescence contract as [`load_aarch64_linux_elf`].
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn load_aarch64_dynamic_linux_elf<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    B: Backend,
+>(
+    executable: &[u8],
+    interpreter: &[u8],
+    policy: DynamicLoadPolicy,
+    start: LinuxProcessStart<'_>,
+    frames: &[PhysFrame],
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+    reserved: &ReservationSet<RESERVED>,
+) -> Result<LoadedImage, Error> {
+    let (plan, spec, layout) =
+        prepare_dynamic_linux_image::<SEGMENTS>(executable, interpreter, policy, start)?;
+    let initial_sp = layout.initial_sp();
+    let trampoline_address = signal_trampoline_address(plan.executable())?;
+    let base_pages = kernal_user_elf_aarch64::required_dynamic_pages(&plan)?;
+    let expected = base_pages.checked_add(1).ok_or(Error::AddressOverflow)?;
+    if frames.len() != expected {
+        return Err(Error::FrameCountMismatch {
+            expected,
+            actual: frames.len(),
+        });
+    }
+    let (base_frames, trampoline_frames) = frames.split_at(base_pages);
+    let trampoline_frame = trampoline_frames[0];
+    if reserved.contains(trampoline_frame) {
+        return Err(Error::ReservedFrame);
+    }
+    if base_frames.contains(&trampoline_frame) {
+        return Err(Error::DuplicateFrame);
+    }
+
+    // SAFETY: delegated caller contract owns the exact same temporary process mappings and TTBR0
+    // switch window.
+    let loaded = unsafe {
+        load_aarch64_dynamic_elf_prepared(
+            executable,
+            interpreter,
+            plan,
+            initial_sp,
+            base_frames,
+            process,
+            objects,
+            space,
+            backend,
+            reserved,
+            move |plan| initialize_linux_stack(plan.executable(), spec, layout),
+        )
+    }?;
+
     unsafe {
         install_rt_sigreturn_trampoline(
             trampoline_address,

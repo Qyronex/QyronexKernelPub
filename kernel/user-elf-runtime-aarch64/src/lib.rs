@@ -4,12 +4,12 @@
 
 mod linux;
 pub use kernal_user_elf::linux_stack::{MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_STRING_BYTES};
-#[cfg(all(target_arch = "aarch64", target_os = "none"))]
-pub use linux::load_aarch64_linux_elf;
 pub use linux::{
     AARCH64_LINUX_RT_SIGRETURN_TRAMPOLINE, LinuxInitialStackLayout, LinuxProcessStart,
     plan_aarch64_dynamic_linux_initial_stack, plan_aarch64_linux_initial_stack,
 };
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub use linux::{load_aarch64_dynamic_linux_elf, load_aarch64_linux_elf};
 
 use kernal_elf::{Error as ElfError, Image, Machine};
 use kernal_memory::{PhysFrame, ReservationSet};
@@ -31,7 +31,7 @@ use kernal_process::Process;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_process_aarch64::BoundProcessAddressSpace;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-use kernal_user_elf_aarch64::map_user_image_pages;
+use kernal_user_elf_aarch64::{map_dynamic_user_image_pages, map_user_image_pages};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_vm::{Backing, VmPerms, Vma};
 
@@ -119,6 +119,13 @@ pub fn plan_aarch64_dynamic_elf<const SEGMENTS: usize>(
         &parsed_interp,
         policy,
     )?)
+}
+
+/// Returns the validated `PT_INTERP` path (without trailing NUL) when `image` is a valid
+/// `EM_AARCH64` ELF declaring a dynamic interpreter.
+pub fn aarch64_elf_interpreter_path(image: &[u8]) -> Result<Option<&[u8]>, Error> {
+    let parsed = Image::parse_for_machine(image, Machine::Aarch64)?;
+    Ok(parsed.interpreter_path()?)
 }
 
 /// Validates the complete frame and initialization plan for a dynamic executable plus interpreter
@@ -520,6 +527,313 @@ fn rollback_staging_prefix<
     let mut cleanup_failed = false;
 
     for segment in plan.segments() {
+        for page_index in 0..segment.page_count {
+            if remaining == 0 {
+                break;
+            }
+            let expected_frame = frames.get(frame_cursor).copied();
+            match segment_page_address(segment.virtual_page_start, page_index) {
+                Ok(address) => match space.unmap_user_page_coalescing_anonymous(
+                    process,
+                    objects,
+                    process.address_space_handle(),
+                    backend,
+                    address,
+                ) {
+                    Ok(frame) if expected_frame == Some(frame) => {}
+                    Ok(_) | Err(_) => cleanup_failed = true,
+                },
+                Err(_) => cleanup_failed = true,
+            }
+            frame_cursor += 1;
+            remaining -= 1;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+
+    if remaining != 0 {
+        let stack = plan.stack();
+        for page_index in 0..stack.stack_pages() {
+            if remaining == 0 {
+                break;
+            }
+            let expected_frame = frames.get(frame_cursor).copied();
+            match segment_page_address(stack.stack_start(), page_index) {
+                Ok(address) => match space.unmap_user_page_coalescing_anonymous(
+                    process,
+                    objects,
+                    process.address_space_handle(),
+                    backend,
+                    address,
+                ) {
+                    Ok(frame) if expected_frame == Some(frame) => {}
+                    Ok(_) | Err(_) => cleanup_failed = true,
+                },
+                Err(_) => cleanup_failed = true,
+            }
+            frame_cursor += 1;
+            remaining -= 1;
+        }
+    }
+
+    if remaining != 0 {
+        cleanup_failed = true;
+    }
+    if cleanup_failed {
+        space.poison();
+        Err(Error::StagingRollbackFailed)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+unsafe fn load_aarch64_dynamic_elf_prepared<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    B: Backend,
+    F: FnOnce(&DynamicUserLoadPlan<SEGMENTS>) -> Result<(), Error>,
+>(
+    executable: &[u8],
+    interpreter: &[u8],
+    plan: DynamicUserLoadPlan<SEGMENTS>,
+    initial_sp: u64,
+    frames: &[PhysFrame],
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+    reserved: &ReservationSet<RESERVED>,
+    initialize_after_base: F,
+) -> Result<LoadedImage, Error> {
+    let total_pages = preflight_dynamic(executable, interpreter, &plan, frames, reserved)?;
+
+    map_dynamic_staging_pages(&plan, frames, process, objects, space, backend, reserved)?;
+
+    if unsafe { space.activate_owner(process, objects) }.is_err() {
+        rollback_dynamic_staging_prefix(
+            &plan,
+            frames,
+            total_pages,
+            process,
+            objects,
+            space,
+            backend,
+        )?;
+        return Err(Error::AddressSpace);
+    }
+
+    let initialize_result = initialize_dynamic_staging(executable, interpreter, &plan)
+        .and_then(|()| initialize_after_base(&plan));
+    if unsafe { BoundProcessAddressSpace::<VMAS>::deactivate() }.is_err() {
+        space.poison();
+        return Err(Error::AddressSpace);
+    }
+    if let Err(error) = initialize_result {
+        rollback_dynamic_staging_prefix(
+            &plan,
+            frames,
+            total_pages,
+            process,
+            objects,
+            space,
+            backend,
+        )?;
+        return Err(error);
+    }
+
+    rollback_dynamic_staging_prefix(&plan, frames, total_pages, process, objects, space, backend)?;
+
+    let mapped =
+        map_dynamic_user_image_pages(&plan, frames, process, objects, space, backend, reserved)?;
+    Ok(LoadedImage {
+        mapped,
+        entry: plan.initial_pc(),
+        initial_sp,
+    })
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+fn map_dynamic_staging_pages<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    B: Backend,
+>(
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+    frames: &[PhysFrame],
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+    reserved: &ReservationSet<RESERVED>,
+) -> Result<(), Error> {
+    let staging_perms = VmPerms::READ.union(VmPerms::WRITE);
+    let mut frame_cursor = 0usize;
+    let mut mapped_pages = 0usize;
+
+    for segment in plan
+        .executable()
+        .segments()
+        .chain(plan.interpreter().segments())
+    {
+        for page_index in 0..segment.page_count {
+            let address = segment_page_address(segment.virtual_page_start, page_index)?;
+            let result = map_staging_page(
+                address,
+                frames[frame_cursor],
+                staging_perms,
+                process,
+                objects,
+                space,
+                backend,
+                reserved,
+            );
+            if let Err(error) = result {
+                if rollback_dynamic_staging_prefix(
+                    plan,
+                    frames,
+                    mapped_pages,
+                    process,
+                    objects,
+                    space,
+                    backend,
+                )
+                .is_err()
+                {
+                    return Err(Error::StagingRollbackFailed);
+                }
+                return Err(error);
+            }
+            frame_cursor += 1;
+            mapped_pages += 1;
+        }
+    }
+
+    let stack = plan.stack();
+    for page_index in 0..stack.stack_pages() {
+        let address = segment_page_address(stack.stack_start(), page_index)?;
+        let result = map_staging_page(
+            address,
+            frames[frame_cursor],
+            staging_perms,
+            process,
+            objects,
+            space,
+            backend,
+            reserved,
+        );
+        if let Err(error) = result {
+            if rollback_dynamic_staging_prefix(
+                plan,
+                frames,
+                mapped_pages,
+                process,
+                objects,
+                space,
+                backend,
+            )
+            .is_err()
+            {
+                return Err(Error::StagingRollbackFailed);
+            }
+            return Err(error);
+        }
+        frame_cursor += 1;
+        mapped_pages += 1;
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn initialize_dynamic_staging<const SEGMENTS: usize>(
+    executable: &[u8],
+    interpreter: &[u8],
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+) -> Result<(), Error> {
+    let mut page = [0u8; PAGE_SIZE as usize];
+
+    for (image_bytes, segments) in [
+        (executable, plan.executable().segments()),
+        (interpreter, plan.interpreter().segments()),
+    ] {
+        for segment in segments {
+            for page_index in 0..segment.page_count {
+                initialize_segment_page(image_bytes, *segment, page_index, &mut page)?;
+                let address = segment_page_address(segment.virtual_page_start, page_index)?;
+                kernal_usercopy_aarch64::copy_to_user(address, &page)
+                    .map_err(|_| Error::Usercopy)?;
+            }
+
+            if segment.perms.executable {
+                let page_count =
+                    u64::try_from(segment.page_count).map_err(|_| Error::AddressOverflow)?;
+                let length = page_count
+                    .checked_mul(PAGE_SIZE)
+                    .ok_or(Error::AddressOverflow)?;
+                // SAFETY: the staging root is active and this VA range resolves to the same
+                // dedicated Normal-memory frames later remapped at the identical execution VA.
+                unsafe {
+                    kernal_cache_aarch64::sync_modified_code(
+                        segment.virtual_page_start,
+                        segment.virtual_page_start,
+                        length,
+                    )
+                }
+                .map_err(|_| Error::CacheMaintenance)?;
+            }
+        }
+    }
+
+    let stack = plan.stack();
+    for page_index in 0..stack.stack_pages() {
+        initialize_stack_page(stack, page_index, &mut page)?;
+        let address = segment_page_address(stack.stack_start(), page_index)?;
+        kernal_usercopy_aarch64::copy_to_user(address, &page).map_err(|_| Error::Usercopy)?;
+    }
+
+    if kernal_usercopy_aarch64::pan_enabled() != Ok(true) {
+        return Err(Error::Usercopy);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+fn rollback_dynamic_staging_prefix<
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    B: Backend,
+>(
+    plan: &DynamicUserLoadPlan<SEGMENTS>,
+    frames: &[PhysFrame],
+    mapped_pages: usize,
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+) -> Result<(), Error> {
+    let mut remaining = mapped_pages;
+    let mut frame_cursor = 0usize;
+    let mut cleanup_failed = false;
+
+    for segment in plan
+        .executable()
+        .segments()
+        .chain(plan.interpreter().segments())
+    {
         for page_index in 0..segment.page_count {
             if remaining == 0 {
                 break;

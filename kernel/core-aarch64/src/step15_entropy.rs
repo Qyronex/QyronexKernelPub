@@ -20,6 +20,7 @@ pub enum Error {
     Fdt(kernal_fdt::Error),
     MissingSeed,
     SeedTooShort,
+    AllZeroSeed,
     DuplicateSeed,
     AlreadyPublished,
     Busy,
@@ -191,11 +192,180 @@ impl SeedCell {
 
 static QEMU_AT_RANDOM: SeedCell = SeedCell::new();
 
+const CSPRNG_READY: u8 = 2;
+const CSPRNG_BORROWED: u8 = 3;
+const CHACHA_DOMAIN_NONCE: [u32; 3] = [0x2d52_5951, 0x5045_5453, 0x472d_3133];
+
+struct CsprngCell {
+    state: AtomicU8,
+    key: UnsafeCell<[u8; QEMU_RNG_SEED_BYTES]>,
+    generation: UnsafeCell<u64>,
+}
+
+// SAFETY: EMPTY -> INSTALLING gives one publisher; CSPRNG_READY -> CSPRNG_BORROWED gives one
+// exclusive caller that rekeys and advances generation before releasing CSPRNG_READY.
+unsafe impl Sync for CsprngCell {}
+
+impl CsprngCell {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(EMPTY),
+            key: UnsafeCell::new([0; QEMU_RNG_SEED_BYTES]),
+            generation: UnsafeCell::new(0),
+        }
+    }
+
+    #[cfg_attr(
+        not(any(test, all(target_arch = "aarch64", target_os = "none"))),
+        allow(dead_code)
+    )]
+    fn publish(&self, seed: [u8; QEMU_RNG_SEED_BYTES]) -> Result<(), Error> {
+        if seed == [0u8; QEMU_RNG_SEED_BYTES] {
+            return Err(Error::AllZeroSeed);
+        }
+        match self
+            .state
+            .compare_exchange(EMPTY, INSTALLING, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => {}
+            Err(INSTALLING | CSPRNG_BORROWED) => return Err(Error::Busy),
+            Err(CSPRNG_READY) => return Err(Error::AlreadyPublished),
+            Err(_) => return Err(Error::InvalidState),
+        }
+        // Derive an initial key distinct from raw AT_RANDOM halves via domain-separated ChaCha20.
+        let initial_block = chacha20_block(&seed, 0, CHACHA_DOMAIN_NONCE);
+        let mut derived_key = [0u8; QEMU_RNG_SEED_BYTES];
+        derived_key.copy_from_slice(&initial_block[..QEMU_RNG_SEED_BYTES]);
+        // SAFETY: INSTALLING is exclusive writer ownership before CSPRNG_READY publication.
+        unsafe {
+            *self.key.get() = derived_key;
+            *self.generation.get() = 1;
+        }
+        self.state.store(CSPRNG_READY, Ordering::Release);
+        Ok(())
+    }
+
+    fn fill(&self, dest: &mut [u8]) -> Result<(), Error> {
+        loop {
+            match self.state.load(Ordering::Acquire) {
+                EMPTY => return Err(Error::MissingSeed),
+                INSTALLING | CSPRNG_BORROWED => return Err(Error::Busy),
+                CSPRNG_READY => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            CSPRNG_READY,
+                            CSPRNG_BORROWED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+                _ => return Err(Error::InvalidState),
+            }
+        }
+
+        // SAFETY: CSPRNG_BORROWED grants exclusive access to `key` and `generation`.
+        let (current_key, current_gen) = unsafe { (*self.key.get(), *self.generation.get()) };
+        let nonce = [
+            current_gen as u32,
+            (current_gen >> 32) as u32,
+            CHACHA_DOMAIN_NONCE[2],
+        ];
+        let mut block0 = chacha20_block(&current_key, 0, nonce);
+        let mut next_key = [0u8; QEMU_RNG_SEED_BYTES];
+        next_key.copy_from_slice(&block0[..QEMU_RNG_SEED_BYTES]);
+
+        let mut written = 0usize;
+        let first_take = dest.len().min(32);
+        dest[..first_take].copy_from_slice(&block0[32..32 + first_take]);
+        written += first_take;
+        block0.fill(0);
+
+        let mut counter = 1u32;
+        while written < dest.len() {
+            let mut block = chacha20_block(&current_key, counter, nonce);
+            let take = (dest.len() - written).min(64);
+            dest[written..written + take].copy_from_slice(&block[..take]);
+            written += take;
+            block.fill(0);
+            counter = counter.wrapping_add(1);
+        }
+
+        // SAFETY: still holding CSPRNG_BORROWED; overwrite key with forward-secure rekeyed state.
+        unsafe {
+            *self.key.get() = next_key;
+            *self.generation.get() = current_gen.wrapping_add(1);
+        }
+        next_key.fill(0);
+        self.state.store(CSPRNG_READY, Ordering::Release);
+        Ok(())
+    }
+}
+
+fn chacha20_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(16);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(12);
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] = (state[d] ^ state[a]).rotate_left(8);
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] = (state[b] ^ state[c]).rotate_left(7);
+}
+
+fn chacha20_block(key: &[u8; 32], counter: u32, nonce: [u32; 3]) -> [u8; 64] {
+    let mut state = [0u32; 16];
+    state[0] = 0x6170_7865;
+    state[1] = 0x3320_646e;
+    state[2] = 0x7962_2d32;
+    state[3] = 0x6b20_6574;
+    for i in 0..8 {
+        let offset = i * 4;
+        state[4 + i] = u32::from_le_bytes([
+            key[offset],
+            key[offset + 1],
+            key[offset + 2],
+            key[offset + 3],
+        ]);
+    }
+    state[12] = counter;
+    state[13] = nonce[0];
+    state[14] = nonce[1];
+    state[15] = nonce[2];
+
+    let initial = state;
+    for _ in 0..10 {
+        chacha20_quarter_round(&mut state, 0, 4, 8, 12);
+        chacha20_quarter_round(&mut state, 1, 5, 9, 13);
+        chacha20_quarter_round(&mut state, 2, 6, 10, 14);
+        chacha20_quarter_round(&mut state, 3, 7, 11, 15);
+        chacha20_quarter_round(&mut state, 0, 5, 10, 15);
+        chacha20_quarter_round(&mut state, 1, 6, 11, 12);
+        chacha20_quarter_round(&mut state, 2, 7, 8, 13);
+        chacha20_quarter_round(&mut state, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 64];
+    for i in 0..16 {
+        let word = state[i].wrapping_add(initial[i]).to_le_bytes();
+        let offset = i * 4;
+        out[offset..offset + 4].copy_from_slice(&word);
+    }
+    out
+}
+
+static QEMU_GETRANDOM: CsprngCell = CsprngCell::new();
+
 /// Extracts the complete 32-byte root `/chosen/rng-seed` property prefix from a validated DTB.
 ///
 /// QEMU ARM `virt` publishes 32 host-random bytes when DTB randomness is enabled. Step 30 retains
 /// exactly those bytes so the initial image and one real exec receive disjoint 16-byte payloads.
-/// Nested `rng-seed` properties do not count. Short or duplicate root-chosen seeds fail closed.
+/// Nested `rng-seed` properties do not count. Short, all-zero, or duplicate root-chosen seeds fail
+/// closed.
 pub fn extract_at_random(blob: &Blob<'_>) -> Result<[u8; QEMU_RNG_SEED_BYTES], Error> {
     let mut depth = 0usize;
     let mut chosen_depth = None;
@@ -217,6 +387,11 @@ pub fn extract_at_random(blob: &Blob<'_>) -> Result<[u8; QEMU_RNG_SEED_BYTES], E
                     let prefix = value
                         .get(..QEMU_RNG_SEED_BYTES)
                         .ok_or(Error::SeedTooShort)?;
+                    if prefix[..AT_RANDOM_BYTES] == [0u8; AT_RANDOM_BYTES]
+                        || prefix[AT_RANDOM_BYTES..QEMU_RNG_SEED_BYTES] == [0u8; AT_RANDOM_BYTES]
+                    {
+                        return Err(Error::AllZeroSeed);
+                    }
                     let mut seed = [0u8; QEMU_RNG_SEED_BYTES];
                     seed.copy_from_slice(prefix);
                     found = Some(seed);
@@ -245,7 +420,15 @@ pub unsafe fn publish_qemu_at_random() -> Result<(), Error> {
     let blob = unsafe {
         super::super::qemu_dtb(super::super::QEMU_VIRT_RAM_BASE).ok_or(Error::QemuDtbUnavailable)?
     };
-    QEMU_AT_RANDOM.publish(extract_at_random(&blob)?)
+    let seed = extract_at_random(&blob)?;
+    QEMU_AT_RANDOM.publish(seed)?;
+    QEMU_GETRANDOM.publish(seed)
+}
+
+/// Fills `dest` with forward-secure ChaCha20 random bytes derived from the DTB seed for Step-31
+/// `getrandom(2)`.
+pub fn fill_getrandom(dest: &mut [u8]) -> Result<(), Error> {
+    QEMU_GETRANDOM.fill(dest)
 }
 
 /// Consumes the next of exactly two boot-provided Linux `AT_RANDOM` payloads.
@@ -432,5 +615,48 @@ mod tests {
             cell.with_second_transaction(|_| Ok::<(), ()>(())),
             Err(Error::Exhausted)
         );
+    }
+
+    #[test]
+    fn all_zero_rng_seed_half_is_rejected_by_extract_at_random() {
+        let mut first_half_zero = [0x11u8; QEMU_RNG_SEED_BYTES];
+        first_half_zero[..AT_RANDOM_BYTES].fill(0);
+        let bytes = blob(Some(&first_half_zero), false, false);
+        assert_eq!(
+            extract_at_random(&Blob::parse(&bytes).unwrap()),
+            Err(Error::AllZeroSeed)
+        );
+
+        let mut second_half_zero = [0x11u8; QEMU_RNG_SEED_BYTES];
+        second_half_zero[AT_RANDOM_BYTES..].fill(0);
+        let bytes = blob(Some(&second_half_zero), false, false);
+        assert_eq!(
+            extract_at_random(&Blob::parse(&bytes).unwrap()),
+            Err(Error::AllZeroSeed)
+        );
+    }
+
+    #[test]
+    fn csprng_cell_produces_forward_secure_non_zero_getrandom_streams() {
+        let csprng = CsprngCell::new();
+        let mut out1 = [0u8; 96];
+        let mut out2 = [0u8; 96];
+        assert_eq!(csprng.fill(&mut out1), Err(Error::MissingSeed));
+        assert_eq!(
+            csprng.publish([0u8; QEMU_RNG_SEED_BYTES]),
+            Err(Error::AllZeroSeed)
+        );
+
+        let seed: [u8; QEMU_RNG_SEED_BYTES] = core::array::from_fn(|i| (i as u8).wrapping_add(1));
+        csprng.publish(seed).unwrap();
+        assert_eq!(csprng.publish(seed), Err(Error::AlreadyPublished));
+
+        csprng.fill(&mut out1).unwrap();
+        csprng.fill(&mut out2).unwrap();
+        assert_ne!(out1, [0u8; 96]);
+        assert_ne!(out2, [0u8; 96]);
+        assert_ne!(out1, out2);
+        assert_ne!(&out1[..16], &seed[..16]);
+        assert_ne!(&out1[..16], &seed[16..32]);
     }
 }

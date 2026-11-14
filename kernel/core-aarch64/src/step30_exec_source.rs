@@ -63,6 +63,32 @@ impl ExecImageSource {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(super) fn select_optional_interpreter_source(
+    process: ObjectId,
+    image: &[u8],
+) -> Result<Option<ExecImageSource>, ExecSourceError> {
+    let Ok(Some(interp_path)) =
+        kernal_user_elf_runtime_aarch64::aarch64_elf_interpreter_path(image)
+    else {
+        return Ok(None);
+    };
+    let lookup = ExecLookupPlan::execve(interp_path.is_empty())
+        .map_err(|_| ExecSourceError::Linux(Errno::ENOEXEC))?;
+    select_exec_image_source(process, lookup, interp_path).map(Some)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(super) fn with_optional_source_bytes<R>(
+    source: Option<ExecImageSource>,
+    operation: impl for<'a> FnOnce(Option<&'a [u8]>) -> R,
+) -> Result<R, ExecSourceError> {
+    match source {
+        Some(source) => source.with_image_bytes(|bytes| operation(Some(bytes))),
+        None => Ok(operation(None)),
+    }
+}
+
 /// Resolves and authorizes one Step-30 exec source through the exact current Process-local Step29
 /// FD/Fs/Overlay owner and returns only generation-qualified immutable initramfs authority.
 ///

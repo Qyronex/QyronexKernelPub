@@ -242,16 +242,27 @@ pub(super) unsafe fn stage_exec_image_with_core_frames(
             .map_err(ReversibleExecError::Source)?;
 
     let staged = source
-        .with_image_bytes(|image| {
-            vectors.with_linux_start(random, |start| {
-                // SAFETY: delegated caller contract owns the exact same lower-EL no-switch window;
-                // image/start borrows remain valid for this complete synchronous staging call.
-                unsafe { super::live_vm::stage_exec_image(current, image, start) }
-            })
+        .with_image_bytes(|image| -> Result<_, ReversibleExecError> {
+            let interpreter_source =
+                super::step30_exec_source::select_optional_interpreter_source(process, image)
+                    .map_err(ReversibleExecError::Source)?;
+            super::step30_exec_source::with_optional_source_bytes(
+                interpreter_source,
+                |interpreter| {
+                    vectors.with_linux_start(random, |start| {
+                        // SAFETY: delegated caller contract owns the exact same lower-EL no-switch window;
+                        // image/start borrows remain valid for this complete synchronous staging call.
+                        unsafe {
+                            super::live_vm::stage_exec_image(current, image, interpreter, start)
+                        }
+                    })
+                },
+            )
+            .map_err(ReversibleExecError::Source)?
+            .map_err(ReversibleExecError::Input)?
+            .map_err(ReversibleExecError::Stage)
         })
-        .map_err(ReversibleExecError::Source)?
-        .map_err(ReversibleExecError::Input)?
-        .map_err(ReversibleExecError::Stage)?;
+        .map_err(ReversibleExecError::Source)??;
 
     Ok(PreparedExecImage { process, staged })
 }

@@ -270,7 +270,10 @@ fn map_exec_preflight_error(error: super::loader_frames::Error) -> ExecStageErro
 
     match error {
         LoaderFrameError::Loader(
-            RuntimeError::Elf(_) | RuntimeError::UserPolicy(_) | RuntimeError::LinuxStack(_),
+            RuntimeError::Elf(_)
+            | RuntimeError::UserPolicy(_)
+            | RuntimeError::LinuxStack(_)
+            | RuntimeError::InterpreterRequired,
         )
         | LoaderFrameError::Mapping(MappingError::PageCountOverflow)
         | LoaderFrameError::InitialBreak => ExecStageError::Linux(Errno::ENOEXEC),
@@ -300,9 +303,10 @@ fn map_exec_preflight_error(error: super::loader_frames::Error) -> ExecStageErro
             | MappingError::RollbackFailed => ExecStageError::Invariant,
         },
         LoaderFrameError::Loader(runtime_error) => match runtime_error {
-            RuntimeError::Elf(_) | RuntimeError::UserPolicy(_) | RuntimeError::LinuxStack(_) => {
-                ExecStageError::Linux(Errno::ENOEXEC)
-            }
+            RuntimeError::Elf(_)
+            | RuntimeError::UserPolicy(_)
+            | RuntimeError::LinuxStack(_)
+            | RuntimeError::InterpreterRequired => ExecStageError::Linux(Errno::ENOEXEC),
             RuntimeError::Initialization(_)
             | RuntimeError::LinuxStackInvariant
             | RuntimeError::Mapping(_)
@@ -360,6 +364,7 @@ fn map_exec_recovered_load_error(error: super::loader_frames::Error) -> ExecStag
             | RuntimeError::Initialization(_)
             | RuntimeError::LinuxStack(_)
             | RuntimeError::LinuxStackInvariant
+            | RuntimeError::InterpreterRequired
             | RuntimeError::Mapping(_)
             | RuntimeError::FrameCountMismatch { .. }
             | RuntimeError::DuplicateFrame
@@ -421,6 +426,7 @@ impl StagedExecImage {
 pub(super) unsafe fn stage_exec_image(
     current: GlobalThreadId,
     image: &[u8],
+    interpreter: Option<&[u8]>,
     start: kernal_user_elf_runtime_aarch64::LinuxProcessStart<'_>,
 ) -> Result<StagedExecImage, ExecStageError> {
     // SAFETY: delegated caller contract owns the exact same synchronous live-table mutation window.
@@ -430,7 +436,9 @@ pub(super) unsafe fn stage_exec_image(
                 runtime::with_linux_runtime(|linux| {
                     linux.with_fork_snapshot_parent(current, |process, active_space, objects| {
                         super::loader_frames::preflight_exec_linux_load::<STEP30_EXEC_SEGMENTS>(
-                            image, start,
+                            image,
+                            interpreter,
+                            start,
                         )
                         .map_err(map_exec_preflight_error)?;
 
@@ -456,6 +464,7 @@ pub(super) unsafe fn stage_exec_image(
                                 RuntimeTablePool,
                             >(
                                 image,
+                                interpreter,
                                 start,
                                 frame_pool,
                                 process,
