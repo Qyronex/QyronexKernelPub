@@ -70,6 +70,8 @@ mod step30_fork;
 mod step30_runtime;
 #[path = "step31_runtime.rs"]
 mod step31_runtime;
+#[path = "step32_dev.rs"]
+mod step32_dev;
 #[path = "step15_write.rs"]
 mod write;
 
@@ -649,6 +651,29 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     let mut args = [0u64; MAX_SYSCALL_ARGS];
     args.copy_from_slice(&frame.x[..MAX_SYSCALL_ARGS]);
     let request = SyscallRequest::new(frame.x[8], args);
+
+    match step32_dev::try_handle_syscall(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 32 /dev syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 32 /dev invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
 
     #[cfg(feature = "step29-qemu-proof")]
     match step29_fd::handle(request, frame) {

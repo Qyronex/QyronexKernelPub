@@ -473,6 +473,29 @@ mod tests {
         assert_eq!(perms, VmPerms::READ.union(VmPerms::EXECUTE));
         assert_eq!(&preview[..4], b"\x7fELF");
 
+        // 2b. Overlay second page with RW data and then seal RELRO via mprotect_step31(PROT_READ).
+        let data_va = mmap_step31_dynamic::<16, _>(
+            base + PAGE_SIZE,
+            PAGE_SIZE,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_FIXED | MAP_DENYWRITE,
+            3,
+            0,
+            MmapFileBacking::FileSlice {
+                bytes: file_data,
+                file_offset: 0,
+            },
+            &mut backend,
+        )
+        .unwrap();
+        assert_eq!(data_va, base + PAGE_SIZE);
+        assert_eq!(
+            backend.page_at(base + PAGE_SIZE).unwrap().0,
+            VmPerms::READ.union(VmPerms::WRITE)
+        );
+        mprotect_step31::<16, _>(base + PAGE_SIZE, PAGE_SIZE, PROT_READ, &mut backend).unwrap();
+        assert_eq!(backend.page_at(base + PAGE_SIZE).unwrap().0, VmPerms::READ);
+
         // 3. Reject W+X before mutating existing mappings.
         assert_eq!(
             mmap_step31_dynamic::<16, _>(

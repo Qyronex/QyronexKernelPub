@@ -6,6 +6,7 @@ const EXEC_SOURCE: &str = include_str!("../../core-aarch64/src/step30_exec_sourc
 const EXEC_INPUT: &str = include_str!("../../core-aarch64/src/step30_exec_input.rs");
 const LIVE_VM: &str = include_str!("../../core-aarch64/src/step15_live_vm.rs");
 const LOADER_FRAMES: &str = include_str!("../../core-aarch64/src/step15_loader_frames.rs");
+const STEP32_DEV: &str = include_str!("../../core-aarch64/src/step32_dev.rs");
 
 #[test]
 fn step31_dynamic_interpreter_resolution_reuses_canonical_vfs_exec_source() {
@@ -45,5 +46,24 @@ fn step31_glibc_syscalls_route_getrandom_through_csprng_and_rseq_to_enosys() {
                 "Step31GlibcCall::Rseq { .. } => return Ok(Some(SyscallReturn::error(Errno::ENOSYS)))"
             ),
         "Step-31 runtime must serve getrandom/uname/prlimit64/ioctl/readv/writev via audited owners and reject rseq with -ENOSYS"
+    );
+}
+
+#[test]
+fn step31_dynamic_mmap_and_step32_dev_runtime_are_wired_into_aarch64_svc_dispatch() {
+    assert!(
+        STEP15_QEMU.contains("step31_runtime::try_handle_dynamic_mmap")
+            && STEP31_RUNTIME.contains("handle_step31_dynamic_mmap")
+            && LIVE_VM.contains("kernal_linux_vm_aarch64::handle_step31_dynamic_mmap"),
+        "Step-31 dynamic linker mmap must route through the audited Step-31 VM transaction owner"
+    );
+    assert!(
+        STEP15_QEMU.contains("#[path = \"step32_dev.rs\"]")
+            && STEP15_QEMU.contains("step32_dev::try_handle_syscall(request)")
+            && STEP31_RUNTIME.contains("step32_dev::handle_dev_ioctl")
+            && STEP32_DEV.contains("classify_dev_path")
+            && STEP32_DEV.contains("authorize_capability")
+            && STEP32_DEV.contains("PtyTable"),
+        "Step-32 /dev pseudo-devices and PTY/devpts subsystem must be wired into AArch64 syscall dispatch"
     );
 }

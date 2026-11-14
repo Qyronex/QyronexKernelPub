@@ -232,6 +232,26 @@ fn handle_ioctl(raw_fd: u64, raw_request: u64, arg: u64) -> Result<i64, Step31Er
     let request = linux_unsigned_int(raw_request);
     let (process_id, _pid, pgid) = current_process_identity()?;
 
+    if super::step32_dev::is_dev_fd(raw_fd) {
+        let ret = super::step32_dev::handle_dev_ioctl(
+            process_id,
+            pgid.get(),
+            pgid.get(),
+            _pid == pgid,
+            raw_fd,
+            raw_request,
+            arg,
+        )
+        .map_err(|()| Step31Error::Invariant)?;
+        let raw = ret.raw();
+        if raw < 0 {
+            let errno = Errno::new(u16::try_from(-raw).map_err(|_| Step31Error::Invariant)?)
+                .ok_or(Step31Error::Invariant)?;
+            return Err(Step31Error::Linux(errno));
+        }
+        return Ok(raw);
+    }
+
     validate_serial_tty_fd(process_id, fd)?;
 
     match request {
