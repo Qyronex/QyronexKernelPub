@@ -5,10 +5,9 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kernal_capability::ObjectId;
 use kernal_linux_abi::{Errno, SyscallRequest, SyscallReturn, linux_signed_int};
 use kernal_linux_mounts::{
-    Ext4WriteJournal, FilesystemType, MAX_MOUNT_PATH, MountTable, ProcSysSnapshot,
+    Ext4DurableJournal, FilesystemType, MAX_MOUNT_PATH, MountTable, ProcSysSnapshot,
     read_procfs_node, read_sysfs_node,
 };
-use kernal_usercopy::Error as UsercopyError;
 
 /// Dedicated file-descriptor base for Step-33 `/proc` and `/sys` virtual nodes (`96..128`),
 /// partitioned cleanly above `STEP29_RUNTIME_FDS` (`0..32`) and `DEV_FD_BASE` (`64..96`).
@@ -58,7 +57,7 @@ struct Step33MountState {
     initialized: bool,
     mounts: MountTable<MAX_MOUNTS>,
     fds: [ProcSysFdEntry; MAX_PROC_SYS_FDS],
-    journal: Ext4WriteJournal<MAX_JOURNAL_ENTRIES, MAX_JOURNAL_DATA>,
+    journal: Ext4DurableJournal<MAX_JOURNAL_ENTRIES, MAX_JOURNAL_DATA>,
     hostname: [u8; MAX_HOSTNAME_BYTES],
     hostname_len: usize,
     boot_id_seed: [u8; 16],
@@ -78,7 +77,7 @@ impl Step33MountState {
             initialized: false,
             mounts: MountTable::new(),
             fds: [ProcSysFdEntry::EMPTY; MAX_PROC_SYS_FDS],
-            journal: Ext4WriteJournal::new(),
+            journal: Ext4DurableJournal::new(),
             hostname,
             hostname_len: 7,
             boot_id_seed: [
@@ -247,8 +246,8 @@ fn build_live_snapshot(hostname: &[u8], boot_id_seed: [u8; 16]) -> ProcSysSnapsh
                     if let Ok(p) = identities.bound_pid(proc_ref) {
                         pid = p.get();
                     }
-                    if let Ok(pp) = identities.getppid(proc_ref) {
-                        ppid = pp;
+                    if let Ok(pp) = identities.parent_pid_for(proc_ref) {
+                        ppid = pp.get();
                     }
                     if let Ok(pg) = identities.getpgid(proc_ref) {
                         pgid = pg.get();
@@ -257,9 +256,11 @@ fn build_live_snapshot(hostname: &[u8], boot_id_seed: [u8; 16]) -> ProcSysSnapsh
                         sid = s.get();
                     }
                 });
-                let _ = state.with_current_process_credentials(current, |creds| {
-                    uid = creds.euid();
-                    gid = creds.egid();
+                let _ = state.with_current_process_credentials(current, |proc_ref, credentials| {
+                    if let Ok(creds) = credentials.credentials(proc_ref) {
+                        uid = creds.euid();
+                        gid = creds.egid();
+                    }
                 });
             });
         }
@@ -293,8 +294,10 @@ fn require_root_admin() -> Result<(), Errno> {
     };
     let mut is_root = true;
     let _ = super::runtime::with_linux_runtime(|state| {
-        let _ = state.with_current_process_credentials(current, |creds| {
-            is_root = creds.euid() == 0;
+        let _ = state.with_current_process_credentials(current, |proc_ref, credentials| {
+            if let Ok(creds) = credentials.credentials(proc_ref) {
+                is_root = creds.euid() == 0;
+            }
         });
     });
     if !is_root {
@@ -771,27 +774,11 @@ fn read_user_cstr(user_ptr: u64, out: &mut [u8]) -> Result<usize, Errno> {
 }
 
 fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(super::map_usercopy_errno)
 }
 
 fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(super::map_usercopy_errno)
 }
 
 #[cfg(test)]

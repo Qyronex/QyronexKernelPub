@@ -9,7 +9,6 @@ use kernal_linux_abi::{
 use kernal_linux_cgroup::CAP_SYS_BOOT;
 use kernal_linux_systemd::{Pid1Orchestrator, RebootAction, encode_sysinfo_64};
 use kernal_linux_udev::{UdevDeviceRegistry, UeventAction};
-use kernal_usercopy::Error as UsercopyError;
 
 /// Dedicated file-descriptor base for Step-37 `/dev/kmsg` and Step-38 sysfs `uevent` trigger
 /// descriptors (`192..208`), partitioned cleanly above `EVENT_FD_BASE` (`160..192`).
@@ -581,35 +580,21 @@ fn current_euid() -> Option<u32> {
     let current = unsafe { scheduler.bootstrap_current_global_thread() }.ok()?;
     let mut uid = 0u32;
     let _ = super::runtime::with_linux_runtime(|state| {
-        let _ = state.with_current_process_credentials(current, |creds| {
-            uid = creds.euid();
+        let _ = state.with_current_process_credentials(current, |proc_ref, credentials| {
+            if let Ok(creds) = credentials.credentials(proc_ref) {
+                uid = creds.euid();
+            }
         });
     });
     Some(uid)
 }
 
 fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(super::map_usercopy_errno)
 }
 
 fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(super::map_usercopy_errno)
 }
 
 #[cfg(test)]

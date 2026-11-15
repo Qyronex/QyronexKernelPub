@@ -97,6 +97,19 @@ static STEP15_SVC_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static STEP15_SVC_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static STEP30_POST_FORK_RESCHEDULE_TRACE_PENDING: AtomicBool = AtomicBool::new(false);
 
+pub(super) fn map_usercopy_errno(err: kernal_usercopy::Error) -> kernal_linux_abi::Errno {
+    match err {
+        kernal_usercopy::Error::NullGuard
+        | kernal_usercopy::Error::Overflow
+        | kernal_usercopy::Error::OutsideUserRange
+        | kernal_usercopy::Error::Fault => kernal_linux_abi::Errno::EFAULT,
+        kernal_usercopy::Error::TooLarge
+        | kernal_usercopy::Error::PanUnavailable
+        | kernal_usercopy::Error::PanStateLeak
+        | kernal_usercopy::Error::FaultHandlerUnavailable => kernal_linux_abi::Errno::EINVAL,
+    }
+}
+
 pub(super) fn install(serial: &Pl011) {
     if !cfg!(feature = "step15-qemu-proof") {
         return;

@@ -13,7 +13,6 @@ use kernal_linux_events::{
     CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, EPOLLIN, EPOLLOUT, EpollEvent, EventTable,
     F_ADD_SEALS, F_GET_SEALS,
 };
-use kernal_usercopy::Error as UsercopyError;
 
 /// Dedicated file-descriptor base for Step-35 event/memfd/pidfd descriptors (`160..192`),
 /// partitioned cleanly above `SOCK_FD_BASE` (`128..160`).
@@ -817,27 +816,11 @@ fn read_user_cstr(user_ptr: u64, out: &mut [u8]) -> Result<usize, Errno> {
 }
 
 fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(super::map_usercopy_errno)
 }
 
 fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(super::map_usercopy_errno)
 }
 
 #[cfg(test)]

@@ -1,19 +1,19 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
 use core::cell::UnsafeCell;
+use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicU8, Ordering};
 use kernal_capability::{CapRights, Capability, ObjectId};
 use kernal_linux_abi::{
-    Errno, SyscallRequest, SyscallReturn, TIOCGPGRP, TIOCGPTN, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP,
-    TIOCSPTLCK, TIOCSWINSZ, WinSize, linux_signed_int, linux_unsigned_int,
+    Errno, KERNEL_TERMIOS_BYTES, SyscallRequest, SyscallReturn, TCGETS, TCSETS, TCSETSF, TCSETSW,
+    TIOCGPGRP, TIOCGPTN, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK, TIOCSWINSZ, WINSIZE_BYTES,
+    WinSize, linux_signed_int, linux_unsigned_int,
 };
 use kernal_linux_dev::{
-    DeviceAccess, DeviceNodeKind, EntropyReadiness, LineDiscipline, PtyMasterToken, PtySlaveToken,
-    PtyTable, Termios, TtySessionState, authorize_capability, classify_dev_path, read_dev_full,
-    read_dev_null, read_dev_random, read_dev_urandom, read_dev_zero, write_dev_full,
-    write_dev_null, write_dev_zero,
+    DeviceNodeKind, EntropyReadiness, JobControlCheck, LineDiscipline, PtyMasterEndpoint,
+    PtySlaveEndpoint, PtySlaveIoResult, PtyTable, Termios, TtySessionState, classify_dev_path,
+    read_pseudo_device, write_pseudo_device,
 };
-use kernal_usercopy::Error as UsercopyError;
 
 /// Dedicated file-descriptor base for Step-32 `/dev` pseudo-device descriptors (`64..96`),
 /// partitioned cleanly above `STEP29_RUNTIME_FDS` (`0..32`).
@@ -33,10 +33,35 @@ const O_NONBLOCK: u64 = 0x0000_0800;
 const O_CLOEXEC: u64 = 0x0008_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+impl DeviceAccess {
+    const fn allows_read(self) -> bool {
+        matches!(self, Self::ReadOnly | Self::ReadWrite)
+    }
+
+    const fn allows_write(self) -> bool {
+        matches!(self, Self::WriteOnly | Self::ReadWrite)
+    }
+
+    fn required_rights(self) -> CapRights {
+        match self {
+            Self::ReadOnly => CapRights::READ,
+            Self::WriteOnly => CapRights::WRITE,
+            Self::ReadWrite => CapRights::READ.union(CapRights::WRITE),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DevBacking {
     Node(DeviceNodeKind),
-    PtyMaster(PtyMasterToken),
-    PtySlave(PtySlaveToken),
+    PtyMaster(PtyMasterEndpoint),
+    PtySlave(PtySlaveEndpoint),
 }
 
 impl DevBacking {
@@ -44,7 +69,7 @@ impl DevBacking {
         match self {
             Self::Node(kind) => kind,
             Self::PtyMaster(_) => DeviceNodeKind::Ptmx,
-            Self::PtySlave(token) => DeviceNodeKind::PtsSlave(token.index() as u32),
+            Self::PtySlave(ep) => DeviceNodeKind::Pts(ep.pty().index()),
         }
     }
 }
@@ -151,9 +176,6 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
 /// `TIOCSCTTY`, `TIOCGPGRP`, and `TIOCSPGRP`.
 pub(super) fn handle_dev_ioctl(
     process: ObjectId,
-    caller_pgid: u32,
-    caller_sid: u32,
-    is_session_leader: bool,
     raw_fd: u64,
     raw_request: u64,
     arg: u64,
@@ -161,6 +183,10 @@ pub(super) fn handle_dev_ioctl(
     let fd = linux_signed_int(raw_fd);
     let slot_idx = usize::try_from(fd - DEV_FD_BASE).map_err(|_| ())?;
     let cmd = linux_unsigned_int(raw_request);
+    let (resolved_proc, caller_pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
+    if resolved_proc != process {
+        return Err(());
+    }
 
     with_dev_state(|state| {
         let Some(entry) = state.fds.get(slot_idx).copied() else {
@@ -178,7 +204,7 @@ pub(super) fn handle_dev_ioctl(
                     }
                     let ptn = match state.ptys.pts_number(master) {
                         Ok(ptn) => ptn,
-                        Err(errno) => return Ok(SyscallReturn::error(errno)),
+                        Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
                     };
                     if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &ptn.to_le_bytes())
                     {
@@ -195,39 +221,54 @@ pub(super) fn handle_dev_ioctl(
                         return map_usercopy(err);
                     }
                     let locked = i32::from_le_bytes(raw_lock) != 0;
-                    if let Err(errno) = state.ptys.set_slave_lock(master, locked) {
-                        return Ok(SyscallReturn::error(errno));
+                    if let Err(err) = state.ptys.set_slave_lock(master, locked) {
+                        return Ok(SyscallReturn::error(err.to_errno()));
                     }
                     Ok(SyscallReturn::success(0).ok_or(())?)
                 }
                 _ => Ok(SyscallReturn::error(Errno::ENOTTY)),
             },
-            DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console)
-            | DevBacking::PtySlave(_) => handle_tty_like_ioctl(
-                &mut state.console_ldisc,
-                &mut state.console_session,
-                caller_pgid,
-                caller_sid,
-                is_session_leader,
-                cmd,
-                arg,
-            ),
+            DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console) => match cmd {
+                TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSWINSZ => {
+                    handle_ldisc_ioctl(&mut state.console_ldisc, cmd, arg)
+                }
+                TIOCSCTTY | TIOCGPGRP | TIOCSPGRP => handle_session_ioctl(
+                    &mut state.console_session,
+                    caller_pid,
+                    caller_pgid,
+                    caller_sid,
+                    cmd,
+                    arg,
+                ),
+                _ => Ok(SyscallReturn::error(Errno::ENOTTY)),
+            },
+            DevBacking::PtySlave(slave) => match cmd {
+                TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSWINSZ => {
+                    let ldisc = match state.ptys.slave_ldisc_mut(slave) {
+                        Ok(ldisc) => ldisc,
+                        Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
+                    };
+                    handle_ldisc_ioctl(ldisc, cmd, arg)
+                }
+                TIOCSCTTY | TIOCGPGRP | TIOCSPGRP => {
+                    let session = match state.ptys.slave_session_mut(slave) {
+                        Ok(session) => session,
+                        Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
+                    };
+                    handle_session_ioctl(session, caller_pid, caller_pgid, caller_sid, cmd, arg)
+                }
+                _ => Ok(SyscallReturn::error(Errno::ENOTTY)),
+            },
             DevBacking::Node(_) => Ok(SyscallReturn::error(Errno::ENOTTY)),
         }
     })?
 }
 
-fn handle_tty_like_ioctl(
+fn handle_ldisc_ioctl(
     ldisc: &mut LineDiscipline<PTY_RING_BYTES>,
-    session: &mut TtySessionState,
-    caller_pgid: u32,
-    caller_sid: u32,
-    is_session_leader: bool,
     cmd: u32,
     arg: u64,
 ) -> Result<SyscallReturn, ()> {
-    use kernal_linux_abi::{KERNEL_TERMIOS_BYTES, TCGETS, TCSETS, TCSETSF, TCSETSW, WINSIZE_BYTES};
-
     match cmd {
         TCGETS => {
             if arg == 0 {
@@ -254,7 +295,7 @@ fn handle_tty_like_ioctl(
             if arg == 0 {
                 return Ok(SyscallReturn::error(Errno::EFAULT));
             }
-            let ws = session.winsize().to_le_bytes();
+            let ws = ldisc.winsize().to_le_bytes();
             if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &ws) {
                 return map_usercopy(err);
             }
@@ -268,14 +309,27 @@ fn handle_tty_like_ioctl(
             if let Err(err) = kernal_usercopy_aarch64::copy_from_user(&mut raw, arg) {
                 return map_usercopy(err);
             }
-            session.set_winsize(WinSize::from_le_bytes(raw));
+            ldisc.set_winsize(WinSize::from_le_bytes(raw));
             Ok(SyscallReturn::success(0).ok_or(())?)
         }
+        _ => Ok(SyscallReturn::error(Errno::ENOTTY)),
+    }
+}
+
+fn handle_session_ioctl(
+    session: &mut TtySessionState,
+    caller_pid: NonZeroU32,
+    caller_pgid: NonZeroU32,
+    caller_sid: NonZeroU32,
+    cmd: u32,
+    arg: u64,
+) -> Result<SyscallReturn, ()> {
+    match cmd {
         TIOCSCTTY => {
-            if let Err(errno) =
-                session.acquire_controlling_tty(caller_sid, caller_pgid, is_session_leader)
+            if let Err(err) =
+                session.attach_controlling_session(caller_pid, caller_sid, caller_pgid)
             {
-                return Ok(SyscallReturn::error(errno));
+                return Ok(SyscallReturn::error(err.to_errno()));
             }
             Ok(SyscallReturn::success(0).ok_or(())?)
         }
@@ -283,7 +337,10 @@ fn handle_tty_like_ioctl(
             if arg == 0 {
                 return Ok(SyscallReturn::error(Errno::EFAULT));
             }
-            let pgid = session.foreground_pgid().unwrap_or(caller_pgid);
+            let pgid = match session.get_foreground_pgid(caller_sid) {
+                Ok(pgid) => pgid.get(),
+                Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
+            };
             if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &pgid.to_le_bytes()) {
                 return map_usercopy(err);
             }
@@ -298,11 +355,14 @@ fn handle_tty_like_ioctl(
                 return map_usercopy(err);
             }
             let pgid = i32::from_le_bytes(raw);
-            if pgid <= 0 {
+            let Some(target_pgid) = u32::try_from(pgid).ok().and_then(NonZeroU32::new) else {
                 return Ok(SyscallReturn::error(Errno::EINVAL));
+            };
+            match session.set_foreground_pgid(caller_sid, caller_pgid, target_pgid) {
+                Ok(JobControlCheck::Allowed) => Ok(SyscallReturn::success(0).ok_or(())?),
+                Ok(JobControlCheck::Stop(_)) => Ok(SyscallReturn::error(Errno::EINTR)),
+                Err(err) => Ok(SyscallReturn::error(err.to_errno())),
             }
-            let _ = session.set_foreground_pgid(caller_sid, pgid as u32);
-            Ok(SyscallReturn::success(0).ok_or(())?)
         }
         _ => Ok(SyscallReturn::error(Errno::ENOTTY)),
     }
@@ -327,8 +387,8 @@ fn try_openat(user_path: u64, raw_flags: u64) -> Result<Option<SyscallReturn>, (
         object: process,
         rights: CapRights::READ.union(CapRights::WRITE),
     };
-    if let Err(errno) = authorize_capability(cap, process, access) {
-        return Ok(Some(SyscallReturn::error(errno)));
+    if let Err(err) = kind.authorize_capability(&cap, access.required_rights()) {
+        return Ok(Some(SyscallReturn::error(err.to_errno())));
     }
 
     let result = with_dev_state(|state| {
@@ -342,19 +402,14 @@ fn try_openat(user_path: u64, raw_flags: u64) -> Result<Option<SyscallReturn>, (
         };
 
         let backing = match kind {
-            DeviceNodeKind::Ptmx => match state.ptys.allocate_ptmx(close_on_exec, nonblocking) {
+            DeviceNodeKind::Ptmx => match state.ptys.allocate_ptmx() {
                 Ok(master) => DevBacking::PtyMaster(master),
-                Err(errno) => return Ok(SyscallReturn::error(errno)),
+                Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
             },
-            DeviceNodeKind::PtsSlave(idx) => {
-                let Ok(idx_usize) = usize::try_from(idx) else {
-                    return Ok(SyscallReturn::error(Errno::ENOENT));
-                };
-                match state.ptys.open_slave(idx_usize, close_on_exec, nonblocking) {
-                    Ok(slave) => DevBacking::PtySlave(slave),
-                    Err(errno) => return Ok(SyscallReturn::error(errno)),
-                }
-            }
+            DeviceNodeKind::Pts(idx) => match state.ptys.open_slave(idx) {
+                Ok(slave) => DevBacking::PtySlave(slave),
+                Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
+            },
             other => DevBacking::Node(other),
         };
 
@@ -420,7 +475,7 @@ fn lseek_dev_fd(raw_fd: u64) -> Result<SyscallReturn, ()> {
             DeviceNodeKind::Tty
             | DeviceNodeKind::Console
             | DeviceNodeKind::Ptmx
-            | DeviceNodeKind::PtsSlave(_) => Ok(SyscallReturn::error(Errno::ESPIPE)),
+            | DeviceNodeKind::Pts(_) => Ok(SyscallReturn::error(Errno::ESPIPE)),
         }
     })?
 }
@@ -428,7 +483,7 @@ fn lseek_dev_fd(raw_fd: u64) -> Result<SyscallReturn, ()> {
 fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallReturn, ()> {
     let fd = linux_signed_int(raw_fd);
     let slot_idx = usize::try_from(fd - DEV_FD_BASE).map_err(|_| ())?;
-    let process = current_process_id()?;
+    let (process, _pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
     let requested = usize::try_from(count)
         .unwrap_or(usize::MAX)
         .min(0x7fff_f000);
@@ -451,21 +506,42 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
     }
 
     match entry.backing {
-        DevBacking::Node(DeviceNodeKind::Null) => {
-            let mut empty = [];
-            let n = read_dev_null(&mut empty);
-            Ok(SyscallReturn::success(n as i64).ok_or(())?)
-        }
-        DevBacking::Node(DeviceNodeKind::Zero | DeviceNodeKind::Full) => {
-            let mut chunk = [0u8; DEV_IO_CHUNK];
-            if matches!(entry.backing, DevBacking::Node(DeviceNodeKind::Zero)) {
-                read_dev_zero(&mut chunk);
+        DevBacking::Node(
+            kind @ (DeviceNodeKind::Null
+            | DeviceNodeKind::Zero
+            | DeviceNodeKind::Full
+            | DeviceNodeKind::Random
+            | DeviceNodeKind::Urandom),
+        ) => {
+            let readiness = if super::entropy::is_csprng_ready() {
+                EntropyReadiness::Ready
             } else {
-                read_dev_full(&mut chunk);
-            }
+                EntropyReadiness::Unseeded
+            };
+            let mut chunk = [0u8; DEV_IO_CHUNK];
             let mut total = 0usize;
             while total < requested {
                 let take = (requested - total).min(DEV_IO_CHUNK);
+                let read_len = match read_pseudo_device(
+                    kind,
+                    &mut chunk[..take],
+                    entry.nonblocking,
+                    readiness,
+                    |dst| {
+                        super::entropy::fill_getrandom(dst)
+                            .map_err(|_| kernal_linux_dev::Error::EntropyNotReady)
+                    },
+                ) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(err) => {
+                        return if total == 0 {
+                            Ok(SyscallReturn::error(err.to_errno()))
+                        } else {
+                            Ok(SyscallReturn::success(total as i64).ok_or(())?)
+                        };
+                    }
+                };
                 let target = match user_buffer.checked_add(total as u64) {
                     Some(addr) => addr,
                     None => {
@@ -476,56 +552,15 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
                         };
                     }
                 };
-                if let Err(err) = kernal_usercopy_aarch64::copy_to_user(target, &chunk[..take]) {
+                if let Err(err) = kernal_usercopy_aarch64::copy_to_user(target, &chunk[..read_len])
+                {
                     return if total == 0 {
                         map_usercopy(err)
                     } else {
                         Ok(SyscallReturn::success(total as i64).ok_or(())?)
                     };
                 }
-                total += take;
-            }
-            Ok(SyscallReturn::success(total as i64).ok_or(())?)
-        }
-        DevBacking::Node(DeviceNodeKind::Random | DeviceNodeKind::Urandom) => {
-            let readiness = if super::entropy::is_csprng_ready() {
-                EntropyReadiness::Ready
-            } else {
-                EntropyReadiness::Unseeded
-            };
-            let is_random = matches!(entry.backing, DevBacking::Node(DeviceNodeKind::Random));
-            let mut chunk = [0u8; DEV_IO_CHUNK];
-            let mut total = 0usize;
-            while total < requested {
-                let take = (requested - total).min(DEV_IO_CHUNK);
-                let res = if is_random {
-                    read_dev_random(readiness, entry.nonblocking, &mut chunk[..take], |dst| {
-                        super::entropy::fill_getrandom(dst).map_err(|_| Errno::EAGAIN)
-                    })
-                } else {
-                    read_dev_urandom(readiness, &mut chunk[..take], |dst| {
-                        super::entropy::fill_getrandom(dst).map_err(|_| Errno::EAGAIN)
-                    })
-                };
-                if let Err(errno) = res {
-                    return if total == 0 {
-                        Ok(SyscallReturn::error(errno))
-                    } else {
-                        Ok(SyscallReturn::success(total as i64).ok_or(())?)
-                    };
-                }
-                let target = match user_buffer.checked_add(total as u64) {
-                    Some(addr) => addr,
-                    None => return Ok(SyscallReturn::error(Errno::EFAULT)),
-                };
-                if let Err(err) = kernal_usercopy_aarch64::copy_to_user(target, &chunk[..take]) {
-                    return if total == 0 {
-                        map_usercopy(err)
-                    } else {
-                        Ok(SyscallReturn::success(total as i64).ok_or(())?)
-                    };
-                }
-                total += take;
+                total += read_len;
             }
             Ok(SyscallReturn::success(total as i64).ok_or(())?)
         }
@@ -535,7 +570,7 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
             let read_res = with_dev_state(|state| {
                 state
                     .console_ldisc
-                    .read_slave(&mut chunk[..take], entry.nonblocking)
+                    .read_committed(&mut chunk[..take], entry.nonblocking)
             })?;
             match read_res {
                 Ok(0) => Ok(SyscallReturn::success(0).ok_or(())?),
@@ -547,14 +582,17 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
                     }
                     Ok(SyscallReturn::success(n as i64).ok_or(())?)
                 }
-                Err(errno) => Ok(SyscallReturn::error(errno)),
+                Err(err) => Ok(SyscallReturn::error(err.to_errno())),
             }
         }
         DevBacking::PtyMaster(master) => {
             let mut chunk = [0u8; DEV_IO_CHUNK];
             let take = requested.min(DEV_IO_CHUNK);
-            let read_res =
-                with_dev_state(|state| state.ptys.master_read(master, &mut chunk[..take]))?;
+            let read_res = with_dev_state(|state| {
+                state
+                    .ptys
+                    .master_read(master, &mut chunk[..take], entry.nonblocking)
+            })?;
             match read_res {
                 Ok(0) => Ok(SyscallReturn::success(0).ok_or(())?),
                 Ok(n) => {
@@ -565,17 +603,24 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
                     }
                     Ok(SyscallReturn::success(n as i64).ok_or(())?)
                 }
-                Err(errno) => Ok(SyscallReturn::error(errno)),
+                Err(err) => Ok(SyscallReturn::error(err.to_errno())),
             }
         }
         DevBacking::PtySlave(slave) => {
             let mut chunk = [0u8; DEV_IO_CHUNK];
             let take = requested.min(DEV_IO_CHUNK);
-            let read_res =
-                with_dev_state(|state| state.ptys.slave_read(slave, &mut chunk[..take]))?;
+            let read_res = with_dev_state(|state| {
+                state.ptys.slave_read(
+                    slave,
+                    caller_sid,
+                    caller_pgid,
+                    &mut chunk[..take],
+                    entry.nonblocking,
+                )
+            })?;
             match read_res {
-                Ok(0) => Ok(SyscallReturn::success(0).ok_or(())?),
-                Ok(n) => {
+                Ok(PtySlaveIoResult::Transferred(0)) => Ok(SyscallReturn::success(0).ok_or(())?),
+                Ok(PtySlaveIoResult::Transferred(n)) => {
                     if let Err(err) =
                         kernal_usercopy_aarch64::copy_to_user(user_buffer, &chunk[..n])
                     {
@@ -583,10 +628,11 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
                     }
                     Ok(SyscallReturn::success(n as i64).ok_or(())?)
                 }
-                Err(errno) => Ok(SyscallReturn::error(errno)),
+                Ok(PtySlaveIoResult::JobControlStop(_)) => Ok(SyscallReturn::error(Errno::EINTR)),
+                Err(err) => Ok(SyscallReturn::error(err.to_errno())),
             }
         }
-        DevBacking::Node(DeviceNodeKind::Ptmx | DeviceNodeKind::PtsSlave(_)) => {
+        DevBacking::Node(DeviceNodeKind::Ptmx | DeviceNodeKind::Pts(_)) => {
             Ok(SyscallReturn::error(Errno::EIO))
         }
     }
@@ -595,7 +641,7 @@ fn read_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetur
 fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallReturn, ()> {
     let fd = linux_signed_int(raw_fd);
     let slot_idx = usize::try_from(fd - DEV_FD_BASE).map_err(|_| ())?;
-    let process = current_process_id()?;
+    let (process, _pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
     let requested = usize::try_from(count)
         .unwrap_or(usize::MAX)
         .min(0x7fff_f000);
@@ -614,8 +660,10 @@ fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetu
         return Ok(SyscallReturn::error(Errno::EBADF));
     }
     if matches!(entry.backing, DevBacking::Node(DeviceNodeKind::Full)) {
-        let Err(errno) = write_dev_full(&[]);
-        return Ok(SyscallReturn::error(errno));
+        if let Err(err) = write_pseudo_device(DeviceNodeKind::Full, &[]) {
+            return Ok(SyscallReturn::error(err.to_errno()));
+        }
+        return Ok(SyscallReturn::error(Errno::ENOSPC));
     }
     if requested == 0 {
         return Ok(SyscallReturn::success(0).ok_or(())?);
@@ -644,17 +692,26 @@ fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetu
         }
 
         match entry.backing {
-            DevBacking::Node(DeviceNodeKind::Null) => {
-                total += write_dev_null(&chunk[..take]);
-            }
             DevBacking::Node(
-                DeviceNodeKind::Zero | DeviceNodeKind::Random | DeviceNodeKind::Urandom,
-            ) => {
-                total += write_dev_zero(&chunk[..take]);
-            }
+                kind @ (DeviceNodeKind::Null
+                | DeviceNodeKind::Zero
+                | DeviceNodeKind::Random
+                | DeviceNodeKind::Urandom),
+            ) => match write_pseudo_device(kind, &chunk[..take]) {
+                Ok(written) => total += written,
+                Err(err) => {
+                    return if total == 0 {
+                        Ok(SyscallReturn::error(err.to_errno()))
+                    } else {
+                        Ok(SyscallReturn::success(total as i64).ok_or(())?)
+                    };
+                }
+            },
             DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console) => {
                 if let Some(serial) = super::step15_svc_serial() {
-                    serial.write_bytes(&chunk[..take]);
+                    for &byte in &chunk[..take] {
+                        serial.write_byte(byte);
+                    }
                 }
                 total += take;
             }
@@ -662,15 +719,15 @@ fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetu
                 let write_res =
                     with_dev_state(|state| state.ptys.master_write(master, &chunk[..take]))?;
                 match write_res {
-                    Ok((written, _sig)) => {
-                        total += written;
-                        if written < take {
+                    Ok(res) => {
+                        total += res.written;
+                        if res.written < take {
                             break;
                         }
                     }
-                    Err(errno) => {
+                    Err(err) => {
                         return if total == 0 {
-                            Ok(SyscallReturn::error(errno))
+                            Ok(SyscallReturn::error(err.to_errno()))
                         } else {
                             Ok(SyscallReturn::success(total as i64).ok_or(())?)
                         };
@@ -678,18 +735,28 @@ fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetu
                 }
             }
             DevBacking::PtySlave(slave) => {
-                let write_res =
-                    with_dev_state(|state| state.ptys.slave_write(slave, &chunk[..take]))?;
+                let write_res = with_dev_state(|state| {
+                    state
+                        .ptys
+                        .slave_write(slave, caller_sid, caller_pgid, &chunk[..take])
+                })?;
                 match write_res {
-                    Ok(written) => {
+                    Ok(PtySlaveIoResult::Transferred(written)) => {
                         total += written;
                         if written < take {
                             break;
                         }
                     }
-                    Err(errno) => {
+                    Ok(PtySlaveIoResult::JobControlStop(_)) => {
                         return if total == 0 {
-                            Ok(SyscallReturn::error(errno))
+                            Ok(SyscallReturn::error(Errno::EINTR))
+                        } else {
+                            Ok(SyscallReturn::success(total as i64).ok_or(())?)
+                        };
+                    }
+                    Err(err) => {
+                        return if total == 0 {
+                            Ok(SyscallReturn::error(err.to_errno()))
                         } else {
                             Ok(SyscallReturn::success(total as i64).ok_or(())?)
                         };
@@ -697,7 +764,7 @@ fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetu
                 }
             }
             DevBacking::Node(
-                DeviceNodeKind::Full | DeviceNodeKind::Ptmx | DeviceNodeKind::PtsSlave(_),
+                DeviceNodeKind::Full | DeviceNodeKind::Ptmx | DeviceNodeKind::Pts(_),
             ) => {
                 return Ok(SyscallReturn::error(Errno::EIO));
             }
@@ -773,7 +840,7 @@ fn inspect_user_dev_path(user_path: u64) -> Result<Option<DeviceNodeKind>, ()> {
     Ok(None)
 }
 
-fn current_process_id() -> Result<ObjectId, ()> {
+fn current_process_tty_ids() -> Result<(ObjectId, NonZeroU32, NonZeroU32, NonZeroU32), ()> {
     let current_cpu = super::super::current_cpu_index();
     let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
     // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
@@ -786,17 +853,24 @@ fn current_process_id() -> Result<ObjectId, ()> {
             .process_parts_for_scheduler_thread(current)
             .map_err(|_| ())?;
         address_space.current_owner(process).map_err(|_| ())?;
-        Ok(process.id())
+        let proc_id = process.id();
+        let (pid, pgid, sid) = state
+            .with_current_process_identity(current, |proc_ref, identities| {
+                let pid = identities.bound_pid(proc_ref).map_err(|_| ())?;
+                let pgid = identities.getpgid(proc_ref).map_err(|_| ())?;
+                let sid = identities.getsid(proc_ref).map_err(|_| ())?;
+                Ok::<_, ()>((pid, pgid, sid))
+            })
+            .map_err(|_| ())??;
+        Ok((proc_id, pid, pgid, sid))
     })
     .map_err(|_| ())?
 }
 
-fn map_usercopy(error: UsercopyError) -> Result<SyscallReturn, ()> {
-    match error {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Ok(SyscallReturn::error(Errno::EFAULT)),
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => Err(()),
-    }
+fn current_process_id() -> Result<ObjectId, ()> {
+    current_process_tty_ids().map(|(id, _, _, _)| id)
+}
+
+fn map_usercopy(error: kernal_usercopy::Error) -> Result<SyscallReturn, ()> {
+    Ok(SyscallReturn::error(super::map_usercopy_errno(error)))
 }

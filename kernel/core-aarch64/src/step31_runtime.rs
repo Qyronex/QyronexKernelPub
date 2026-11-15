@@ -233,16 +233,8 @@ fn handle_ioctl(raw_fd: u64, raw_request: u64, arg: u64) -> Result<i64, Step31Er
     let (process_id, _pid, pgid) = current_process_identity()?;
 
     if super::step32_dev::is_dev_fd(raw_fd) {
-        let ret = super::step32_dev::handle_dev_ioctl(
-            process_id,
-            pgid.get(),
-            pgid.get(),
-            _pid == pgid,
-            raw_fd,
-            raw_request,
-            arg,
-        )
-        .map_err(|()| Step31Error::Invariant)?;
+        let ret = super::step32_dev::handle_dev_ioctl(process_id, raw_fd, raw_request, arg)
+            .map_err(|()| Step31Error::Invariant)?;
         let raw = ret.raw();
         if raw < 0 {
             let errno = Errno::new(u16::try_from(-raw).map_err(|_| Step31Error::Invariant)?)
@@ -658,38 +650,52 @@ fn write_segment(
                         };
                     }
                     let plan = fds.prepare_write(fd, take).map_err(map_fd_error)?;
-                    let (_, _, retained, offset, _, append) = plan;
-                    let write_offset = if append {
-                        overlay
-                            .retained_regular_size(retained)
-                            .map_err(|_| Step31Error::Invariant)?
+                    let (_, _, retained, expected_offset, _, append) = plan;
+                    let mutation = if append {
+                        overlay.append_retained_regular(
+                            retained,
+                            &chunk[..take],
+                            kernal_linux_vfs::MutableTimestamp::ZERO,
+                        )
                     } else {
-                        offset
+                        overlay
+                            .write_retained_regular(
+                                retained,
+                                expected_offset,
+                                &chunk[..take],
+                                kernal_linux_vfs::MutableTimestamp::ZERO,
+                            )
+                            .map(|written| (expected_offset, written))
                     };
-                    if let Err(overlay_err) = overlay.write_retained_regular_at(
-                        retained,
-                        write_offset,
-                        &chunk[..take],
-                        kernal_linux_vfs::MutableTimestamp::ZERO,
-                    ) {
-                        let errno = match overlay_err {
-                            kernal_linux_vfs::OverlayError::Rooted(
-                                kernal_linux_vfs::RootedMutableError::Mutable(
-                                    kernal_linux_vfs::MutableError::DataExhausted
-                                    | kernal_linux_vfs::MutableError::InodeExhausted,
-                                ),
-                            ) => Errno::ENOSPC,
-                            _ => Errno::EIO,
-                        };
-                        return if copied == 0 {
-                            Err(Step31Error::Linux(errno))
-                        } else {
-                            Ok(copied)
-                        };
-                    }
-                    fds.commit_write(plan, write_offset, take)
+                    let (actual_start, written) = match mutation {
+                        Ok(result) => result,
+                        Err(overlay_err) => {
+                            let errno = match overlay_err {
+                                kernal_linux_vfs::OverlayError::FileTooLarge
+                                | kernal_linux_vfs::OverlayError::TombstoneTableFull
+                                | kernal_linux_vfs::OverlayError::BindingTableFull
+                                | kernal_linux_vfs::OverlayError::Mutable(
+                                    kernal_linux_vfs::RootedMutableError::Mutable(
+                                        kernal_linux_vfs::MutableError::NodeTableFull
+                                        | kernal_linux_vfs::MutableError::DirectoryEntryTableFull
+                                        | kernal_linux_vfs::MutableError::FileTooLarge,
+                                    ),
+                                ) => Errno::ENOSPC,
+                                _ => Errno::EIO,
+                            };
+                            return if copied == 0 {
+                                Err(Step31Error::Linux(errno))
+                            } else {
+                                Ok(copied)
+                            };
+                        }
+                    };
+                    fds.commit_write(plan, actual_start, written)
                         .map_err(|_| Step31Error::Invariant)?;
-                    copied += take;
+                    copied += written;
+                    if written < take {
+                        break;
+                    }
                 }
                 Ok(copied)
             })
@@ -718,74 +724,124 @@ fn read_segment(
                 super::step29_pipe_io::read(pipes, endpoint, user_base, seg_len as u64, nonblocking)
             })
             .map_err(|_| Step31Error::Invariant)?;
-            let read_bytes = match read_bytes {
-                Ok(n) => usize::try_from(n).map_err(|_| Step31Error::Invariant)?,
+            match read_bytes {
+                Ok(n) => usize::try_from(n).map_err(|_| Step31Error::Invariant),
                 Err(super::step29_pipe_io::Error::BlockingWaitRequired) => {
-                    return Err(Step31Error::Linux(Errno::EAGAIN));
+                    Err(Step31Error::Linux(Errno::EAGAIN))
                 }
-                Err(super::step29_pipe_io::Error::Linux(errno)) => {
-                    return Err(Step31Error::Linux(errno));
-                }
-                Err(super::step29_pipe_io::Error::Invariant) => return Err(Step31Error::Invariant),
-            };
-            if read_bytes != 0 {
-                super::futex::pipe_blocking::notify_after_read(endpoint.pipe())
-                    .map_err(|_| Step31Error::Invariant)?;
+                Err(super::step29_pipe_io::Error::Linux(errno)) => Err(Step31Error::Linux(errno)),
+                Err(super::step29_pipe_io::Error::Invariant) => Err(Step31Error::Invariant),
             }
-            Ok(read_bytes)
         }
         #[cfg(feature = "step29-qemu-proof")]
         ReadTargetKind::File => super::step29_runtime::with_process(process, |runtime| {
-            if runtime.fds().retained_readonly(fd).is_ok() {
-                let (fds, overlay) = runtime.fd_overlay_parts();
-                let plan = fds
-                    .prepare_retained_read(fd, seg_len)
-                    .map_err(map_fd_error)?;
-                let (_, _, handle, start_offset, max_len) = plan;
-                let slice = overlay
-                    .read_open_at(handle, start_offset, max_len)
-                    .map_err(|_| Step31Error::Invariant)?;
-                let progress = kernal_usercopy_aarch64::copy_to_user_progress(user_base, slice)
-                    .map_err(map_usercopy_step31)?;
-                fds.commit_retained_read(plan, progress.copied())
-                    .map_err(map_fd_error)?;
-                if progress.copied() == 0 && progress.faulted() {
-                    return Err(Step31Error::Linux(Errno::EFAULT));
+            let is_writable = if runtime.fds().writable_regular(fd).is_ok() {
+                Some(true)
+            } else if runtime.fds().retained_readonly(fd).is_ok() {
+                Some(false)
+            } else {
+                None
+            };
+            if let Some(writable) = is_writable {
+                if seg_len == 0 {
+                    if writable {
+                        runtime
+                            .fds()
+                            .prepare_writable_read(fd, 0)
+                            .map_err(map_fd_error)?;
+                    } else {
+                        runtime
+                            .fds()
+                            .prepare_retained_read(fd, 0)
+                            .map_err(map_fd_error)?;
+                    }
+                    return Ok(0);
                 }
-                return Ok(progress.copied());
-            }
-            if runtime.fds().writable_regular(fd).is_ok() {
                 let (fds, overlay) = runtime.fd_overlay_parts();
-                let plan = fds
-                    .prepare_writable_read(fd, seg_len)
-                    .map_err(map_fd_error)?;
-                let (_, _, retained, start_offset, max_len) = plan;
-                let slice = overlay
-                    .read_retained_regular_at(retained, start_offset, max_len)
-                    .map_err(|_| Step31Error::Invariant)?;
-                let progress = kernal_usercopy_aarch64::copy_to_user_progress(user_base, slice)
-                    .map_err(map_usercopy_step31)?;
-                fds.commit_writable_read(plan, progress.copied())
-                    .map_err(map_fd_error)?;
-                if progress.copied() == 0 && progress.faulted() {
-                    return Err(Step31Error::Linux(Errno::EFAULT));
+                let mut total = 0usize;
+                let mut scratch = [0u8; VEC_IO_CHUNK_BYTES];
+                while total < seg_len {
+                    let take = (seg_len - total).min(VEC_IO_CHUNK_BYTES);
+                    let Some(dst_addr) = user_base.checked_add(total as u64) else {
+                        return if total == 0 {
+                            Err(Step31Error::Linux(Errno::EFAULT))
+                        } else {
+                            Ok(total)
+                        };
+                    };
+                    let (read, step_copied, faulted) = if writable {
+                        let plan = fds.prepare_writable_read(fd, take).map_err(map_fd_error)?;
+                        let read = overlay
+                            .read_retained_regular(plan.2, plan.3, &mut scratch[..take])
+                            .map_err(|_| Step31Error::Invariant)?;
+                        let progress = match kernal_usercopy_aarch64::copy_to_user_progress(
+                            dst_addr,
+                            &scratch[..read],
+                        ) {
+                            Ok(progress) => progress,
+                            Err(err) => {
+                                let mapped = map_usercopy_step31(err);
+                                return if total > 0 && matches!(mapped, Step31Error::Linux(_)) {
+                                    Ok(total)
+                                } else {
+                                    Err(mapped)
+                                };
+                            }
+                        };
+                        let copied = progress.copied();
+                        fds.commit_writable_read(plan, copied)
+                            .map_err(map_fd_error)?;
+                        (read, copied, progress.faulted())
+                    } else {
+                        let plan = fds.prepare_retained_read(fd, take).map_err(map_fd_error)?;
+                        let read = overlay
+                            .read_regular(plan.2, plan.3, &mut scratch[..take])
+                            .map_err(|_| Step31Error::Invariant)?;
+                        let progress = match kernal_usercopy_aarch64::copy_to_user_progress(
+                            dst_addr,
+                            &scratch[..read],
+                        ) {
+                            Ok(progress) => progress,
+                            Err(err) => {
+                                let mapped = map_usercopy_step31(err);
+                                return if total > 0 && matches!(mapped, Step31Error::Linux(_)) {
+                                    Ok(total)
+                                } else {
+                                    Err(mapped)
+                                };
+                            }
+                        };
+                        let copied = progress.copied();
+                        fds.commit_retained_read(plan, copied)
+                            .map_err(map_fd_error)?;
+                        (read, copied, progress.faulted())
+                    };
+                    total += step_copied;
+                    if faulted {
+                        return if total == 0 {
+                            Err(Step31Error::Linux(Errno::EFAULT))
+                        } else {
+                            Ok(total)
+                        };
+                    }
+                    if read < take || step_copied < read {
+                        break;
+                    }
                 }
-                return Ok(progress.copied());
+                return Ok(total);
             }
             let (initrd, root_id, fds) = runtime.parts();
             let plan = fds.prepare_read(fd, seg_len).map_err(map_fd_error)?;
-            let progress = initrd
-                .with_bytes(|bytes| {
-                    let archive =
-                        kernal_cpio::Archive::parse(bytes).map_err(|_| Step31Error::Invariant)?;
-                    let root = kernal_linux_vfs::InitramfsRoot::new(archive, root_id);
-                    let source = root
-                        .read_at(plan.file(), plan.start_offset(), plan.len())
-                        .map_err(|_| Step31Error::Invariant)?;
-                    kernal_usercopy_aarch64::copy_to_user_progress(user_base, source)
-                        .map_err(map_usercopy_step31)
-                })
-                .map_err(|_| Step31Error::Invariant)??;
+            let progress = initrd.with_bytes(|bytes| {
+                let archive =
+                    kernal_cpio::Archive::parse(bytes).map_err(|_| Step31Error::Invariant)?;
+                let root = kernal_linux_vfs::InitramfsRoot::new(archive, root_id);
+                let source = root
+                    .read_at(plan.file(), plan.start_offset(), plan.len())
+                    .map_err(|_| Step31Error::Invariant)?;
+                kernal_usercopy_aarch64::copy_to_user_progress(user_base, source)
+                    .map_err(map_usercopy_step31)
+            })?;
             fds.commit_read(plan, progress.copied())
                 .map_err(map_fd_error)?;
             if progress.copied() == 0 && progress.faulted() {
@@ -829,11 +885,14 @@ fn map_usercopy_step31(error: UsercopyError) -> Step31Error {
 
 fn map_usercopy_error(error: UsercopyError) -> Result<Errno, ()> {
     match error {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
+        UsercopyError::NullGuard
+        | UsercopyError::Overflow
         | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Ok(Errno::EFAULT),
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => Err(()),
+        | UsercopyError::Fault => Ok(Errno::EFAULT),
+        UsercopyError::TooLarge
+        | UsercopyError::PanUnavailable
+        | UsercopyError::PanStateLeak
+        | UsercopyError::FaultHandlerUnavailable => Err(()),
     }
 }
 
@@ -899,15 +958,10 @@ fn handle_file_backed_mmap(
     offset: u64,
 ) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
     use kernal_linux_abi::linux_signed_int;
-    use kernal_linux_fd::O_ACCMODE;
-    use kernal_linux_fd::O_WRONLY;
     use kernal_linux_vfs::{InitramfsRoot, NodeKind, OverlayNodeHandle};
     use kernal_linux_vm::{Error as VmError, MmapFileBacking};
 
-    let process = match current_process_id() {
-        Ok(id) => id,
-        Err(_) => return Err(()),
-    };
+    let (process, _, _) = current_process_identity().map_err(|_| ())?;
     let fd = linux_signed_int(raw_fd);
     let resolved = super::step29_runtime::with_process(process, |runtime| {
         let (initrd, root_id) = {
@@ -950,23 +1004,21 @@ fn handle_file_backed_mmap(
     if file.root_id() != root_id {
         return Err(());
     }
-    initrd
-        .with_bytes(|archive_bytes| {
-            let archive = kernal_cpio::Archive::parse(archive_bytes).map_err(|_| ())?;
-            let root = InitramfsRoot::new(archive, root_id);
-            let file_bytes = root.read_at(file, 0, usize::MAX).map_err(|_| ())?;
-            super::live_vm::handle_step31_dynamic_mmap(
-                address,
-                length,
-                protection,
-                flags,
-                raw_fd,
-                offset,
-                MmapFileBacking::FileSlice {
-                    bytes: file_bytes,
-                    file_offset: offset,
-                },
-            )
-        })
-        .map_err(|_| ())?
+    initrd.with_bytes(|archive_bytes| {
+        let archive = kernal_cpio::Archive::parse(archive_bytes).map_err(|_| ())?;
+        let root = InitramfsRoot::new(archive, root_id);
+        let file_bytes = root.read_at(file, 0, usize::MAX).map_err(|_| ())?;
+        super::live_vm::handle_step31_dynamic_mmap(
+            address,
+            length,
+            protection,
+            flags,
+            raw_fd,
+            offset,
+            MmapFileBacking::FileSlice {
+                bytes: file_bytes,
+                file_offset: offset,
+            },
+        )
+    })
 }

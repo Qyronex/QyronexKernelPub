@@ -6,7 +6,6 @@ use kernal_linux_abi::{
     Errno, SyscallRequest, SyscallReturn, linux_signed_int, linux_unsigned_int,
 };
 use kernal_linux_net::{MAX_SCM_RIGHTS_FDS, SCM_RIGHTS, SOL_SOCKET, SockAddr, SocketTable, Ucred};
-use kernal_usercopy::Error as UsercopyError;
 
 /// Dedicated file-descriptor base for Step-34 sockets (`128..160`), partitioned cleanly above
 /// `STEP29_RUNTIME_FDS` (`0..32`), `DEV_FD_BASE` (`64..96`), and `PROC_SYS_FD_BASE` (`96..128`).
@@ -232,9 +231,11 @@ fn current_ucred() -> Ucred {
                         cred.pid = p.get();
                     }
                 });
-                let _ = state.with_current_process_credentials(current, |creds| {
-                    cred.uid = creds.euid();
-                    cred.gid = creds.egid();
+                let _ = state.with_current_process_credentials(current, |proc_ref, credentials| {
+                    if let Ok(creds) = credentials.credentials(proc_ref) {
+                        cred.uid = creds.euid();
+                        cred.gid = creds.egid();
+                    }
                 });
             });
         }
@@ -715,27 +716,11 @@ fn write_user_sockaddr(user_addr: u64, user_addrlen: u64, addr: &SockAddr) -> Re
 }
 
 fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(super::map_usercopy_errno)
 }
 
 fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(super::map_usercopy_errno)
 }
 
 /// Broadcasts a kernel kobject uevent payload to all bound `NETLINK_KOBJECT_UEVENT` sockets.

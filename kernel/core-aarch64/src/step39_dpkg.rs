@@ -10,7 +10,6 @@ use kernal_linux_dpkg::{
     AdvisoryLockTable, F_GETLK, F_SETLK, F_SETLKW, PackageMetadataTable, PosixFlock, TargetKey,
     TimespecPair, XattrTable,
 };
-use kernal_usercopy::Error as UsercopyError;
 
 const CAP_FOWNER: u32 = 3;
 const MAX_LOCKS: usize = 32;
@@ -488,8 +487,10 @@ fn current_euid() -> u32 {
         // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
         if let Ok(current) = unsafe { scheduler.bootstrap_current_global_thread() } {
             let _ = super::runtime::with_linux_runtime(|state| {
-                let _ = state.with_current_process_credentials(current, |creds| {
-                    uid = creds.euid();
+                let _ = state.with_current_process_credentials(current, |proc_ref, credentials| {
+                    if let Ok(creds) = credentials.credentials(proc_ref) {
+                        uid = creds.euid();
+                    }
                 });
             });
         }
@@ -514,27 +515,11 @@ fn read_user_cstr(user_ptr: u64, out: &mut [u8]) -> Result<usize, Errno> {
 }
 
 fn copy_from_user(dst: &mut [u8], user_src: u64) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_from_user(dst, user_src).map_err(super::map_usercopy_errno)
 }
 
 fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), Errno> {
-    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(|err| match err {
-        UsercopyError::NullPointer
-        | UsercopyError::AddressOverflow
-        | UsercopyError::OutsideUserRange
-        | UsercopyError::PageFault => Errno::EFAULT,
-        UsercopyError::LengthExceedsMaximum | UsercopyError::PrivilegeAccessNotDisabled => {
-            Errno::EINVAL
-        }
-    })
+    kernal_usercopy_aarch64::copy_to_user(user_dst, src).map_err(super::map_usercopy_errno)
 }
 
 #[cfg(test)]
