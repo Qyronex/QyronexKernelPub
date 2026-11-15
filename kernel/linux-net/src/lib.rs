@@ -964,6 +964,32 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         }
     }
 
+    /// Finds a listening `SOCK_STREAM` IPv4 slot bound to `guest_port` on wildcard (`0.0.0.0`),
+    /// `target_ip`, `fallback_ip`, or loopback (`127.0.0.1`).
+    pub fn listening_inet4_slot(
+        &self,
+        target_ip: [u8; 4],
+        guest_port: u16,
+        fallback_ip: [u8; 4],
+    ) -> Option<usize> {
+        for (idx, s) in self.slots.iter().enumerate() {
+            if !s.live || s.kind != SocketKind::Stream || !matches!(s.state, SocketState::Listening)
+            {
+                continue;
+            }
+            if let Some(SockAddr::Inet { ip, port }) = s.local_addr
+                && port == guest_port
+                && (ip == [0, 0, 0, 0]
+                    || ip == target_ip
+                    || ip == fallback_ip
+                    || ip == [127, 0, 0, 1])
+            {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     fn slot(&self, id: usize) -> Result<&SocketSlot<BUF_CAP>, Errno> {
         let s = self.slots.get(id).ok_or(Errno::EBADF)?;
         if !s.live {

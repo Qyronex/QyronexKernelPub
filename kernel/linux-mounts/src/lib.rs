@@ -20,8 +20,11 @@ pub const MS_NODIRATIME: u64 = 2048;
 pub const MS_BIND: u64 = 4096;
 pub const MS_MOVE: u64 = 8192;
 pub const MS_REC: u64 = 16384;
+pub const MS_UNBINDABLE: u64 = 1 << 17;
 pub const MS_PRIVATE: u64 = 1 << 18;
+pub const MS_SLAVE: u64 = 1 << 19;
 pub const MS_SHARED: u64 = 1 << 20;
+pub const MS_PROPAGATION_MASK: u64 = MS_UNBINDABLE | MS_PRIVATE | MS_SLAVE | MS_SHARED;
 pub const MS_RELATIME: u64 = 1 << 21;
 pub const MS_STRICTATIME: u64 = 1 << 24;
 
@@ -43,6 +46,7 @@ pub enum FilesystemType {
     Devtmpfs,
     Devpts,
     Cgroup2,
+    Overlay,
 }
 
 impl FilesystemType {
@@ -56,6 +60,7 @@ impl FilesystemType {
             b"devtmpfs" => Ok(Self::Devtmpfs),
             b"devpts" => Ok(Self::Devpts),
             b"cgroup2" => Ok(Self::Cgroup2),
+            b"overlay" | b"overlayfs" => Ok(Self::Overlay),
             _ => Err(Errno::ENODEV),
         }
     }
@@ -70,6 +75,7 @@ impl FilesystemType {
             Self::Devtmpfs => b"devtmpfs",
             Self::Devpts => b"devpts",
             Self::Cgroup2 => b"cgroup2",
+            Self::Overlay => b"overlay",
         }
     }
 
@@ -83,6 +89,7 @@ impl FilesystemType {
             Self::Devtmpfs => 0x0102_1994,  // TMPFS_MAGIC
             Self::Devpts => 0x1cd1,         // DEVPTS_SUPER_MAGIC
             Self::Cgroup2 => 0x6367_7270,   // CGROUP2_SUPER_MAGIC
+            Self::Overlay => 0x794c_7630,   // OVERLAYFS_SUPER_MAGIC
         }
     }
 }
@@ -161,6 +168,23 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
         }
     }
 
+    /// Clones this mount table into a child mount namespace (`CLONE_NEWNS`), demoting
+    /// any `MS_SHARED` mounts to `MS_SLAVE` unless explicitly preserved.
+    pub fn clone_into_child_namespace(&self, make_slave: bool) -> Self {
+        let mut child = Self {
+            entries: self.entries,
+            next_id: self.next_id,
+        };
+        if make_slave {
+            for e in &mut child.entries {
+                if e.live && (e.flags & MS_SHARED) != 0 {
+                    e.flags = (e.flags & !MS_PROPAGATION_MASK) | MS_SLAVE;
+                }
+            }
+        }
+        child
+    }
+
     /// Seeds the baseline early-boot mount table (`/` on `initramfs`, `/dev`, `/dev/pts`, `/proc`,
     /// `/sys`, `/run`).
     pub fn seed_default_hierarchy(&mut self) -> Result<(), Errno> {
@@ -225,16 +249,70 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
             return Ok(slot.mount_id);
         }
 
-        if flags & (MS_PRIVATE | MS_SHARED) != 0 && fstype.is_none() && source.is_empty() {
-            // Propagation-flag change on an existing mount point.
+        if (flags & MS_PROPAGATION_MASK) != 0 && fstype.is_none() && source.is_empty() {
+            let prop_bits = flags & MS_PROPAGATION_MASK;
+            // Exactly one propagation mode may be requested at a time.
+            if prop_bits.count_ones() != 1 {
+                return Err(Errno::EINVAL);
+            }
+            let recursive = (flags & MS_REC) != 0;
+            let mut matched_id = None;
+            for slot in &mut self.entries {
+                if !slot.live {
+                    continue;
+                }
+                let tgt = &slot.target[..slot.target_len];
+                let is_exact = tgt == normalized_target;
+                let is_descendant = recursive
+                    && tgt.len() > normalized_target.len()
+                    && ((normalized_target == b"/")
+                        || (tgt.starts_with(normalized_target)
+                            && tgt[normalized_target.len()] == b'/'));
+                if is_exact || is_descendant {
+                    slot.flags = (slot.flags & !MS_PROPAGATION_MASK) | prop_bits;
+                    if is_exact {
+                        matched_id = Some(slot.mount_id);
+                    }
+                }
+            }
+            return matched_id.ok_or(Errno::EINVAL);
+        }
+
+        if (flags & MS_BIND) != 0 {
+            let norm_source = normalize_mount_path(source)?;
+            let src_entry = *self
+                .entries
+                .iter()
+                .find(|e| e.live && e.target() == norm_source)
+                .ok_or(Errno::ENOENT)?;
+            if (src_entry.flags & MS_UNBINDABLE) != 0 {
+                return Err(Errno::EINVAL);
+            }
+            if source.len() > MAX_MOUNT_SOURCE {
+                return Err(Errno::ENAMETOOLONG);
+            }
+            let mut src_buf = [0u8; MAX_MOUNT_SOURCE];
+            src_buf[..source.len()].copy_from_slice(source);
+            let mut tgt_buf = [0u8; MAX_MOUNT_PATH];
+            tgt_buf[..normalized_target.len()].copy_from_slice(normalized_target);
+            let id = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
             let slot = self
                 .entries
                 .iter_mut()
-                .find(|e| e.live && e.target() == normalized_target)
-                .ok_or(Errno::EINVAL)?;
-            slot.flags =
-                (slot.flags & !(MS_PRIVATE | MS_SHARED)) | (flags & (MS_PRIVATE | MS_SHARED));
-            return Ok(slot.mount_id);
+                .find(|e| !e.live)
+                .ok_or(Errno::ENOSPC)?;
+            *slot = MountEntry {
+                live: true,
+                mount_id: id,
+                fstype: src_entry.fstype,
+                flags: (src_entry.flags & !MS_UNBINDABLE) | (flags & !MS_UNBINDABLE),
+                source: src_buf,
+                source_len: source.len(),
+                target: tgt_buf,
+                target_len: normalized_target.len(),
+            };
+            return Ok(id);
         }
 
         let parsed_type = FilesystemType::parse(fstype.ok_or(Errno::EINVAL)?)?;
@@ -1032,5 +1110,45 @@ mod tests {
         let g2 = journal.sync_all();
         assert_eq!(g2, 2);
         assert!(!journal.has_dirty_files());
+    }
+
+    #[test]
+    fn mount_propagation_unbindable_and_overlay_type_work() {
+        let mut tbl = MountTable::<12>::new();
+        tbl.seed_default_hierarchy().unwrap();
+        tbl.mount(
+            b"overlay",
+            b"/var/lib/oci/rootfs",
+            Some(b"overlay"),
+            MS_NODEV,
+        )
+        .unwrap();
+        tbl.mount(
+            b"tmpfs",
+            b"/var/lib/oci/rootfs/tmp",
+            Some(b"tmpfs"),
+            MS_SHARED,
+        )
+        .unwrap();
+
+        // Mark container root + child recursively unbindable; bind-mounting it must fail with EINVAL.
+        tbl.mount(b"", b"/var/lib/oci/rootfs", None, MS_UNBINDABLE | MS_REC)
+            .unwrap();
+        assert_eq!(
+            tbl.mount(b"/var/lib/oci/rootfs/tmp", b"/mnt/leak", None, MS_BIND),
+            Err(Errno::EINVAL)
+        );
+
+        // Child mount namespace demotes MS_SHARED -> MS_SLAVE cleanly when isolated.
+        tbl.mount(b"", b"/var/lib/oci/rootfs/tmp", None, MS_SHARED)
+            .unwrap();
+        let child = tbl.clone_into_child_namespace(true);
+        let (entry, _) = child.resolve(b"/var/lib/oci/rootfs/tmp/file").unwrap();
+        assert_ne!(entry.flags() & MS_SLAVE, 0);
+        assert_eq!(entry.flags() & MS_SHARED, 0);
+        let (ov, _) = child
+            .resolve(b"/var/lib/oci/rootfs/etc/os-release")
+            .unwrap();
+        assert_eq!(ov.fstype(), FilesystemType::Overlay);
     }
 }

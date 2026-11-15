@@ -74,9 +74,43 @@ pub(super) const fn is_event_fd(raw_fd: u64) -> bool {
     fd >= EVENT_FD_BASE && fd < EVENT_FD_BASE + (MAX_EVENT_FDS as i32)
 }
 
-/// Reads a cgroup v2 control file under `/sys/fs/cgroup/<rel>` (Step 36).
+/// Reads a cgroup v2 control file under `/sys/fs/cgroup/<rel>` (Step 36/41).
 pub(super) fn read_cgroup_control_file(rel: &[u8], out: &mut [u8]) -> Result<usize, Errno> {
     with_step35_state(|state| state.cgroups.read_control_file(rel, out)).map_err(|()| Errno::EIO)?
+}
+
+/// Writes a cgroup v2 control file under `/sys/fs/cgroup/<rel>` (Step 41).
+pub(super) fn write_cgroup_control_file(rel: &[u8], val: &[u8]) -> Result<(), Errno> {
+    with_step35_state(|state| state.cgroups.write_control_file(rel, val))
+        .map_err(|()| Errno::EIO)?
+}
+
+/// Creates a cgroup v2 subdirectory `/sys/fs/cgroup/<rel>` (Step 41).
+pub(super) fn cgroup_mkdir(rel: &[u8]) -> Result<(), Errno> {
+    with_step35_state(|state| state.cgroups.mkdir(rel)).map_err(|()| Errno::EIO)?;
+    Ok(())
+}
+
+/// Mutates the shared process security state (userns maps, seccomp policy, unshare) for Step 41.
+pub(super) fn with_security_state<R>(
+    f: impl FnOnce(&mut ProcessSecurityState) -> R,
+) -> Result<R, ()> {
+    with_step35_state(|state| f(&mut state.security))
+}
+
+/// Evaluates active seccomp filter before dispatching sensitive AArch64 syscalls.
+#[allow(dead_code)]
+pub(super) fn evaluate_seccomp_request(
+    request: SyscallRequest,
+) -> Result<kernal_linux_cgroup::SeccompVerdict, ()> {
+    with_step35_state(|state| {
+        state.security.evaluate_seccomp(
+            request.number as u32,
+            kernal_linux_cgroup::AUDIT_ARCH_AARCH64,
+            0,
+            request.args,
+        )
+    })
 }
 
 /// Reports whether the current Step-36 security state retains effective capability `cap`.
@@ -204,9 +238,10 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[3],
             request.args[4],
         ),
-        // add_key(217), request_key(218), keyctl(219), seccomp(277), bpf(280):
-        // Step 36 requires unsupported security/keyring/seccomp/BPF calls to fail explicitly.
-        217..=219 | 277 | 280 => Ok(Some(SyscallReturn::error(Errno::ENOSYS))),
+        // add_key(217), request_key(218), keyctl(219), bpf(280):
+        // Unsupported keyring and eBPF operations fail explicitly with ENOSYS (`seccomp(277)` is
+        // handled in Step 41's step41_container dispatcher).
+        217..=219 | 280 => Ok(Some(SyscallReturn::error(Errno::ENOSYS))),
         // memfd_create(uname, flags)
         279 => Ok(Some(encode_result(handle_memfd_create(
             request.args[0],
@@ -821,8 +856,8 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_seccomp_bpf_and_keyctl_fail_explicitly_with_enosys() {
-        for nr in [217u64, 218, 219, 277, 280] {
+    fn unsupported_bpf_and_keyctl_fail_explicitly_with_enosys() {
+        for nr in [217u64, 218, 219, 280] {
             let req = SyscallRequest::new(nr, [0; 6]);
             let ret = try_handle_syscall(req).unwrap().unwrap();
             assert_eq!(ret, SyscallReturn::error(Errno::ENOSYS));

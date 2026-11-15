@@ -229,7 +229,9 @@ dependencies = [
  "kernal-linux-clone-exit-aarch64",
  "kernal-linux-clone-runtime-aarch64",
  "kernal-linux-clone-trap-aarch64",
+ "kernal-linux-container",
  "kernal-linux-credentials",
+ "kernal-linux-debian-profile",
  "kernal-linux-dev",
  "kernal-linux-dpkg",
  "kernal-linux-events",
@@ -567,6 +569,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernal-linux-container"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
+ "kernal-linux-cgroup",
+ "kernal-linux-debian-profile",
+ "kernal-linux-dpkg",
+ "kernal-linux-events",
+ "kernal-linux-mounts",
+ "kernal-linux-net",
+ "kernal-linux-systemd",
+]
+
+[[package]]
 name = "kernal-linux-credentials"
 version = "0.1.0"
 dependencies = [
@@ -575,6 +592,17 @@ dependencies = [
  "kernal-object",
  "kernal-process",
  "kernal-usercopy",
+]
+
+[[package]]
+name = "kernal-linux-debian-profile"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
+ "kernal-linux-mounts",
+ "kernal-linux-net",
+ "kernal-linux-systemd",
 ]
 
 [[package]]

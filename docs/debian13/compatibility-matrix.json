@@ -87,46 +87,58 @@
       "id": "syscall.rt_sigprocmask",
       "kind": "syscall",
       "name": "rt_sigprocmask",
-      "state": "ENOSYS_UNSUPPORTED",
-      "expected_errno": "ENOSYS",
-      "evidence": "Accepted Step 15/16 musl transcript tolerates ENOSYS; Debian requirement not yet traced."
+      "state": "PARTIAL",
+      "evidence": "Step 30/35 signal mask and rt_sigreturn state machine implemented cleanly.",
+      "note": "Full pinned Debian 13 userspace QEMU trace proof remains pending."
     },
     {
       "id": "feature.dynamic_pt_interp",
       "kind": "elf",
       "name": "PT_INTERP dynamic loader path",
       "state": "PARTIAL",
-      "note": "Static Linux ELF execution is proven; the pinned Debian glibc PT_INTERP path is not yet implemented/proven."
+      "note": "Dynamic PT_INTERP and auxv preparation exist in kernel/linux-exec; unmodified Debian ld-linux-aarch64.so.1 QEMU proof pending."
     },
     {
       "id": "feature.vfs_path_fd",
       "kind": "vfs",
       "name": "ordinary path and file-descriptor semantics",
       "state": "PARTIAL",
-      "note": "Write-to-console exists, but ordinary Debian path/open/read/stat/dirfd semantics are not yet claimed."
+      "note": "Path/openat/stat/dirfd/ext4/procfs/sysfs/devtmpfs/overlayfs and flock/xattr models exist in kernel crates; full Debian rootfs QEMU boot proof pending."
     },
     {
       "id": "feature.serial_console",
       "kind": "device",
       "name": "Linux console stdin/stdout/stderr",
       "state": "PARTIAL",
-      "note": "Linux write output is proven; complete /dev/console and stdin semantics remain unproven."
+      "note": "PL011 console and /dev/ptmx + PTY/termios models exist; full interactive Debian login session proof in QEMU pending."
     },
     {
       "id": "feature.virtio_block",
       "kind": "device",
       "name": "VirtIO block storage",
-      "state": "ENOSYS_UNSUPPORTED",
-      "expected_errno": "ENODEV",
-      "note": "Required later by the Debian persistent-root path."
+      "state": "PARTIAL",
+      "note": "Step 33/40 ext4 durable journal and cmdline root=/dev/vda1 boot profile implemented; full QEMU Debian rootfs block I/O proof pending."
     },
     {
       "id": "feature.virtio_net",
       "kind": "device",
       "name": "VirtIO network interface",
-      "state": "ENOSYS_UNSUPPORTED",
-      "expected_errno": "ENODEV",
-      "note": "Required later by the Debian networking path."
+      "state": "PARTIAL",
+      "note": "Step 34/40 socket, netlink, DNS, and host-forward profile implemented; live VirtIO-net QEMU Debian boot proof pending."
+    },
+    {
+      "id": "feature.systemd_udev_dpkg",
+      "kind": "service",
+      "name": "systemd PID 1, udev netlink, and dpkg/apt primitives",
+      "state": "SUPPORTED_UNVERIFIED",
+      "note": "Steps 37-40 implement PID 1 service/kmsg/reboot orchestration, netlink uevent broadcast, flock/xattr/shebang metadata, and multi-boot cmdline/journal readiness on host tests; unmodified Debian 13 QEMU trace pending."
+    },
+    {
+      "id": "feature.container_namespaces_cgroups_seccomp",
+      "kind": "container",
+      "name": "User/pid/net/mnt namespaces, veth/bridge, cgroups v2, overlayfs, and seccomp",
+      "state": "SUPPORTED_UNVERIFIED",
+      "note": "Step 41 implements CLONE_NEWUSER with non-ambient delegated capability authority, setns, veth+bridge, cgroup cpu/memory/pids enforcement, overlay copy-up/whiteouts, and bounded cBPF seccomp on host tests; live OCI runtime proof under Debian 13 QEMU pending."
     }
   ]
 }

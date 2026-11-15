@@ -82,6 +82,10 @@ mod step35_events_cgroup;
 mod step37_38_systemd_udev;
 #[path = "step39_dpkg.rs"]
 mod step39_dpkg;
+#[path = "step40_debian_boot.rs"]
+mod step40_debian_boot;
+#[path = "step41_container.rs"]
+mod step41_container;
 #[path = "step15_write.rs"]
 mod write;
 
@@ -662,6 +666,27 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     args.copy_from_slice(&frame.x[..MAX_SYSCALL_ARGS]);
     let request = SyscallRequest::new(frame.x[8], args);
 
+    match step35_events_cgroup::evaluate_seccomp_request(request) {
+        Ok(kernal_linux_cgroup::SeccompVerdict::Allow) => {}
+        Ok(kernal_linux_cgroup::SeccompVerdict::Errno(code)) => {
+            let err = kernal_linux_abi::Errno::new(code).unwrap_or(kernal_linux_abi::Errno::EPERM);
+            frame.x[0] = SyscallReturn::error(err).as_u64_bits();
+            return true;
+        }
+        Ok(
+            kernal_linux_cgroup::SeccompVerdict::Kill | kernal_linux_cgroup::SeccompVerdict::Trap,
+        ) => {
+            frame.x[0] = SyscallReturn::error(kernal_linux_abi::Errno::EPERM).as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 41 seccomp terminated syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+        Err(()) => return false,
+    }
+
     match step32_dev::try_handle_syscall(request) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
@@ -683,6 +708,24 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             return false;
         }
+    }
+
+    if let Some(handled) = dispatch_step_subsystem(
+        frame,
+        request,
+        "Step 40 debian-boot",
+        step40_debian_boot::try_handle_syscall,
+    ) {
+        return handled;
+    }
+
+    if let Some(handled) = dispatch_step_subsystem(
+        frame,
+        request,
+        "Step 41 container",
+        step41_container::try_handle_syscall,
+    ) {
+        return handled;
     }
 
     match step33_mounts::try_handle_syscall(request) {
@@ -1488,6 +1531,40 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         serial.write_str(" -> ENOSYS\n");
     }
     true
+}
+
+fn dispatch_step_subsystem(
+    frame: &mut ExceptionFrame,
+    request: SyscallRequest,
+    label: &str,
+    handler: fn(SyscallRequest) -> Result<Option<SyscallReturn>, ()>,
+) -> Option<bool> {
+    match handler(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: ");
+                serial.write_str(label);
+                serial.write_str(" syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            Some(true)
+        }
+        Ok(None) => None,
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: ");
+                serial.write_str(label);
+                serial.write_str(" invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            Some(false)
+        }
+    }
 }
 
 const fn is_classified_minimum_number(number: u64) -> bool {
