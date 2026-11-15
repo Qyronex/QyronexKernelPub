@@ -868,29 +868,6 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
-    match step39_dpkg::try_handle_syscall(request) {
-        Ok(Some(result)) => {
-            frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
-                serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg syscall nr=");
-                serial.write_u64(request.number);
-                serial.write_str(" result=");
-                serial.write_hex_u64(frame.x[0]);
-                serial.write_str("\n");
-            }
-            return true;
-        }
-        Ok(None) => {}
-        Err(()) => {
-            if let Some(serial) = step15_svc_serial() {
-                serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg invariant failed nr=");
-                serial.write_u64(request.number);
-                serial.write_str("\n");
-            }
-            return false;
-        }
-    }
-
     #[cfg(feature = "step29-qemu-proof")]
     match step29_fd::handle(request, frame) {
         Ok(step29_fd::HandleOutcome::Handled) => {
@@ -916,6 +893,32 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         Err(()) => {
             if let Some(serial) = step15_svc_serial() {
                 serial.write_str("KERNAL/ARM64: Step 29 path/fd invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
+    // Dispatch Step-39 dpkg/xattr/locking helpers after Step-29 path/FD ownership (so real
+    // overlay metadata operations like fchmod/utimensat update the active VFS inode state) and
+    // before Step-29 FD-I/O so advisory fcntl locks (F_GETLK/F_SETLK/F_SETLKW) are not rejected.
+    match step39_dpkg::try_handle_syscall(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg invariant failed nr=");
                 serial.write_u64(request.number);
                 serial.write_str("\n");
             }

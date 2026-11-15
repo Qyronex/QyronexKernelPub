@@ -76,12 +76,14 @@ impl<const THREADS: usize, const WAKES: usize> CpuSchedulerCell<THREADS, WAKES> 
             Err(Self::INITIALIZING) => return Err(Error::InitializationInProgress),
             Err(_) => return Err(Error::AlreadyInitialized),
         }
-        // SAFETY: successful state transition gives this call exclusive initialization access.
+        // SAFETY: successful state transition gives this call exclusive initialization access, and
+        // `MaybeUninit::as_mut_ptr` yields valid, aligned, exclusively writable storage for each
+        // fixed-capacity table without constructing them by value on the bootstrap stack.
         unsafe {
             *self.owner.get() = owner;
-            (*self.run_queue.get()).write(RunQueue::new());
-            (*self.contexts.get()).write(ContextTable::new());
-            (*self.wakes.get()).write(RemoteWakeQueue::new(owner));
+            RunQueue::init_in_place((*self.run_queue.get()).as_mut_ptr());
+            ContextTable::init_in_place((*self.contexts.get()).as_mut_ptr());
+            RemoteWakeQueue::init_in_place((*self.wakes.get()).as_mut_ptr(), owner);
         }
         self.state.store(Self::READY, Ordering::Release);
         Ok(())

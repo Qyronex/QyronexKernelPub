@@ -117,9 +117,7 @@ fn run() -> Result<(), String> {
     let command = args.next().unwrap_or_else(|| "help".to_string());
     match command.as_str() {
         "arm-build" => build_aarch64(false),
-        "arm-qemu" => {
-            qemu::run()
-        }
+        "arm-qemu" => qemu::run(),
         "build" => build(false),
         "doctor" => doctor(),
         "image" => {

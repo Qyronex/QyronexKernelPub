@@ -118,6 +118,28 @@ impl<const N: usize> RunQueue<N> {
         }
     }
 
+    /// Initializes `dst` in place without materializing an entire `RunQueue<N>` on the stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid, properly aligned, and writable for `core::mem::size_of::<Self>()` bytes,
+    /// with exclusive access for the duration of initialization.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        // SAFETY: caller guarantees `dst` is valid, aligned, and exclusively writable.
+        unsafe {
+            let slots = core::ptr::addr_of_mut!((*dst).slots).cast::<ThreadSlot>();
+            for index in 0..N {
+                slots.add(index).write(ThreadSlot::EMPTY);
+            }
+            let heads = core::ptr::addr_of_mut!((*dst).heads).cast::<u16>();
+            let tails = core::ptr::addr_of_mut!((*dst).tails).cast::<u16>();
+            for level in 0..PRIORITY_LEVELS {
+                heads.add(level).write(NONE);
+                tails.add(level).write(NONE);
+            }
+            core::ptr::addr_of_mut!((*dst).ready_bitmap).write(0);
+        }
+    }
+
     pub fn create(&mut self, priority: u8) -> Result<ThreadId, Error> {
         if priority as usize >= PRIORITY_LEVELS {
             return Err(Error::InvalidPriority);
@@ -672,5 +694,32 @@ mod tests {
         q.make_ready(a).unwrap();
         assert_eq!(q.schedule().unwrap(), Some(a));
         assert_eq!(q.schedule().unwrap(), None);
+    }
+
+    #[test]
+    fn init_in_place_initializes_dirty_storage() {
+        let mut slot = core::mem::MaybeUninit::<RunQueue<4>>::uninit();
+        // SAFETY: slot holds uninitialized RunQueue<4> bytes.
+        unsafe {
+            core::ptr::write_bytes(
+                slot.as_mut_ptr().cast::<u8>(),
+                0xaa,
+                core::mem::size_of::<RunQueue<4>>(),
+            )
+        };
+        // SAFETY: slot is aligned and exclusively writable.
+        let q = unsafe {
+            RunQueue::init_in_place(slot.as_mut_ptr());
+            slot.assume_init_mut()
+        };
+        assert_eq!(q.schedule(), Ok(None));
+        let a = q.create(15).unwrap();
+        let b = q.create(15).unwrap();
+        assert_ne!(a.slot, b.slot);
+        q.make_ready(a).unwrap();
+        q.make_ready(b).unwrap();
+        assert_eq!(q.schedule(), Ok(Some(a)));
+        assert_eq!(q.schedule(), Ok(Some(b)));
+        assert_eq!(q.schedule(), Ok(None));
     }
 }

@@ -167,6 +167,22 @@ impl<const N: usize> ContextTable<N> {
             len: 0,
         }
     }
+
+    /// Initializes `dst` in place without materializing an entire `ContextTable<N>` on the stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid, properly aligned, and writable for `core::mem::size_of::<Self>()` bytes,
+    /// with exclusive access for the duration of initialization.
+    pub unsafe fn init_in_place(dst: *mut Self) {
+        // SAFETY: caller guarantees `dst` is valid, aligned, and exclusively writable.
+        unsafe {
+            let slots = core::ptr::addr_of_mut!((*dst).slots).cast::<Slot>();
+            for index in 0..N {
+                slots.add(index).write(Slot::EMPTY);
+            }
+            core::ptr::addr_of_mut!((*dst).len).write(0);
+        }
+    }
     pub const fn len(&self) -> usize {
         self.len
     }
@@ -1042,5 +1058,31 @@ mod tests {
         assert_eq!(table.update_rsp(id, 0x6000), Err(Error::InvalidRsp));
         table.update_rsp(id, 0x3000).unwrap();
         assert_eq!(table.get(id).unwrap().saved_rsp, 0x3000);
+    }
+
+    #[test]
+    fn init_in_place_initializes_dirty_storage() {
+        let mut slot = core::mem::MaybeUninit::<ContextTable<4>>::uninit();
+        // SAFETY: slot holds uninitialized ContextTable<4> bytes.
+        unsafe {
+            core::ptr::write_bytes(
+                slot.as_mut_ptr().cast::<u8>(),
+                0xaa,
+                core::mem::size_of::<ContextTable<4>>(),
+            );
+        }
+        // SAFETY: slot is aligned and exclusively writable.
+        let table = unsafe {
+            ContextTable::init_in_place(slot.as_mut_ptr());
+            slot.assume_init_mut()
+        };
+        assert!(table.is_empty());
+        let id = ThreadId {
+            slot: 0,
+            generation: 1,
+        };
+        table.insert(id, 0x5ff8, stack(), 0).unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(id).unwrap().saved_rsp, 0x5ff8);
     }
 }

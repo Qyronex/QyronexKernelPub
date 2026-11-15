@@ -134,6 +134,24 @@ impl<const N: usize> RemoteWakeQueue<N> {
         }
     }
 
+    /// Initializes `dst` in place without materializing a `RemoteWakeQueue<N>` temporary on the
+    /// stack.
+    ///
+    /// # Safety
+    /// `dst` must be valid, properly aligned, and writable for `core::mem::size_of::<Self>()` bytes,
+    /// with exclusive access for the duration of initialization.
+    pub unsafe fn init_in_place(dst: *mut Self, owner: CpuIndex) {
+        // SAFETY: caller guarantees `dst` is valid, aligned, and exclusively writable.
+        unsafe {
+            core::ptr::addr_of_mut!((*dst).owner).write(owner);
+            let slots = core::ptr::addr_of_mut!((*dst).slots).cast::<AtomicU64>();
+            for index in 0..N {
+                slots.add(index).write(AtomicU64::new(EMPTY));
+            }
+            core::ptr::addr_of_mut!((*dst).consumer_hint).write(AtomicUsize::new(0));
+        }
+    }
+
     pub const fn owner(&self) -> CpuIndex {
         self.owner
     }
@@ -1352,5 +1370,33 @@ mod tests {
         assert_eq!(report.deschedule, 1);
         assert_eq!(run_queue.state(thread).unwrap(), ThreadState::Ready);
         assert!(run_queue.job_control_stopped(thread).unwrap());
+    }
+
+    #[test]
+    fn remote_wake_queue_init_in_place_initializes_dirty_storage() {
+        let owner = CpuIndex(4);
+        let mut slot = core::mem::MaybeUninit::<RemoteWakeQueue<4>>::uninit();
+        // SAFETY: slot holds uninitialized RemoteWakeQueue<4> bytes.
+        unsafe {
+            core::ptr::write_bytes(
+                slot.as_mut_ptr().cast::<u8>(),
+                0xaa,
+                core::mem::size_of::<RemoteWakeQueue<4>>(),
+            );
+        }
+        // SAFETY: slot is aligned and exclusively writable.
+        let mailbox = unsafe {
+            RemoteWakeQueue::init_in_place(slot.as_mut_ptr(), owner);
+            slot.assume_init_ref()
+        };
+        assert_eq!(mailbox.owner(), owner);
+        let mut run_queue = RunQueue::<2>::new();
+        let thread = run_queue.create(7).unwrap();
+        let target = GlobalThreadId::new(owner, thread);
+        mailbox.push(target).unwrap();
+        let drained = mailbox.drain_into(&mut run_queue, 4).unwrap();
+        assert_eq!(drained.observed, 1);
+        assert_eq!(drained.readied, 1);
+        assert_eq!(run_queue.state(thread).unwrap(), ThreadState::Ready);
     }
 }

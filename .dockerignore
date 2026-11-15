@@ -1,0 +1,6 @@
+.git
+target
+runner-results
+runner-notes
+*.tmp
+*.bak
