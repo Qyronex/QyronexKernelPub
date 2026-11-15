@@ -457,6 +457,32 @@ fn handle_fstatfs(raw_fd: u64, user_buf: u64) -> Result<Result<i64, Errno>, ()> 
     Ok(Ok(0))
 }
 
+fn synthesize_proc_or_sys_node<const M: usize>(
+    target_fs: FilesystemType,
+    rel: &[u8],
+    mounts: &kernal_linux_mounts::MountTable<M>,
+    snap: &ProcSysSnapshot<'_>,
+    node_buf: &mut [u8],
+) -> Result<usize, Errno> {
+    match target_fs {
+        FilesystemType::Procfs => {
+            read_procfs_node(rel, mounts, snap, node_buf).ok_or(Errno::ENOENT)
+        }
+        FilesystemType::Sysfs => {
+            if let Some(cg_rel) = rel.strip_prefix(b"fs/cgroup/") {
+                super::step35_events_cgroup::read_cgroup_control_file(cg_rel, node_buf)
+            } else {
+                match super::step37_38_systemd_udev::read_sysfs_device_attr(rel, node_buf) {
+                    Ok(len) => Ok(len),
+                    Err(Errno::ENOENT) => read_sysfs_node(rel, snap, node_buf).ok_or(Errno::ENOENT),
+                    Err(errno) => Err(errno),
+                }
+            }
+        }
+        _ => Err(Errno::ENOENT),
+    }
+}
+
 fn handle_openat_if_proc_or_sys(user_path: u64, flags: u64) -> Result<Option<SyscallReturn>, ()> {
     let mut path_buf = [0u8; MAX_MOUNT_PATH];
     let Ok(path_len) = read_user_cstr(user_path, &mut path_buf) else {
@@ -471,14 +497,19 @@ fn handle_openat_if_proc_or_sys(user_path: u64, flags: u64) -> Result<Option<Sys
         return Ok(None);
     };
 
-    if (flags & O_ACCMODE) != O_RDONLY {
-        return Ok(Some(SyscallReturn::error(Errno::EACCES)));
-    }
     let rel = if path.len() <= 5 {
         &b""[..]
     } else {
         &path[6..]
     };
+    if (flags & O_ACCMODE) != O_RDONLY {
+        if target_fs == FilesystemType::Sysfs
+            && super::step37_38_systemd_udev::is_sysfs_uevent_trigger_rel(rel)
+        {
+            return Ok(None);
+        }
+        return Ok(Some(SyscallReturn::error(Errno::EACCES)));
+    }
 
     let owner = current_process_id()?;
     let close_on_exec = (flags & O_CLOEXEC) != 0;
@@ -486,17 +517,7 @@ fn handle_openat_if_proc_or_sys(user_path: u64, flags: u64) -> Result<Option<Sys
         state.ensure_initialized();
         let mut node_buf = [0u8; MAX_VIRTUAL_NODE_BYTES];
         let snap = build_live_snapshot(&state.hostname[..state.hostname_len], state.boot_id_seed);
-        let len = match target_fs {
-            FilesystemType::Procfs => read_procfs_node(rel, &state.mounts, &snap, &mut node_buf)?,
-            FilesystemType::Sysfs => {
-                if let Some(cg_rel) = rel.strip_prefix(b"fs/cgroup/") {
-                    super::step35_events_cgroup::read_cgroup_control_file(cg_rel, &mut node_buf)?
-                } else {
-                    read_sysfs_node(rel, &snap, &mut node_buf)?
-                }
-            }
-            _ => return Err(Errno::ENOENT),
-        };
+        let len = synthesize_proc_or_sys_node(target_fs, rel, &state.mounts, &snap, &mut node_buf)?;
         let Some((slot_idx, slot)) = state.fds.iter_mut().enumerate().find(|(_, e)| !e.live) else {
             return Err(Errno::EMFILE);
         };
@@ -619,11 +640,7 @@ fn handle_newfstatat_if_proc_or_sys(
         state.ensure_initialized();
         let mut node_buf = [0u8; MAX_VIRTUAL_NODE_BYTES];
         let snap = build_live_snapshot(&state.hostname[..state.hostname_len], state.boot_id_seed);
-        match target_fs {
-            FilesystemType::Procfs => read_procfs_node(rel, &state.mounts, &snap, &mut node_buf),
-            FilesystemType::Sysfs => read_sysfs_node(rel, &snap, &mut node_buf),
-            _ => Err(Errno::ENOENT),
-        }
+        synthesize_proc_or_sys_node(target_fs, rel, &state.mounts, &snap, &mut node_buf)
     })?;
     let size = match check {
         Ok(n) => n as u64,

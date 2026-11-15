@@ -78,6 +78,10 @@ mod step33_mounts;
 mod step34_net;
 #[path = "step35_events_cgroup.rs"]
 mod step35_events_cgroup;
+#[path = "step37_38_systemd_udev.rs"]
+mod step37_38_systemd_udev;
+#[path = "step39_dpkg.rs"]
+mod step39_dpkg;
 #[path = "step15_write.rs"]
 mod write;
 
@@ -743,6 +747,52 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         Err(()) => {
             if let Some(serial) = step15_svc_serial() {
                 serial.write_str("KERNAL/ARM64: Step 35/36 events/cgroup invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
+    match step37_38_systemd_udev::try_handle_syscall(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 37/38 systemd/udev syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 37/38 systemd/udev invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
+    match step39_dpkg::try_handle_syscall(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg invariant failed nr=");
                 serial.write_u64(request.number);
                 serial.write_str("\n");
             }

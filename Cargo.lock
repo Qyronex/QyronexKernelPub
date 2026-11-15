@@ -231,6 +231,7 @@ dependencies = [
  "kernal-linux-clone-trap-aarch64",
  "kernal-linux-credentials",
  "kernal-linux-dev",
+ "kernal-linux-dpkg",
  "kernal-linux-events",
  "kernal-linux-exec",
  "kernal-linux-exit-lifecycle",
@@ -242,6 +243,8 @@ dependencies = [
  "kernal-linux-net",
  "kernal-linux-pipe",
  "kernal-linux-signal",
+ "kernal-linux-systemd",
+ "kernal-linux-udev",
  "kernal-linux-vfs",
  "kernal-linux-vm",
  "kernal-linux-vm-aarch64",
@@ -583,6 +586,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernal-linux-dpkg"
+version = "0.1.0"
+dependencies = [
+ "kernal-linux-abi",
+]
+
+[[package]]
 name = "kernal-linux-events"
 version = "0.1.0"
 dependencies = [
@@ -752,6 +762,21 @@ dependencies = [
  "kernal-process",
  "kernal-scheduler",
  "kernal-scheduler-smp",
+]
+
+[[package]]
+name = "kernal-linux-systemd"
+version = "0.1.0"
+dependencies = [
+ "kernal-linux-abi",
+]
+
+[[package]]
+name = "kernal-linux-udev"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
 ]
 
 [[package]]

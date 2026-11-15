@@ -79,6 +79,11 @@ pub(super) fn read_cgroup_control_file(rel: &[u8], out: &mut [u8]) -> Result<usi
     with_step35_state(|state| state.cgroups.read_control_file(rel, out)).map_err(|()| Errno::EIO)?
 }
 
+/// Reports whether the current Step-36 security state retains effective capability `cap`.
+pub(super) fn has_effective_capability(cap: u32) -> Result<bool, ()> {
+    with_step35_state(|state| state.security.has_cap(cap))
+}
+
 /// Dispatches Step-35 event/notification/memfd/pidfd/close_range syscalls and Step-36
 /// capability/namespace/prctl/security syscalls on AArch64.
 pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<SyscallReturn>, ()> {

@@ -738,6 +738,11 @@ fn copy_to_user(user_dst: u64, src: &[u8]) -> Result<(), Errno> {
     })
 }
 
+/// Broadcasts a kernel kobject uevent payload to all bound `NETLINK_KOBJECT_UEVENT` sockets.
+pub(super) fn broadcast_netlink_uevent(msg: &[u8]) -> Result<usize, ()> {
+    with_net_state(|table| table.broadcast_netlink_uevent(msg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

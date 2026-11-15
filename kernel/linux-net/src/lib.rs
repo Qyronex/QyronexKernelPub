@@ -54,6 +54,7 @@ pub const MAX_UNIX_PATH: usize = 64;
 
 /// Netlink constants (`<linux/netlink.h>`, `<linux/rtnetlink.h>`).
 pub const NETLINK_ROUTE: u32 = 0;
+pub const NETLINK_KOBJECT_UEVENT: u32 = 15;
 pub const NLMSG_NOOP: u16 = 1;
 pub const NLMSG_ERROR: u16 = 2;
 pub const NLMSG_DONE: u16 = 3;
@@ -363,6 +364,7 @@ struct SocketSlot<const BUF_CAP: usize> {
     live: bool,
     family: AddressFamily,
     kind: SocketKind,
+    netlink_protocol: u32,
     state: SocketState,
     nonblocking: bool,
     cloexec: bool,
@@ -388,6 +390,7 @@ impl<const BUF_CAP: usize> SocketSlot<BUF_CAP> {
         live: false,
         family: AddressFamily::Unix,
         kind: SocketKind::Stream,
+        netlink_protocol: 0,
         state: SocketState::Unbound,
         nonblocking: false,
         cloexec: false,
@@ -458,7 +461,7 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
                 }
             }
             (AddressFamily::Netlink, SocketKind::Raw | SocketKind::Dgram) => {
-                if protocol != NETLINK_ROUTE {
+                if protocol != NETLINK_ROUTE && protocol != NETLINK_KOBJECT_UEVENT {
                     return Err(Errno::EPROTONOSUPPORT);
                 }
             }
@@ -475,6 +478,11 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
             live: true,
             family,
             kind,
+            netlink_protocol: if family == AddressFamily::Netlink {
+                protocol
+            } else {
+                0
+            },
             state: SocketState::Unbound,
             nonblocking,
             cloexec,
@@ -716,6 +724,9 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
 
         if family == AddressFamily::Netlink {
             let slot = self.slot_mut(id)?;
+            if slot.netlink_protocol != NETLINK_ROUTE {
+                return Err(Errno::EOPNOTSUPP);
+            }
             let n = handle_netlink_route_request(payload, &mut slot.rx_buf)?;
             slot.rx_len = n;
             return Ok(payload.len());
@@ -826,6 +837,39 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
             _ => return Err(Errno::EINVAL),
         }
         Ok(())
+    }
+
+    /// Broadcasts a kernel kobject uevent payload to bound `NETLINK_KOBJECT_UEVENT` sockets.
+    pub fn broadcast_netlink_uevent(&mut self, msg: &[u8]) -> usize {
+        if msg.is_empty() {
+            return 0;
+        }
+        let mut delivered = 0usize;
+        for slot in &mut self.slots {
+            if !slot.live
+                || slot.shut_rd
+                || slot.family != AddressFamily::Netlink
+                || slot.netlink_protocol != NETLINK_KOBJECT_UEVENT
+            {
+                continue;
+            }
+            let subscribed = matches!(
+                slot.local_addr,
+                Some(SockAddr::Netlink { groups, .. }) if groups == 0 || (groups & 1) != 0
+            );
+            if !subscribed {
+                continue;
+            }
+            let avail = BUF_CAP.saturating_sub(slot.rx_len);
+            if avail < msg.len() {
+                continue;
+            }
+            slot.rx_buf[slot.rx_len..slot.rx_len + msg.len()].copy_from_slice(msg);
+            slot.rx_len += msg.len();
+            slot.peer_addr = Some(SockAddr::Netlink { pid: 0, groups: 1 });
+            delivered += 1;
+        }
+        delivered
     }
 
     /// Closes socket `id`.
@@ -1286,5 +1330,34 @@ mod tests {
         assert_eq!(from, Some(dns_addr));
         assert_eq!(&resp[0..2], &[0x12, 0x34]);
         assert_eq!(&resp[n - 4..n], &[127, 0, 0, 1]);
+    }
+
+    #[test]
+    fn netlink_kobject_uevent_delivers_broadcast_to_bound_sockets() {
+        let mut table = SocketTable::<4, 256>::new();
+        let udev_sock = table
+            .socket(
+                AF_NETLINK,
+                SOCK_DGRAM | SOCK_CLOEXEC,
+                NETLINK_KOBJECT_UEVENT,
+            )
+            .unwrap();
+        table
+            .bind(
+                udev_sock,
+                SockAddr::Netlink {
+                    pid: 100,
+                    groups: 1,
+                },
+            )
+            .unwrap();
+
+        let payload = b"add@/devices/virtio0/block/vda\0ACTION=add\0SUBSYSTEM=block\0DEVNAME=vda\0";
+        assert_eq!(table.broadcast_netlink_uevent(payload), 1);
+
+        let mut rx = [0u8; 128];
+        let (n, from, _, _) = table.recv(udev_sock, &mut rx).unwrap();
+        assert_eq!(&rx[..n], payload);
+        assert_eq!(from, Some(SockAddr::Netlink { pid: 0, groups: 1 }));
     }
 }
