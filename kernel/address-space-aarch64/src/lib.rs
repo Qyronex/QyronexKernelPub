@@ -326,10 +326,14 @@ fn validate_user_leaf(virtual_address: u64, perms: VmPerms) -> Result<(), Error>
 }
 
 fn aarch64_flags(perms: VmPerms) -> Result<MapFlags, Error> {
-    if !perms.readable() {
+    perms.validate()?;
+    if perms.writable() && !perms.readable() {
         return Err(Error::UnsupportedPermissions);
     }
-    let mut flags = MapFlags::READ.union(MapFlags::USER);
+    let mut flags = MapFlags::USER;
+    if !perms.readable() {
+        flags = flags.union(MapFlags::USER_NO_ACCESS);
+    }
     if perms.writable() {
         flags = flags.union(MapFlags::WRITE);
     }
@@ -623,5 +627,30 @@ mod tests {
             .unwrap();
         assert_eq!(space.vmas().len(), 1);
         assert_eq!(space.find(start).unwrap().len, 3 * PAGE_SIZE);
+    }
+
+    #[test]
+    fn prot_none_user_guard_page_maps_translates_and_unmaps_cleanly() {
+        let mut backend = TestBackend::new();
+        let mut space = new_space::<2>(&mut backend);
+        let reserved = ReservationSet::<1>::new();
+        let va = USER_MIN + 0x90_000;
+        let frame = PhysFrame::from_start_address(0x45_0000).unwrap();
+
+        space
+            .map_user_page_coalescing_anonymous(
+                &mut backend,
+                page_vma(va, VmPerms::NONE),
+                frame,
+                &reserved,
+            )
+            .unwrap();
+        assert_eq!(space.translate_user(&mut backend, va).unwrap(), 0x45_0000);
+        assert_eq!(
+            space
+                .unmap_user_page_coalescing_anonymous(&mut backend, va)
+                .unwrap(),
+            frame
+        );
     }
 }

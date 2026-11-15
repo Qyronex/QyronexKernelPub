@@ -436,6 +436,10 @@ impl DebianBootProfile {
         &self.net
     }
 
+    pub fn net_mut(&mut self) -> &mut DebianNetProfile {
+        &mut self.net
+    }
+
     pub const fn mounts(&self) -> &MountTable<16> {
         &self.mounts
     }

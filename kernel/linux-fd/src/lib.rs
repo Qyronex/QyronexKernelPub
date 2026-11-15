@@ -11,7 +11,7 @@ mod stdio;
 pub use pipe::{PipeDescriptors, ReleasedObject};
 pub use process_views::{FdTableSet, FdViewId};
 use stdio::ExternalBacking;
-pub use stdio::{ExternalObject, OpenObjectKind, StandardDescriptors};
+pub use stdio::{ExternalObject, OpenObjectKind, StandardDescriptors, SubsystemHandle};
 
 pub const FIRST_DYNAMIC_FD: usize = 3;
 
@@ -675,7 +675,8 @@ impl<const N: usize> FdTable<N> {
             OpenObject::File(file) => (file.size(), file.mode()),
             OpenObject::Directory(directory) => (0, directory.mode()),
             OpenObject::Pipe(_) => (0, 0o010600),
-            OpenObject::External(ExternalBacking::Stdio(_)) => (0, 0o020600),
+            OpenObject::External(ExternalBacking::Stdio(_))
+            | OpenObject::External(ExternalBacking::Subsystem(_)) => (0, 0o020600),
             OpenObject::External(ExternalBacking::RetainedReadOnly(_))
             | OpenObject::External(ExternalBacking::WritableRegular(_)) => {
                 return Err(Error::NotFile);
@@ -687,9 +688,9 @@ impl<const N: usize> FdTable<N> {
     pub fn offset(&self, fd: i32) -> Result<u64, Error> {
         let state = self.open_file_state(self.descriptor(fd)?.open_file)?;
         match state.object {
-            OpenObject::Pipe(_) | OpenObject::External(ExternalBacking::Stdio(_)) => {
-                Err(Error::NotSeekable)
-            }
+            OpenObject::Pipe(_)
+            | OpenObject::External(ExternalBacking::Stdio(_))
+            | OpenObject::External(ExternalBacking::Subsystem(_)) => Err(Error::NotSeekable),
             OpenObject::File(_)
             | OpenObject::Directory(_)
             | OpenObject::External(ExternalBacking::RetainedReadOnly(_))

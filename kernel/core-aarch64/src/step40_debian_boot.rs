@@ -138,7 +138,7 @@ fn materialize_boot_file(state: &Step40State, kind: BootFileKind, out: &mut [u8;
 pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<SyscallReturn>, ()> {
     match request.number {
         // openat(dirfd, pathname, flags, mode)
-        56 => handle_openat_if_boot_file(request.args[1]),
+        56 => handle_openat_if_boot_file(request.args[1], request.args[2]),
         // close(fd)
         57 if is_boot_fd(request.args[0]) => {
             Ok(Some(encode_result(handle_close(request.args[0])?)))
@@ -173,7 +173,22 @@ fn encode_result(res: Result<i64, Errno>) -> SyscallReturn {
     }
 }
 
-fn handle_openat_if_boot_file(user_path: u64) -> Result<Option<SyscallReturn>, ()> {
+pub(super) fn update_network_config(ip: [u8; 4], gw: [u8; 4], dns: [u8; 4], mac: [u8; 6]) {
+    let _ = with_step40_state(|state| {
+        let net = state.profile.net_mut();
+        net.guest_ipv4 = ip;
+        net.gateway_ipv4 = gw;
+        if dns != [0, 0, 0, 0] {
+            net.dns_primary_ipv4 = dns;
+            net.dns_fallback_ipv4 = dns;
+        }
+        net.nic_mac = mac;
+        net.nic_up = true;
+        net.loopback_up = true;
+    });
+}
+
+fn handle_openat_if_boot_file(user_path: u64, flags: u64) -> Result<Option<SyscallReturn>, ()> {
     let mut path_buf = [0u8; 64];
     let Ok(len) = read_user_cstr(user_path, &mut path_buf) else {
         return Ok(None);
@@ -181,6 +196,14 @@ fn handle_openat_if_boot_file(user_path: u64) -> Result<Option<SyscallReturn>, (
     let Some(kind) = match_boot_path(&path_buf[..len]) else {
         return Ok(None);
     };
+    let write_or_create = (flags & 0x3) != 0 || (flags & 0x40) != 0 || (flags & 0x200) != 0;
+    if matches!(
+        kind,
+        BootFileKind::EtcResolvConf | BootFileKind::EtcHostname
+    ) && (write_or_create || super::step33_ext4_vfs::ext4_path_exists(&path_buf[..len]))
+    {
+        return Ok(None);
+    }
     let res = with_step40_state(|state| {
         let Some((idx, slot)) = state
             .fds
@@ -289,6 +312,13 @@ fn handle_newfstatat_if_boot_file(
     let Some(kind) = match_boot_path(&path_buf[..len]) else {
         return Ok(None);
     };
+    if matches!(
+        kind,
+        BootFileKind::EtcResolvConf | BootFileKind::EtcHostname
+    ) && super::step33_ext4_vfs::ext4_path_exists(&path_buf[..len])
+    {
+        return Ok(None);
+    }
     let sz = with_step40_state(|state| {
         let mut data = [0u8; 256];
         materialize_boot_file(state, kind, &mut data) as u64

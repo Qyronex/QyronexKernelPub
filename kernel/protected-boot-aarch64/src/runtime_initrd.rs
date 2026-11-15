@@ -10,14 +10,14 @@ const FDT_HEADER_BYTES: usize = 40;
 const MAX_QEMU_DTB_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PageSpan {
-    start: u64,
-    end: u64,
-    offset: u64,
+pub(crate) struct PageSpan {
+    pub(crate) start: u64,
+    pub(crate) end: u64,
+    pub(crate) offset: u64,
 }
 
 impl PageSpan {
-    fn from_data(start: u64, len: u64) -> Result<Self, AliasPlanError> {
+    pub(crate) fn from_data(start: u64, len: u64) -> Result<Self, AliasPlanError> {
         if len == 0 {
             return Err(AliasPlanError::Empty);
         }
@@ -41,13 +41,13 @@ impl PageSpan {
         })
     }
 
-    const fn len(self) -> u64 {
+    pub(crate) const fn len(self) -> u64 {
         self.end - self.start
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AliasPlanError {
+pub(crate) enum AliasPlanError {
     Empty,
     AddressOverflow,
     InvalidSpan,
@@ -117,6 +117,7 @@ pub enum ProtectedInitrdError {
     DtbHeader,
     DtbOutsideReservedWindow,
     Dtb(kernal_fdt::Error),
+    DeviceInventory(kernal_fdt_aarch64::Error),
     Provenance(kernal_core_initrd_aarch64::Error),
     PageTable(kernal_page_table_aarch64::Error),
     CleanupFailed,
@@ -179,25 +180,39 @@ impl ProtectedInitrd {
         self.with_bytes(|bytes| self.proof.parse_aarch64_elf(bytes).map(|_| ()))
             .map_err(ProtectedInitrdError::Provenance)
     }
+
+    /// Returns the exclusive page-aligned TTBR1 virtual end address immediately after the mapped
+    /// initrd payload.
+    pub fn virtual_page_end(self) -> Result<u64, ProtectedInitrdError> {
+        let payload_len = u64::try_from(self.len()).map_err(|_| ProtectedInitrdError::AliasPlan)?;
+        let payload = PageSpan::from_data(self.physical_start(), payload_len)
+            .map_err(|_| ProtectedInitrdError::AliasPlan)?;
+        let virtual_base = self
+            .virtual_start
+            .checked_sub(payload.offset)
+            .ok_or(ProtectedInitrdError::AliasPlan)?;
+        virtual_base
+            .checked_add(payload.len())
+            .ok_or(ProtectedInitrdError::AliasPlan)
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-fn map_read_only_pages<B: Backend>(
+pub(crate) fn map_pages_with_type<B: Backend>(
     mapper: &mut Mapper<'_, B>,
     virtual_start: u64,
     physical: PageSpan,
+    flags: MapFlags,
+    memory_type: MemoryType,
 ) -> Result<(), ProtectedInitrdError> {
     let mut virtual_page = virtual_start;
     let mut physical_page = physical.start;
     let mut mapped_end = physical.start;
 
     while physical_page < physical.end {
-        if let Err(error) = mapper.map_page_with_type(
-            virtual_page,
-            physical_page,
-            MapFlags::READ,
-            MemoryType::NormalWriteBack,
-        ) {
+        if let Err(error) =
+            mapper.map_page_with_type(virtual_page, physical_page, flags, memory_type)
+        {
             if unmap_read_only_pages(mapper, virtual_start, physical.start, mapped_end).is_err() {
                 return Err(ProtectedInitrdError::CleanupFailed);
             }
@@ -215,7 +230,22 @@ fn map_read_only_pages<B: Backend>(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-fn unmap_read_only_pages<B: Backend>(
+fn map_read_only_pages<B: Backend>(
+    mapper: &mut Mapper<'_, B>,
+    virtual_start: u64,
+    physical: PageSpan,
+) -> Result<(), ProtectedInitrdError> {
+    map_pages_with_type(
+        mapper,
+        virtual_start,
+        physical,
+        MapFlags::READ,
+        MemoryType::NormalWriteBack,
+    )
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(crate) fn unmap_read_only_pages<B: Backend>(
     mapper: &mut Mapper<'_, B>,
     virtual_start: u64,
     physical_start: u64,
@@ -241,7 +271,7 @@ fn unmap_read_only_pages<B: Backend>(
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-unsafe fn invalidate_after_table_mutation() {
+pub(crate) unsafe fn invalidate_after_table_mutation() {
     // SAFETY: the public mapping contract holds every secondary PE at the final BSP construction
     // barrier while this sole owner mutates the shared TTBR1 hierarchy.
     unsafe { invalidate_all_el1() };
@@ -259,7 +289,7 @@ unsafe fn read_be_u32(address: u64) -> Result<u32, ProtectedInitrdError> {
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-fn unmap_and_invalidate(
+pub(crate) fn unmap_and_invalidate(
     backend: &mut crate::runtime_table::RuntimeTablePool,
     root_table: u64,
     virtual_start: u64,
@@ -275,31 +305,13 @@ fn unmap_and_invalidate(
     cleanup
 }
 
-/// Creates the only protected high-half view of the external QEMU initrd.
-///
-/// The function temporarily maps the QEMU DTB read-only at the first free TTBR1 page after the
-/// packed MMIO aliases, reads and validates its exact bounded length, and calls the single
-/// `kernal-core-initrd-aarch64` provenance owner while that scoped DTB view is live. The temporary DTB
-/// mapping is then removed. The same virtual range is reused for the proven initrd and mapped
-/// supervisor-only, read-only and PXN/UXN as Normal-WB memory. No physical or TTBR0 alias is recreated.
-///
-/// # Safety
-/// - Must run in the one-shot protected BSP proof callback after every PE retired TTBR0.
-/// - `backend` must be the exact exclusive monotonic RuntimeTablePool cursor supplied by that owner.
-/// - Every secondary PE must remain parked with IRQ delivery masked for all shared table mutations
-///   and broadcast invalidations.
-/// - The returned mapping must not be removed while any `ProtectedInitrd::with_bytes` operation runs.
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-pub unsafe fn map_qemu_initrd_high_alias(
+pub(crate) fn with_mapped_qemu_dtb<R>(
     backend: &mut crate::runtime_table::RuntimeTablePool,
-) -> Result<ProtectedInitrd, ProtectedInitrdError> {
-    if !crate::runtime::runtime_table_pool_claim_ready() {
-        return Err(ProtectedInitrdError::RuntimeNotReady);
-    }
-
+    alias_base: u64,
+    operation: impl FnOnce(&Blob<'_>) -> Result<R, ProtectedInitrdError>,
+) -> Result<R, ProtectedInitrdError> {
     let state = crate::boot_state();
-    let alias_base = alias_base_after_mmio(state.layout, &state.mmio_aliases)
-        .map_err(|_| ProtectedInitrdError::AliasPlan)?;
     let header_span = PageSpan::from_data(crate::QEMU_VIRT_RAM_BASE, PAGE_SIZE)
         .map_err(|_| ProtectedInitrdError::AliasPlan)?;
 
@@ -359,21 +371,51 @@ pub unsafe fn map_qemu_initrd_high_alias(
         }
     }
 
-    let proof_result = (|| -> Result<CoreValidatedInitrd, ProtectedInitrdError> {
+    let result = (|| -> Result<R, ProtectedInitrdError> {
         // SAFETY: the complete exact DTB span is mapped read-only and total_size is bounded above.
         let bytes = unsafe { from_raw_parts(alias_base as *const u8, total_size) };
         let blob = Blob::parse(bytes).map_err(ProtectedInitrdError::Dtb)?;
+        operation(&blob)
+    })();
+
+    unmap_and_invalidate(backend, state.root_table, alias_base, dtb_span)?;
+    result
+}
+
+/// Creates the only protected high-half view of the external QEMU initrd.
+///
+/// The function temporarily maps the QEMU DTB read-only at the first free TTBR1 page after the
+/// packed MMIO aliases, reads and validates its exact bounded length, and calls the single
+/// `kernal-core-initrd-aarch64` provenance owner while that scoped DTB view is live. The temporary DTB
+/// mapping is then removed. The same virtual range is reused for the proven initrd and mapped
+/// supervisor-only, read-only and PXN/UXN as Normal-WB memory. No physical or TTBR0 alias is recreated.
+///
+/// # Safety
+/// - Must run in the one-shot protected BSP proof callback after every PE retired TTBR0.
+/// - `backend` must be the exact exclusive monotonic RuntimeTablePool cursor supplied by that owner.
+/// - Every secondary PE must remain parked with IRQ delivery masked for all shared table mutations
+///   and broadcast invalidations.
+/// - The returned mapping must not be removed while any `ProtectedInitrd::with_bytes` operation runs.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub unsafe fn map_qemu_initrd_high_alias(
+    backend: &mut crate::runtime_table::RuntimeTablePool,
+) -> Result<ProtectedInitrd, ProtectedInitrdError> {
+    if !crate::runtime::runtime_table_pool_claim_ready() {
+        return Err(ProtectedInitrdError::RuntimeNotReady);
+    }
+
+    let state = crate::boot_state();
+    let alias_base = alias_base_after_mmio(state.layout, &state.mmio_aliases)
+        .map_err(|_| ProtectedInitrdError::AliasPlan)?;
+    let proof = with_mapped_qemu_dtb(backend, alias_base, |blob| {
         discover_qemu_initrd(
-            &blob,
+            blob,
             crate::QEMU_VIRT_RAM_BASE,
             state.layout.text.start,
             state.layout.bss.end,
         )
         .map_err(ProtectedInitrdError::Provenance)
-    })();
-
-    unmap_and_invalidate(backend, state.root_table, alias_base, dtb_span)?;
-    let proof = proof_result?;
+    })?;
 
     let payload_len = u64::try_from(proof.len()).map_err(|_| ProtectedInitrdError::AliasPlan)?;
     let payload = PageSpan::from_data(proof.physical_start(), payload_len)

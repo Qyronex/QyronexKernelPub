@@ -98,6 +98,72 @@ impl StagedExecVectors {
         Ok(operation(start))
     }
 
+    pub(super) fn with_linux_start_with_prefix<R>(
+        &self,
+        random: [u8; 16],
+        prefix: &[&[u8]],
+        operation: impl FnOnce(LinuxProcessStart<'_>) -> R,
+    ) -> Result<R, ExecInputError> {
+        if prefix.is_empty() {
+            return self.with_linux_start(random, operation);
+        }
+        if self.argc == 0 {
+            return Err(ExecInputError::Linux(Errno::EINVAL));
+        }
+
+        let mut argv_refs: [&[u8]; MAX_ARGC] = [&[]; MAX_ARGC];
+        let mut out_argc = 0usize;
+        for arg in prefix {
+            if out_argc >= MAX_ARGC {
+                return Err(ExecInputError::Linux(Errno::E2BIG));
+            }
+            argv_refs[out_argc] = arg;
+            out_argc += 1;
+        }
+        for slot in self.argv.iter().copied().take(self.argc).skip(1) {
+            if out_argc >= MAX_ARGC {
+                return Err(ExecInputError::Linux(Errno::E2BIG));
+            }
+            let entry = slot.ok_or(ExecInputError::Invariant)?;
+            argv_refs[out_argc] = self.entry_bytes(entry)?;
+            out_argc += 1;
+        }
+
+        let mut env_refs: [&[u8]; MAX_ENVC] = [&[]; MAX_ENVC];
+        for (index, slot) in self.envp.iter().copied().enumerate().take(self.envc) {
+            let entry = slot.ok_or(ExecInputError::Invariant)?;
+            env_refs[index] = self.entry_bytes(entry)?;
+        }
+
+        let start = LinuxProcessStart::with_vectors(
+            argv_refs[0],
+            &argv_refs[1..out_argc],
+            &env_refs[..self.envc],
+            random,
+        );
+        Ok(operation(start))
+    }
+
+    pub(super) fn encode_cmdline(&self, out: &mut [u8; 128]) -> usize {
+        let mut pos = 0usize;
+        for slot in self.argv.iter().copied().take(self.argc) {
+            let Some(entry) = slot else {
+                break;
+            };
+            let Ok(bytes) = self.entry_bytes(entry) else {
+                break;
+            };
+            let take = bytes.len().min(out.len().saturating_sub(pos));
+            out[pos..pos + take].copy_from_slice(&bytes[..take]);
+            pos += take;
+            if pos < out.len() {
+                out[pos] = 0;
+                pos += 1;
+            }
+        }
+        pos
+    }
+
     fn entry_bytes(&self, entry: ExecScratchEntry) -> Result<&[u8], ExecInputError> {
         let end = entry
             .start
@@ -119,7 +185,11 @@ impl StagedExecVectors {
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub(super) struct PreparedExecImage {
     process: ObjectId,
-    staged: super::live_vm::StagedExecImage,
+    staged: alloc::boxed::Box<super::live_vm::StagedExecImage>,
+    exe_path: [u8; 128],
+    exe_len: u8,
+    cmdline: [u8; 128],
+    cmdline_len: u8,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
@@ -128,8 +198,22 @@ impl PreparedExecImage {
         self.process
     }
 
-    pub(super) fn into_staged(self) -> super::live_vm::StagedExecImage {
-        self.staged
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        alloc::boxed::Box<super::live_vm::StagedExecImage>,
+        [u8; 128],
+        usize,
+        [u8; 128],
+        usize,
+    ) {
+        (
+            self.staged,
+            self.exe_path,
+            usize::from(self.exe_len),
+            self.cmdline,
+            usize::from(self.cmdline_len),
+        )
     }
 }
 
@@ -223,7 +307,7 @@ pub(super) unsafe fn stage_exec_image_with_core_frames(
         _ => return Err(ReversibleExecError::Invariant),
     };
 
-    let vectors = stage_exec_vectors(argv_base, envp_base).map_err(ReversibleExecError::Input)?;
+    let vectors = capture_exec_vectors_boxed(argv_base, envp_base)?;
 
     // Resolve Process authority from the exact running scheduler generation. ObjectId is copied out
     // only after the retained Process/AddressSpace pair and current TTBR0 binding are revalidated.
@@ -237,11 +321,117 @@ pub(super) unsafe fn stage_exec_image_with_core_frames(
     .map_err(|_| ReversibleExecError::Invariant)?
     .map_err(|_| ReversibleExecError::Invariant)?;
 
-    let source =
-        super::step30_exec_source::select_exec_image_source(process, lookup, path.as_bytes())
-            .map_err(ReversibleExecError::Source)?;
+    let (source, extra_prefix) = resolve_exec_shebang(process, lookup, path.as_bytes())?;
+    let staged = stage_exec_from_source(current, process, source, &vectors, &extra_prefix, random)?;
 
-    let staged = source
+    let mut exe_path = [0u8; 128];
+    let raw_exe = if path.as_bytes().is_empty() {
+        vectors
+            .argv
+            .first()
+            .and_then(|s| s.and_then(|e| vectors.entry_bytes(e).ok()))
+            .unwrap_or(&b""[..])
+    } else {
+        path.as_bytes()
+    };
+    let exe_len = raw_exe.len().min(exe_path.len());
+    exe_path[..exe_len].copy_from_slice(&raw_exe[..exe_len]);
+    let mut cmdline = [0u8; 128];
+    let cmdline_len = vectors.encode_cmdline(&mut cmdline);
+
+    Ok(PreparedExecImage {
+        process,
+        staged,
+        exe_path,
+        exe_len: exe_len as u8,
+        cmdline,
+        cmdline_len: cmdline_len as u8,
+    })
+}
+
+#[inline(never)]
+fn capture_exec_vectors_boxed(
+    argv_base: u64,
+    envp_base: u64,
+) -> Result<alloc::boxed::Box<StagedExecVectors>, ReversibleExecError> {
+    stage_exec_vectors(argv_base, envp_base)
+        .map(alloc::boxed::Box::new)
+        .map_err(ReversibleExecError::Input)
+}
+
+#[inline(never)]
+fn resolve_exec_shebang(
+    process: ObjectId,
+    lookup: ExecLookupPlan,
+    initial_path: &[u8],
+) -> Result<
+    (
+        super::step30_exec_source::ExecImageSource,
+        alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    ),
+    ReversibleExecError,
+> {
+    let mut source =
+        super::step30_exec_source::select_exec_image_source(process, lookup, initial_path)
+            .map_err(ReversibleExecError::Source)?;
+    let mut shebang_depth: u8 = 0;
+    let mut extra_prefix: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    loop {
+        let parsed = source
+            .with_image_bytes(|bytes| kernal_linux_dpkg::parse_shebang(bytes, shebang_depth))
+            .map_err(ReversibleExecError::Source)?;
+        match parsed {
+            Ok(None) => return Ok((source, extra_prefix)),
+            Err(errno) => {
+                return Err(ReversibleExecError::Source(
+                    super::step30_exec_source::ExecSourceError::Linux(errno),
+                ));
+            }
+            Ok(Some(spec)) => {
+                let mut next_prefix = alloc::vec::Vec::with_capacity(extra_prefix.len() + 2);
+                next_prefix.push(spec.interpreter().to_vec());
+                if let Some(opt) = spec.optional_arg()
+                    && !opt.is_empty()
+                {
+                    next_prefix.push(opt.to_vec());
+                }
+                if shebang_depth == 0 {
+                    if initial_path.is_empty() {
+                        next_prefix.push(b"/dev/fd".to_vec());
+                    } else {
+                        next_prefix.push(initial_path.to_vec());
+                    }
+                } else {
+                    next_prefix.extend(extra_prefix);
+                }
+                extra_prefix = next_prefix;
+                let interp_lookup = ExecLookupPlan::execve(spec.interpreter().is_empty())
+                    .map_err(map_exec_lookup_error)
+                    .map_err(ReversibleExecError::Input)?;
+                source = super::step30_exec_source::select_exec_image_source(
+                    process,
+                    interp_lookup,
+                    spec.interpreter(),
+                )
+                .map_err(ReversibleExecError::Source)?;
+                shebang_depth = shebang_depth.saturating_add(1);
+            }
+        }
+    }
+}
+
+#[inline(never)]
+fn stage_exec_from_source(
+    current: kernal_scheduler_smp::GlobalThreadId,
+    process: ObjectId,
+    source: super::step30_exec_source::ExecImageSource,
+    vectors: &StagedExecVectors,
+    extra_prefix: &[alloc::vec::Vec<u8>],
+    random: [u8; 16],
+) -> Result<alloc::boxed::Box<super::live_vm::StagedExecImage>, ReversibleExecError> {
+    let prefix_slices: alloc::vec::Vec<&[u8]> =
+        extra_prefix.iter().map(alloc::vec::Vec::as_slice).collect();
+    source
         .with_image_bytes(|image| -> Result<_, ReversibleExecError> {
             let interpreter_source =
                 super::step30_exec_source::select_optional_interpreter_source(process, image)
@@ -249,12 +439,13 @@ pub(super) unsafe fn stage_exec_image_with_core_frames(
             super::step30_exec_source::with_optional_source_bytes(
                 interpreter_source,
                 |interpreter| {
-                    vectors.with_linux_start(random, |start| {
+                    vectors.with_linux_start_with_prefix(random, &prefix_slices, |start| {
                         // SAFETY: delegated caller contract owns the exact same lower-EL no-switch window;
                         // image/start borrows remain valid for this complete synchronous staging call.
                         unsafe {
                             super::live_vm::stage_exec_image(current, image, interpreter, start)
                         }
+                        .map(alloc::boxed::Box::new)
                     })
                 },
             )
@@ -262,9 +453,7 @@ pub(super) unsafe fn stage_exec_image_with_core_frames(
             .map_err(ReversibleExecError::Input)?
             .map_err(ReversibleExecError::Stage)
         })
-        .map_err(ReversibleExecError::Source)??;
-
-    Ok(PreparedExecImage { process, staged })
+        .map_err(ReversibleExecError::Source)?
 }
 
 fn stage_one_vector<const N: usize>(

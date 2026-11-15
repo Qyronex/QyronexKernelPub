@@ -8,6 +8,7 @@ use kernal_linux_abi::{Errno, PathFdCall, SyscallRequest, SyscallReturn};
 use kernal_linux_fd::{
     Error as FdError, ExternalObject, FdTable, FdToken, OpenObjectKind, ReadPlan,
 };
+use kernal_linux_pipe::{End as PipeEnd, PipeId};
 use kernal_linux_vfs::{
     AT_FDCWD, DirectoryScan, Error as VfsError, InitramfsRoot, LINUX_PATH_MAX, MAX_PATH_BYTES,
     Node, NodeKind, OverlayDirectoryScan, OverlayNodeHandle, ReadOnlyDirectory, ReadOnlyFile,
@@ -16,8 +17,7 @@ use kernal_usercopy::{Error as UsercopyError, MAX_USERCOPY_BYTES};
 
 #[path = "step29_directory_proof.rs"]
 mod directory_proof;
-#[path = "step29_dirent.rs"]
-mod dirent;
+use super::step29_dirent as dirent;
 #[path = "step29_final_fs.rs"]
 mod final_fs;
 #[path = "step29_pathfd_decode.rs"]
@@ -75,7 +75,10 @@ pub(super) enum HandleOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReadOutcome {
-    Returned(u64),
+    Returned {
+        value: u64,
+        wake_pipe: Option<PipeId>,
+    },
     BlockingWaitRequired,
 }
 
@@ -377,9 +380,52 @@ fn handle_read(
     count: u64,
     frame: &mut ExceptionFrame,
 ) -> Result<HandleOutcome, ()> {
+    #[cfg(feature = "step31-debian-shell")]
+    {
+        let fd = raw_i32(raw_fd);
+        let stdin_status = super::step29_runtime::with_process(process, |runtime| {
+            let fds = runtime.fds();
+            match fds.object_kind(fd).map_err(map_fd_error)? {
+                OpenObjectKind::External(ExternalObject::Stdin) => {
+                    let status = fds.status_flags(fd).map_err(map_fd_error)?;
+                    if (status & O_ACCMODE) == 1 {
+                        return Err(Error::Linux(Errno::EBADF));
+                    }
+                    Ok(Some(status & O_NONBLOCK != 0))
+                }
+                _ => Ok(None),
+            }
+        })
+        .map_err(|_| ())?;
+        match stdin_status {
+            Ok(Some(nonblocking)) => {
+                let requested = usize::try_from(count)
+                    .unwrap_or(MAX_USERCOPY_BYTES)
+                    .min(MAX_USERCOPY_BYTES);
+                let result = super::step32_dev::read_console_into_user(
+                    user_buffer,
+                    requested,
+                    nonblocking,
+                    Some(frame),
+                )?;
+                frame.x[0] = result.as_u64_bits();
+                return Ok(HandleOutcome::Handled);
+            }
+            Ok(None) => {}
+            Err(Error::Linux(errno)) => {
+                frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
+                return Ok(HandleOutcome::Handled);
+            }
+            Err(Error::Invariant) => return Err(()),
+        }
+    }
+
     loop {
         match read(process, raw_fd, user_buffer, count) {
-            Ok(ReadOutcome::Returned(value)) => {
+            Ok(ReadOutcome::Returned { value, wake_pipe }) => {
+                if let Some(pipe) = wake_pipe {
+                    super::futex::pipe_blocking::notify_after_read(pipe).map_err(|_| ())?;
+                }
                 frame.x[0] = SyscallReturn::success(value as i64)
                     .ok_or(())?
                     .as_u64_bits();
@@ -428,10 +474,127 @@ fn current_process() -> Result<ObjectId, Error> {
     .map_err(|_| Error::Invariant)?
 }
 
+pub(super) fn openat_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+    raw_flags: u64,
+    raw_mode: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    match final_fs::openat_overlay_bytes(process, host_path, raw_flags, raw_mode) {
+        Ok(Some(value)) => return Ok(Ok(i64::try_from(value).map_err(|_| ())?)),
+        Ok(None) => {}
+        Err(error) => return host_error_result(error),
+    }
+    match openat_bytes(process, AT_FDCWD as u64, host_path, raw_flags, raw_mode) {
+        Ok(value) => Ok(Ok(i64::try_from(value).map_err(|_| ())?)),
+        Err(error) => host_error_result(error),
+    }
+}
+
+pub(super) fn newfstatat_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+    user_stat: u64,
+    flags: u32,
+) -> Result<Result<i64, Errno>, ()> {
+    final_fs::newfstatat_host_path(process, host_path, user_stat, flags)
+}
+
+pub(super) fn statx_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+    flags: u32,
+    user_statx: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    final_fs::statx_host_path(process, host_path, flags, user_statx)
+}
+
+pub(super) fn readlinkat_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+    user_buffer: u64,
+    raw_buffer_size: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    final_fs::readlinkat_host_path(process, host_path, user_buffer, raw_buffer_size)
+}
+
+pub(super) fn faccessat_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+) -> Result<Result<i64, Errno>, ()> {
+    final_fs::faccessat_host_path(process, host_path)
+}
+
+pub(super) fn chdir_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+) -> Result<Result<i64, Errno>, ()> {
+    final_fs::chdir_host_path(process, host_path)
+}
+
+pub(super) fn fchdir_host(process: ObjectId, raw_fd: u64) -> Result<Result<i64, Errno>, ()> {
+    final_fs::fchdir_host(process, raw_fd)
+}
+
+pub(super) fn initramfs_cwd_bytes(process: ObjectId) -> Result<alloc::vec::Vec<u8>, Errno> {
+    final_fs::initramfs_cwd_bytes(process)
+}
+
+pub(super) fn inspect_initramfs_path(
+    process: ObjectId,
+    host_path: &[u8],
+) -> Result<Option<(bool, Option<alloc::vec::Vec<u8>>)>, Errno> {
+    final_fs::inspect_initramfs_path(process, host_path)
+}
+
+pub(super) fn apply_umask_mode(process: ObjectId, raw_mode: u32) -> u16 {
+    super::step29_runtime::with_process(process, |runtime| {
+        runtime.fs_context().apply_creation_mode(raw_mode) as u16
+    })
+    .unwrap_or((raw_mode & 0o7777) as u16)
+}
+
+pub(super) fn resolve_initramfs_dirfd_path(
+    process: ObjectId,
+    raw_dirfd: u64,
+) -> Option<alloc::vec::Vec<u8>> {
+    let fd = kernal_linux_abi::linux_signed_int(raw_dirfd);
+    super::step29_runtime::with_process(process, |runtime| {
+        let dir_handle = runtime.overlay_directory_for_fd(fd).ok()??;
+        let canonical = runtime
+            .overlay()
+            .directory_canonical_path(dir_handle)
+            .ok()?;
+        let mut out = [0u8; kernal_linux_vfs::LINUX_PATH_MAX];
+        let len = canonical.write_absolute(&mut out[..kernal_linux_vfs::LINUX_PATH_MAX - 1])?;
+        Some(out[..len].to_vec())
+    })
+    .ok()
+    .flatten()
+}
+
+fn host_error_result(error: Error) -> Result<Result<i64, Errno>, ()> {
+    match error {
+        Error::Linux(errno) => Ok(Err(errno)),
+        Error::Invariant => Err(()),
+    }
+}
+
 fn openat(
     process: ObjectId,
     raw_dirfd: u64,
     user_path: u64,
+    raw_flags: u64,
+    mode: u64,
+) -> Result<u64, Error> {
+    let path = copy_user_path(user_path)?;
+    openat_bytes(process, raw_dirfd, path.as_bytes(), raw_flags, mode)
+}
+
+fn openat_bytes(
+    process: ObjectId,
+    raw_dirfd: u64,
+    path: &[u8],
     raw_flags: u64,
     _mode: u64,
 ) -> Result<u64, Error> {
@@ -443,7 +606,6 @@ fn openat(
         return Err(Error::Linux(Errno::EINVAL));
     }
 
-    let path = copy_user_path(user_path)?;
     let nofollow = flags & O_NOFOLLOW != 0;
     let require_directory = flags & O_DIRECTORY != 0;
     let close_on_exec = flags & O_CLOEXEC != 0;
@@ -457,7 +619,7 @@ fn openat(
         initrd.with_bytes(|bytes| {
             let archive = kernal_cpio::Archive::parse(bytes).map_err(|_| Error::Invariant)?;
             let root = InitramfsRoot::new(archive, root_id);
-            let (entry_id, node) = resolve_path(root, fds, raw_dirfd, path.as_bytes(), nofollow)?;
+            let (entry_id, node) = resolve_path(root, fds, raw_dirfd, path, nofollow)?;
             let token = match node.kind() {
                 NodeKind::Regular => {
                     if require_directory {
@@ -483,7 +645,7 @@ fn openat(
                 NodeKind::Symlink => return Err(Error::Linux(Errno::ELOOP)),
                 NodeKind::Other(_) => return Err(Error::Linux(Errno::EACCES)),
             };
-            record_proof_open(path.as_bytes(), entry_id, token);
+            record_proof_open(path, entry_id, token);
             record_directory_open(entry_id, node.kind(), token);
             u64::try_from(token.fd()).map_err(|_| Error::Invariant)
         })
@@ -493,14 +655,25 @@ fn openat(
 
 fn close(process: ObjectId, raw_fd: u64) -> Result<u64, Error> {
     let fd = raw_i32(raw_fd);
-    super::step29_runtime::with_process(process, |runtime| {
+    let mut closed_pipe: Option<(PipeId, PipeEnd)> = None;
+    let mut dropped_subsys: Option<kernal_linux_fd::SubsystemHandle> = None;
+    let res = super::step29_runtime::with_process(process, |runtime| {
         let (fds, pipes) = runtime.fd_pipe_parts();
         let token = fds.token(fd).map_err(map_fd_error)?;
         let closed = fds
-            .close_with_release(fd, |released| {
-                pipes
-                    .close(released.pipe_endpoint())
-                    .map_err(|_| Error::Invariant)
+            .close_with_release(fd, |released| match released {
+                kernal_linux_fd::ReleasedObject::Pipe(endpoint) => {
+                    pipes.close(endpoint).map_err(|_| Error::Invariant)?;
+                    closed_pipe = Some((endpoint.pipe(), endpoint.end()));
+                    Ok(())
+                }
+                kernal_linux_fd::ReleasedObject::Subsystem(handle) => {
+                    dropped_subsys = Some(handle);
+                    Ok(())
+                }
+                kernal_linux_fd::ReleasedObject::RetainedDirectory(_)
+                | kernal_linux_fd::ReleasedObject::RetainedReadOnly(_)
+                | kernal_linux_fd::ReleasedObject::WritableRegular(_) => Err(Error::Invariant),
             })
             .map_err(map_fd_error)?;
         closed?;
@@ -508,7 +681,15 @@ fn close(process: ObjectId, raw_fd: u64) -> Result<u64, Error> {
         record_directory_close(token);
         Ok(0)
     })
-    .map_err(|_| Error::Invariant)?
+    .map_err(|_| Error::Invariant)?;
+    if let Some(handle) = dropped_subsys {
+        super::step_fd_util::release_subsystem_handle(handle);
+    }
+    if let Some((pipe, end)) = closed_pipe {
+        super::futex::pipe_blocking::notify_after_endpoint_close(pipe, end)
+            .map_err(|_| Error::Invariant)?;
+    }
+    res
 }
 
 fn getdents64(process: ObjectId, raw_fd: u64, user_buffer: u64, count: u64) -> Result<u64, Error> {
@@ -582,7 +763,10 @@ fn read(
                 let (initrd, root_id, fds) = runtime.parts();
                 let plan = prepare_read_plan(fds, fd, count)?;
                 if plan.is_empty() {
-                    return Ok(ReadOutcome::Returned(0));
+                    return Ok(ReadOutcome::Returned {
+                        value: 0,
+                        wake_pipe: None,
+                    });
                 }
 
                 let progress = initrd.with_bytes(|bytes| {
@@ -600,7 +784,10 @@ fn read(
                     .map_err(map_fd_error)?;
                 let result = linux_read_result(progress.copied(), progress.faulted())?;
                 record_proof_read(plan.token(), result);
-                Ok(ReadOutcome::Returned(result))
+                Ok(ReadOutcome::Returned {
+                    value: result,
+                    wake_pipe: None,
+                })
             }
             OpenObjectKind::Pipe => {
                 let (fds, pipes) = runtime.fd_pipe_parts();
@@ -616,7 +803,10 @@ fn read(
                     count,
                     status & O_NONBLOCK != 0,
                 ) {
-                    Ok(value) => Ok(ReadOutcome::Returned(value)),
+                    Ok(value) => Ok(ReadOutcome::Returned {
+                        value,
+                        wake_pipe: (value != 0).then_some(endpoint.pipe()),
+                    }),
                     Err(super::step29_pipe_io::Error::BlockingWaitRequired) => {
                         Ok(ReadOutcome::BlockingWaitRequired)
                     }
@@ -631,7 +821,8 @@ fn read(
             OpenObjectKind::External(ExternalObject::Stdin) => Err(Error::Invariant),
             // stdout/stderr are valid External OFDs in the wrong access direction for read(2).
             OpenObjectKind::External(ExternalObject::Stdout)
-            | OpenObjectKind::External(ExternalObject::Stderr) => Err(Error::Linux(Errno::EBADF)),
+            | OpenObjectKind::External(ExternalObject::Stderr)
+            | OpenObjectKind::Subsystem(_) => Err(Error::Linux(Errno::EBADF)),
         }
     })
     .map_err(|_| Error::Invariant)?
@@ -693,7 +884,7 @@ fn fstat(process: ObjectId, raw_fd: u64, user_stat: u64) -> Result<u64, Error> {
                     .map_err(map_usercopy_error)?;
                 Ok(0)
             }
-            OpenObjectKind::External(_) => {
+            OpenObjectKind::External(_) | OpenObjectKind::Subsystem(_) => {
                 let open_file = fds.open_file_id(fd).map_err(map_fd_error)?;
                 let metadata = fds.metadata(fd).map_err(map_fd_error)?;
                 let bytes = stat::Arm64Stat::anonymous_external(open_file, metadata)

@@ -139,8 +139,17 @@ pub fn leaf_descriptor(
         | (shareability << SH_SHIFT);
 
     if flags.user() {
-        // AP=01 => EL1/EL0 RW, AP=11 => EL1/EL0 RO.
-        let ap = if flags.writable() { 0b01 } else { 0b11 };
+        // AP=01 => EL1/EL0 RW, AP=11 => EL1/EL0 RO, AP=10 => EL1 RO / EL0 no access (PROT_NONE / exec-only).
+        if flags.user_no_access() && flags.writable() {
+            return Err(Error::InvalidDescriptor);
+        }
+        let ap = if flags.user_no_access() {
+            0b10
+        } else if flags.writable() {
+            0b01
+        } else {
+            0b11
+        };
         descriptor |= (ap as u64) << AP_SHIFT;
         descriptor |= NOT_GLOBAL | PXN;
         if !flags.executable() {
@@ -908,6 +917,44 @@ mod tests {
         assert!(high_half_address(0xffff_ffff_8020_0000));
         assert!(high_half_address(0xffff_0000_0000_0000));
         assert!(!high_half_address(0x0000_ffff_8020_0000));
+    }
+
+    #[test]
+    fn user_no_access_leaf_blocks_el0_access_and_preserves_valid_mapping() {
+        let prot_none = leaf_descriptor(
+            0xa000,
+            MapFlags::USER.union(MapFlags::USER_NO_ACCESS),
+            MemoryType::NormalWriteBack,
+        )
+        .unwrap();
+        assert_ne!(prot_none & VALID, 0);
+        assert_ne!(prot_none & NOT_GLOBAL, 0);
+        assert_ne!(prot_none & PXN, 0);
+        assert_ne!(prot_none & UXN, 0);
+        assert_eq!((prot_none >> AP_SHIFT) & 0b11, 0b10);
+
+        let exec_only = leaf_descriptor(
+            0xb000,
+            MapFlags::USER
+                .union(MapFlags::USER_NO_ACCESS)
+                .union(MapFlags::EXECUTE),
+            MemoryType::NormalWriteBack,
+        )
+        .unwrap();
+        assert_ne!(exec_only & PXN, 0);
+        assert_eq!(exec_only & UXN, 0);
+        assert_eq!((exec_only >> AP_SHIFT) & 0b11, 0b10);
+
+        assert_eq!(
+            leaf_descriptor(
+                0xc000,
+                MapFlags::USER
+                    .union(MapFlags::USER_NO_ACCESS)
+                    .union(MapFlags::WRITE),
+                MemoryType::NormalWriteBack,
+            ),
+            Err(Error::InvalidDescriptor)
+        );
     }
 
     #[test]

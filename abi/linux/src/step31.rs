@@ -44,6 +44,23 @@ pub const WINSIZE_BYTES: usize = 8;
 /// Linux `struct termios` byte size for `TCGETS` (`4 * u32 + u8 + [u8; 19] = 36` bytes).
 pub const KERNEL_TERMIOS_BYTES: usize = 36;
 
+/// Linux `struct pollfd` byte size (`fd: i32`, `events: i16`, `revents: i16`).
+pub const POLLFD_BYTES: usize = 8;
+/// Data other than high-priority data may be read without blocking (`asm-generic/poll.h`).
+pub const POLLIN: u16 = 0x0001;
+/// High-priority data may be read without blocking.
+pub const POLLPRI: u16 = 0x0002;
+/// Writing will not block.
+pub const POLLOUT: u16 = 0x0004;
+/// Error condition on the file descriptor (output-only in `revents`).
+pub const POLLERR: u16 = 0x0008;
+/// Hang up on the file descriptor (output-only in `revents`).
+pub const POLLHUP: u16 = 0x0010;
+/// Invalid request: fd not open (output-only in `revents`).
+pub const POLLNVAL: u16 = 0x0020;
+/// Stream socket peer closed connection or shut down writing half.
+pub const POLLRDHUP: u16 = 0x2000;
+
 /// Validated Linux `getrandom(2)` flags word after low-32-bit `unsigned int` decoding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GetrandomFlags(u32);
@@ -545,5 +562,14 @@ mod tests {
             u32::from_le_bytes([termios[12], termios[13], termios[14], termios[15]]),
             0x803b
         );
+
+        assert_eq!(POLLFD_BYTES, 8);
+        assert_eq!(POLLIN, 0x0001);
+        assert_eq!(POLLPRI, 0x0002);
+        assert_eq!(POLLOUT, 0x0004);
+        assert_eq!(POLLERR, 0x0008);
+        assert_eq!(POLLHUP, 0x0010);
+        assert_eq!(POLLNVAL, 0x0020);
+        assert_eq!(POLLRDHUP, 0x2000);
     }
 }

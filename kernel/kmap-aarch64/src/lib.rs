@@ -217,6 +217,8 @@ impl KmapController {
     /// Writes a caller-prepared 4-KiB page image into one physical frame through a temporary
     /// supervisor-only RW-NX alias, removing and invalidating the alias before returning.
     ///
+    /// Overwrites one caller-owned 4-KiB frame with `bytes` through one temporary supervisor alias.
+    ///
     /// # Safety
     /// The caller must satisfy the same exclusive active-TTBR1 mutation, local quiescence, and
     /// non-migration contract as [`Self::zero_frame`].
@@ -226,9 +228,34 @@ impl KmapController {
         physical_address: u64,
         bytes: &[u8; PAGE_SIZE as usize],
     ) -> Result<(), Error> {
+        // SAFETY: delegated caller contract matches `with_mapped_writable_frame`, and `bytes` is
+        // an exact `PAGE_SIZE` slice written at offset 0.
+        unsafe { self.write_frame_bytes(backend, physical_address, 0, bytes) }
+    }
+
+    /// Overwrites a contiguous byte slice inside one caller-owned 4-KiB frame through a temporary
+    /// supervisor alias without modifying bytes outside `[offset, offset + bytes.len())`.
+    ///
+    /// # Safety
+    /// The caller must satisfy the same exclusive active-TTBR1 mutation, local quiescence, and
+    /// non-migration contract as [`Self::zero_frame`].
+    pub unsafe fn write_frame_bytes<B: Backend>(
+        &self,
+        backend: &mut B,
+        physical_address: u64,
+        offset: usize,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let Some(end) = offset.checked_add(bytes.len()) else {
+            return Err(Error::Poisoned);
+        };
+        if end > PAGE_SIZE as usize {
+            return Err(Error::Poisoned);
+        }
+
         #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
         {
-            let _ = (backend, physical_address, bytes);
+            let _ = (backend, physical_address, offset, bytes);
             Err(Error::UnsupportedHostArchitecture)
         }
 
@@ -275,13 +302,13 @@ impl KmapController {
             // lease exclusively owns the newly published supervisor kmap leaf.
             unsafe { kernal_page_table_aarch64::invalidate_page_el1(virtual_address) };
 
-            // SAFETY: the leaf above maps exactly one writable Normal-memory physical frame at this
-            // CPU-local supervisor VA. The mapping is NX and inaccessible to EL0.
+            // SAFETY: the leaf above maps one writable Normal-memory physical frame at this
+            // CPU-local supervisor VA, and `[offset, offset + bytes.len())` stays within one page.
             unsafe {
                 copy_nonoverlapping(
                     bytes.as_ptr(),
-                    virtual_address as *mut u8,
-                    PAGE_SIZE as usize,
+                    (virtual_address + offset as u64) as *mut u8,
+                    bytes.len(),
                 )
             };
 

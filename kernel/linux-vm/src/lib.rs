@@ -8,9 +8,9 @@ use kernal_vm::{Backing, PAGE_SIZE, USER_MAX_EXCLUSIVE, USER_MIN, VmPerms, Vma};
 
 mod step31_mmap;
 pub use step31_mmap::{
-    DynamicPageBackend, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MmapFileBacking, PROT_NONE,
-    STEP31_ALLOWED_MMAP_FLAGS, Step31MmapSpec, mmap_step31_dynamic, mprotect_step31,
-    parse_step31_perms, validate_step31_mmap_spec,
+    DynamicPageBackend, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_NONBLOCK, MAP_NORESERVE,
+    MAP_POPULATE, MAP_STACK, MmapFileBacking, PROT_NONE, STEP31_ALLOWED_MMAP_FLAGS, Step31MmapSpec,
+    mmap_step31_dynamic, mprotect_step31, parse_step31_perms, validate_step31_mmap_spec,
 };
 
 pub const PROT_READ: u64 = 0x1;
@@ -19,7 +19,9 @@ pub const PROT_EXEC: u64 = 0x4;
 pub const MAP_PRIVATE: u64 = 0x02;
 pub const MAP_ANONYMOUS: u64 = 0x20;
 pub const STEP15_ANON_FLAGS: u64 = MAP_PRIVATE | MAP_ANONYMOUS;
-pub const DEFAULT_MMAP_CEILING: u64 = USER_MAX_EXCLUSIVE;
+/// Reserve the top 8 MiB of user VA space for stack, guard reservation, and the default
+/// `rt_sigreturn` trampoline so top-down `mmap(2)` allocations cannot collide with stack growth.
+pub const DEFAULT_MMAP_CEILING: u64 = USER_MAX_EXCLUSIVE - (8 * 1024 * 1024);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendFailure {

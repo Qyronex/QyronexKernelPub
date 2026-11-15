@@ -35,6 +35,9 @@ pub const MUSL_PTHREAD_FLAGS: u64 = CLONE_VM
     | CLONE_CHILD_CLEARTID
     | CLONE_DETACHED;
 
+/// Exact flags emitted by unmodified glibc AArch64 `pthread_create` (`CLONE_DETACHED` omitted).
+pub const GLIBC_PTHREAD_FLAGS: u64 = MUSL_PTHREAD_FLAGS & !CLONE_DETACHED;
+
 const AARCH64_STACK_ALIGNMENT: u64 = 16;
 const LINUX_TID_BYTES: usize = core::mem::size_of::<u32>();
 const LINUX_TID_ALIGNMENT: u64 = core::mem::align_of::<u32>() as u64;
@@ -132,7 +135,7 @@ impl ClonePlan {
         tls: u64,
         child_tid: u64,
     ) -> Result<Self, Error> {
-        if flags != MUSL_PTHREAD_FLAGS {
+        if flags != MUSL_PTHREAD_FLAGS && flags != GLIBC_PTHREAD_FLAGS {
             return Err(Error::UnsupportedFlags);
         }
         if !child_stack.is_multiple_of(AARCH64_STACK_ALIGNMENT)
@@ -190,11 +193,15 @@ mod tests {
     #[test]
     fn exact_unchanged_musl_pthread_shape_is_accepted() {
         assert_eq!(MUSL_PTHREAD_FLAGS, 0x007d_0f00);
+        assert_eq!(GLIBC_PTHREAD_FLAGS, 0x003d_0f00);
         let plan = ClonePlan::validate(MUSL_PTHREAD_FLAGS, STACK, PTID, TLS, CTID).unwrap();
         assert_eq!(plan.child_stack(), STACK);
         assert_eq!(plan.parent_tid(), PTID);
         assert_eq!(plan.tls(), TLS);
         assert_eq!(plan.child_tid(), CTID);
+        let glibc_plan = ClonePlan::validate(GLIBC_PTHREAD_FLAGS, STACK, PTID, TLS, CTID).unwrap();
+        assert_eq!(glibc_plan.child_stack(), STACK);
+        assert_eq!(glibc_plan.tls(), TLS);
     }
 
     #[test]

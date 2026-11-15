@@ -17,11 +17,43 @@ use kernal_process_aarch64::BoundProcessAddressSpace;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_user_elf_aarch64::{required_dynamic_pages, required_pages};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+use kernal_user_elf_runtime_aarch64::{DynamicLoadPolicy, LoadPolicy};
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_user_elf_runtime_aarch64::{
     LinuxProcessStart, LoadedImage, load_aarch64_dynamic_linux_elf, load_aarch64_linux_elf,
     plan_aarch64_dynamic_elf, plan_aarch64_dynamic_linux_initial_stack, plan_aarch64_elf,
     plan_aarch64_linux_initial_stack,
 };
+
+/// Reserve the top 8 MiB of the Linux user address space (`0x7fff_ff80_0000..USER_MAX_EXCLUSIVE`)
+/// for a 512 KiB initial stack, guard reservation, and the RX `rt_sigreturn` trampoline.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(super) const STEP15_LINUX_STACK_RESERVATION_PAGES: usize = 2048;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(super) const STEP15_LINUX_STACK_PAGES: usize = 128;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+const STEP15_LINUX_STACK_GUARD_PAGES: usize =
+    STEP15_LINUX_STACK_RESERVATION_PAGES - STEP15_LINUX_STACK_PAGES - 1;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(super) const STEP15_LINUX_RT_SIGRETURN_TRAMPOLINE: u64 = kernal_vm::USER_MAX_EXCLUSIVE
+    - (STEP15_LINUX_STACK_RESERVATION_PAGES as u64 * kernal_vm::PAGE_SIZE);
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn step15_linux_load_policy() -> LoadPolicy {
+    LoadPolicy {
+        stack_pages: STEP15_LINUX_STACK_PAGES,
+        stack_guard_pages: STEP15_LINUX_STACK_GUARD_PAGES,
+        ..LoadPolicy::default()
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn step15_linux_dynamic_load_policy() -> DynamicLoadPolicy {
+    DynamicLoadPolicy {
+        executable: step15_linux_load_policy(),
+        ..DynamicLoadPolicy::default()
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Error {
@@ -77,6 +109,58 @@ impl<const N: usize> InitialFrameBatch<N> {
         &self.frames[..self.len]
     }
 
+    fn allocate_one<const EXTENTS: usize>(
+        allocator: &mut ExtentAllocator<EXTENTS>,
+    ) -> Result<PhysFrame, Error> {
+        let range = allocator.allocate(1, 1).map_err(Error::Frame)?;
+        let Some(frame) = PhysFrame::from_start_address(range.start) else {
+            if allocator.free(range).is_err() {
+                return Err(Error::FrameRollbackFailed);
+            }
+            return Err(Error::InvalidAllocatedFrame);
+        };
+        Ok(frame)
+    }
+
+    fn reclaim_exact_from<const EXTENTS: usize>(
+        frames: &mut [PhysFrame],
+        len: &mut usize,
+        allocator: &mut ExtentAllocator<EXTENTS>,
+        frame: PhysFrame,
+    ) -> Result<(), Error> {
+        let index = frames[..*len]
+            .iter()
+            .position(|candidate| *candidate == frame)
+            .ok_or(Error::InvalidAllocatedFrame)?;
+        let range = FrameRange::new(frame.start_address(), 1).map_err(Error::Frame)?;
+        if allocator.free(range).is_err() {
+            return Err(Error::FrameRollbackFailed);
+        }
+
+        let last = *len - 1;
+        frames[index] = frames[last];
+        frames[last] = PhysFrame::containing_address(0);
+        *len = last;
+        Ok(())
+    }
+
+    fn reclaim_slice<const EXTENTS: usize>(
+        frames: &mut [PhysFrame],
+        len: &mut usize,
+        allocator: &mut ExtentAllocator<EXTENTS>,
+    ) -> Result<(), Error> {
+        while *len != 0 {
+            let index = *len - 1;
+            let range = FrameRange::new(frames[index].start_address(), 1).map_err(Error::Frame)?;
+            if allocator.free(range).is_err() {
+                return Err(Error::FrameRollbackFailed);
+            }
+            frames[index] = PhysFrame::containing_address(0);
+            *len = index;
+        }
+        Ok(())
+    }
+
     fn allocate<const EXTENTS: usize>(
         allocator: &mut ExtentAllocator<EXTENTS>,
         required: usize,
@@ -90,20 +174,14 @@ impl<const N: usize> InitialFrameBatch<N> {
 
         let mut batch = Self::new();
         while batch.len < required {
-            let range = match allocator.allocate(1, 1) {
-                Ok(range) => range,
+            let frame = match Self::allocate_one(allocator) {
+                Ok(frame) => frame,
                 Err(error) => {
-                    batch.reclaim(allocator)?;
-                    return Err(Error::Frame(error));
+                    if !matches!(error, Error::FrameRollbackFailed) {
+                        batch.reclaim(allocator)?;
+                    }
+                    return Err(error);
                 }
-            };
-
-            let Some(frame) = PhysFrame::from_start_address(range.start) else {
-                if allocator.free(range).is_err() {
-                    return Err(Error::FrameRollbackFailed);
-                }
-                batch.reclaim(allocator)?;
-                return Err(Error::InvalidAllocatedFrame);
             };
             batch.frames[batch.len] = frame;
             batch.len += 1;
@@ -114,24 +192,77 @@ impl<const N: usize> InitialFrameBatch<N> {
     /// Returns one exact frame from this still-linear batch to the allocator and removes it from the
     /// receipt. This is used only after the canonical staging-discard owner has removed the matching
     /// PTE and handed that exact physical frame back to Core.
+    #[allow(dead_code)]
     fn reclaim_exact<const EXTENTS: usize>(
         &mut self,
         allocator: &mut ExtentAllocator<EXTENTS>,
         frame: PhysFrame,
     ) -> Result<(), Error> {
-        let index = self.frames[..self.len]
-            .iter()
-            .position(|candidate| *candidate == frame)
-            .ok_or(Error::InvalidAllocatedFrame)?;
-        let range = FrameRange::new(frame.start_address(), 1).map_err(Error::Frame)?;
-        if allocator.free(range).is_err() {
-            return Err(Error::FrameRollbackFailed);
-        }
+        Self::reclaim_exact_from(&mut self.frames, &mut self.len, allocator, frame)
+    }
 
-        let last = self.len - 1;
-        self.frames[index] = self.frames[last];
-        self.frames[last] = PhysFrame::containing_address(0);
-        self.len = last;
+    fn reclaim<const EXTENTS: usize>(
+        &mut self,
+        allocator: &mut ExtentAllocator<EXTENTS>,
+    ) -> Result<(), Error> {
+        Self::reclaim_slice(&mut self.frames, &mut self.len, allocator)
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+struct LiveExecFrameBatch {
+    frames: alloc::vec::Vec<PhysFrame>,
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+impl LiveExecFrameBatch {
+    const fn empty() -> Self {
+        Self {
+            frames: alloc::vec::Vec::new(),
+        }
+    }
+
+    fn frames(&self) -> &[PhysFrame] {
+        &self.frames
+    }
+
+    fn allocate<const EXTENTS: usize>(
+        allocator: &mut ExtentAllocator<EXTENTS>,
+        required: usize,
+        capacity: usize,
+    ) -> Result<Self, Error> {
+        if required > capacity {
+            return Err(Error::FrameCapacity { required, capacity });
+        }
+        let mut frames = alloc::vec::Vec::new();
+        if frames.try_reserve(required).is_err() {
+            return Err(Error::Frame(FrameError::NoMemory));
+        }
+        while frames.len() < required {
+            let frame = match InitialFrameBatch::<0>::allocate_one(allocator) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if !matches!(error, Error::FrameRollbackFailed) {
+                        let mut len = frames.len();
+                        InitialFrameBatch::<0>::reclaim_slice(&mut frames, &mut len, allocator)?;
+                        frames.truncate(len);
+                    }
+                    return Err(error);
+                }
+            };
+            frames.push(frame);
+        }
+        Ok(Self { frames })
+    }
+
+    fn reclaim_exact<const EXTENTS: usize>(
+        &mut self,
+        allocator: &mut ExtentAllocator<EXTENTS>,
+        frame: PhysFrame,
+    ) -> Result<(), Error> {
+        let mut len = self.frames.len();
+        InitialFrameBatch::<0>::reclaim_exact_from(&mut self.frames, &mut len, allocator, frame)?;
+        self.frames.truncate(len);
         Ok(())
     }
 
@@ -139,16 +270,9 @@ impl<const N: usize> InitialFrameBatch<N> {
         &mut self,
         allocator: &mut ExtentAllocator<EXTENTS>,
     ) -> Result<(), Error> {
-        while self.len != 0 {
-            let index = self.len - 1;
-            let range =
-                FrameRange::new(self.frames[index].start_address(), 1).map_err(Error::Frame)?;
-            if allocator.free(range).is_err() {
-                return Err(Error::FrameRollbackFailed);
-            }
-            self.frames[index] = PhysFrame::containing_address(0);
-            self.len = index;
-        }
+        let mut len = self.frames.len();
+        InitialFrameBatch::<0>::reclaim_slice(&mut self.frames, &mut len, allocator)?;
+        self.frames.truncate(len);
         Ok(())
     }
 }
@@ -156,12 +280,12 @@ impl<const N: usize> InitialFrameBatch<N> {
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub(super) struct ExecLoadFailure<const N: usize> {
     error: Error,
-    batch: InitialFrameBatch<N>,
+    batch: LiveExecFrameBatch,
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 impl<const N: usize> ExecLoadFailure<N> {
-    fn new(error: Error, batch: InitialFrameBatch<N>) -> Self {
+    fn new(error: Error, batch: LiveExecFrameBatch) -> Self {
         Self { error, batch }
     }
 
@@ -192,9 +316,9 @@ fn plan_initial_linux_load<const SEGMENTS: usize>(
     image: &[u8],
     start: LinuxProcessStart<'_>,
 ) -> Result<(usize, u64), Error> {
-    plan_aarch64_linux_initial_stack::<SEGMENTS>(image, Default::default(), start)
-        .map_err(Error::Loader)?;
-    let plan = plan_aarch64_elf::<SEGMENTS>(image, Default::default()).map_err(Error::Loader)?;
+    let policy = step15_linux_load_policy();
+    plan_aarch64_linux_initial_stack::<SEGMENTS>(image, policy, start).map_err(Error::Loader)?;
+    let plan = plan_aarch64_elf::<SEGMENTS>(image, policy).map_err(Error::Loader)?;
     let required = required_pages(&plan)
         .map_err(Error::Mapping)?
         .checked_add(1)
@@ -227,14 +351,10 @@ fn plan_dynamic_linux_load<const SEGMENTS: usize>(
     interpreter: &[u8],
     start: LinuxProcessStart<'_>,
 ) -> Result<(usize, u64), Error> {
-    plan_aarch64_dynamic_linux_initial_stack::<SEGMENTS>(
-        executable,
-        interpreter,
-        Default::default(),
-        start,
-    )
-    .map_err(Error::Loader)?;
-    let plan = plan_aarch64_dynamic_elf::<SEGMENTS>(executable, interpreter, Default::default())
+    let policy = step15_linux_dynamic_load_policy();
+    plan_aarch64_dynamic_linux_initial_stack::<SEGMENTS>(executable, interpreter, policy, start)
+        .map_err(Error::Loader)?;
+    let plan = plan_aarch64_dynamic_elf::<SEGMENTS>(executable, interpreter, policy)
         .map_err(Error::Loader)?;
     let required = required_dynamic_pages(&plan)
         .map_err(Error::Mapping)?
@@ -318,26 +438,78 @@ pub unsafe fn load_initial_linux_elf_with_core_frames<
     space: &mut BoundProcessAddressSpace<VMAS>,
     backend: &mut B,
 ) -> Result<LoadedInitialLinuxImage, Error> {
-    let (required, initial_break) = plan_initial_linux_load::<SEGMENTS>(image, start)?;
+    // SAFETY: delegated directly to the shared initial loader with `interpreter: None`.
+    unsafe {
+        load_initial_linux_elf_with_optional_interpreter_with_core_frames::<
+            FRAMES,
+            SEGMENTS,
+            CAPS,
+            OBJECTS,
+            VMAS,
+            B,
+        >(image, None, start, pool, process, objects, space, backend)
+    }
+}
+
+/// Dynamic-interpreter-capable variant of [`load_initial_linux_elf_with_core_frames`].
+///
+/// # Safety
+/// Identical owner, quiescence, and quarantine contract as [`load_initial_linux_elf_with_core_frames`].
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn load_initial_linux_elf_with_optional_interpreter_with_core_frames<
+    const FRAMES: usize,
+    const SEGMENTS: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    B: Backend,
+>(
+    image: &[u8],
+    interpreter: Option<&[u8]>,
+    start: LinuxProcessStart<'_>,
+    pool: &mut Step15FramePool,
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    backend: &mut B,
+) -> Result<LoadedInitialLinuxImage, Error> {
+    let (required, initial_break) = plan_exec_linux_load::<SEGMENTS>(image, interpreter, start)?;
     let (allocator, reservations) = pool.split();
     let batch = InitialFrameBatch::<FRAMES>::allocate(allocator, required)?;
 
-    // SAFETY: delegated caller contract is exactly the canonical loader's owner/quiescence contract;
-    // the batch contains distinct pages removed from this same pool and the reservation reference is
-    // the exact metadata used to construct its persistent allocator exclusions.
-    match unsafe {
-        load_aarch64_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
-            image,
-            Default::default(),
-            start,
-            batch.frames(),
-            process,
-            objects,
-            space,
-            backend,
-            reservations,
-        )
-    } {
+    // SAFETY: delegated caller contract is identical to `load_aarch64_linux_elf`; the batch
+    // holds distinct pages removed from this pool and the reservation reference is persistent.
+    let result = match interpreter {
+        Some(interpreter) => unsafe {
+            load_aarch64_dynamic_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
+                image,
+                interpreter,
+                step15_linux_dynamic_load_policy(),
+                start,
+                batch.frames(),
+                process,
+                objects,
+                space,
+                backend,
+                reservations,
+            )
+        },
+        None => unsafe {
+            load_aarch64_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
+                image,
+                step15_linux_load_policy(),
+                start,
+                batch.frames(),
+                process,
+                objects,
+                space,
+                backend,
+                reservations,
+            )
+        },
+    };
+    match result {
         Ok(loaded) => Ok(LoadedInitialLinuxImage {
             loaded,
             initial_break,
@@ -381,12 +553,12 @@ pub(super) unsafe fn load_exec_linux_elf_with_core_frames<
     let (required, initial_break) =
         match plan_exec_linux_load::<SEGMENTS>(image, interpreter, start) {
             Ok(plan) => plan,
-            Err(error) => return Err(ExecLoadFailure::new(error, InitialFrameBatch::new())),
+            Err(error) => return Err(ExecLoadFailure::new(error, LiveExecFrameBatch::empty())),
         };
     let (allocator, reservations) = pool.split();
-    let batch = match InitialFrameBatch::<FRAMES>::allocate(allocator, required) {
+    let batch = match LiveExecFrameBatch::allocate(allocator, required, FRAMES) {
         Ok(batch) => batch,
-        Err(error) => return Err(ExecLoadFailure::new(error, InitialFrameBatch::new())),
+        Err(error) => return Err(ExecLoadFailure::new(error, LiveExecFrameBatch::empty())),
     };
 
     // SAFETY: identical owner/quiescence contract to the boot wrapper above. The batch remains linear
@@ -396,7 +568,7 @@ pub(super) unsafe fn load_exec_linux_elf_with_core_frames<
             load_aarch64_dynamic_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
                 image,
                 interpreter,
-                Default::default(),
+                step15_linux_dynamic_load_policy(),
                 start,
                 batch.frames(),
                 process,
@@ -409,7 +581,7 @@ pub(super) unsafe fn load_exec_linux_elf_with_core_frames<
         None => unsafe {
             load_aarch64_linux_elf::<SEGMENTS, CAPS, OBJECTS, VMAS, STEP15_RESERVED_RANGES, B>(
                 image,
-                Default::default(),
+                step15_linux_load_policy(),
                 start,
                 batch.frames(),
                 process,

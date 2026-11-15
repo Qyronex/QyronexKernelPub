@@ -14,7 +14,7 @@ use kernal_linux_abi::{
 use kernal_linux_bootstrap_aarch64::time::{ClockGettimeError, clock_gettime};
 use kernal_protected_boot_aarch64::{
     RuntimeTablePool, Step15ProofCallback, install_step15_proof_callback,
-    map_qemu_initrd_high_alias, runtime_ttbr1_root,
+    map_qemu_initrd_high_alias, map_qemu_virtio_mmio_high_aliases, runtime_ttbr1_root,
 };
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_scheduler_smp::GlobalThreadId;
@@ -45,6 +45,8 @@ mod signal_delivery;
 mod sigreturn;
 #[path = "step28_mprotect.rs"]
 mod step28_mprotect;
+#[path = "step29_dirent.rs"]
+pub(super) mod step29_dirent;
 #[cfg(feature = "step29-qemu-proof")]
 #[path = "step29_fd.rs"]
 mod step29_fd;
@@ -72,6 +74,8 @@ mod step30_runtime;
 mod step31_runtime;
 #[path = "step32_dev.rs"]
 mod step32_dev;
+#[path = "step33_ext4_vfs.rs"]
+mod step33_ext4_vfs;
 #[path = "step33_mounts.rs"]
 mod step33_mounts;
 #[path = "step34_net.rs"]
@@ -158,6 +162,20 @@ unsafe fn run_protected(
     let initrd = unsafe { map_qemu_initrd_high_alias(backend.as_mut()) }.map_err(|_| ())?;
     serial.write_str("KERNAL/ARM64: Step 15 protected initrd mapped RO/NX\n");
 
+    // Discover and permanently map QEMU VirtIO-MMIO apertures + `/chosen` metadata immediately
+    // after initrd before frame/runtime setup touches any block or network peripherals.
+    // SAFETY: same BSP-exclusive quiescence and monotonic `RuntimeTablePool` cursor hold.
+    let virtio_map =
+        unsafe { map_qemu_virtio_mmio_high_aliases(backend.as_mut(), initrd) }.map_err(|_| ())?;
+    if let Some(sectors) = step42_hardware::init_from_protected_virtio(&virtio_map)? {
+        serial.write_str("KERNAL/ARM64: VirtIO-Blk MMIO attached sectors=");
+        serial.write_u64(sectors);
+        serial.write_str("\n");
+    }
+    if step42_hardware::has_hardware_net() {
+        serial.write_str("KERNAL/ARM64: VirtIO-Net MMIO attached\n");
+    }
+
     // Publish physical exclusions before the first safe byte borrow. This records the protected QEMU
     // low prefix plus the complete page-covering initrd range.
     memory::publish_frame_reservations(initrd).map_err(|_| ())?;
@@ -178,6 +196,17 @@ unsafe fn run_protected(
     // cursor supplied by the protected-boot owner for the duration of this synchronous callback.
     runtime::initialize_linux_runtime(unsafe { backend.as_mut() }).map_err(|_| ())?;
     serial.write_str("KERNAL/ARM64: Step 15 persistent Linux runtime initialized\n");
+    if let Some(ip) = step34_net::init_hardware_net() {
+        serial.write_str("KERNAL/ARM64: VirtIO-Net DHCP ip=");
+        serial.write_u64(u64::from(ip[0]));
+        serial.write_str(".");
+        serial.write_u64(u64::from(ip[1]));
+        serial.write_str(".");
+        serial.write_u64(u64::from(ip[2]));
+        serial.write_str(".");
+        serial.write_u64(u64::from(ip[3]));
+        serial.write_str("\n");
+    }
 
     #[cfg(feature = "step29-qemu-proof")]
     {
@@ -263,7 +292,7 @@ pub(super) fn activate_step30_scheduler_destination(
         .and_then(|result| result)
     };
     if activated.is_ok() {
-        if let Some(serial) = step15_svc_serial() {
+        if let Some(serial) = step15_svc_trace_serial() {
             serial.write_str("KERNAL/S30S selected cpu=");
             serial.write_u64(destination.cpu.0 as u64);
             serial.write_str(" slot=");
@@ -443,7 +472,22 @@ pub(super) fn finalize_step30_pending_exit_after_resume(current_cpu: usize) -> R
 
     // Zombie publication or auto-reap consumed every matching committed waiter. Deliver those exact
     // generations before any unrelated fallible reclamation step can abort this post-commit path.
+    let had_parent_publication = wakes.is_some();
     wake_wait_exit_batch(current_cpu, scheduler, wakes)?;
+
+    #[cfg(feature = "step29-qemu-proof")]
+    if matches!(
+        completion,
+        kernal_linux_exit_lifecycle::Completion::ProcessExited { .. }
+    ) {
+        if had_parent_publication {
+            step29_runtime::retire_on_process_exit(process_id).map_err(|_| ())?;
+        } else {
+            step29_runtime::retire_process(process_id).map_err(|_| ())?;
+        }
+    }
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    let _ = had_parent_publication;
 
     // SAFETY: scheduler reap proof was consumed by successful lifecycle finalization above.
     unsafe { kernal_core_aarch64::reclaim_reaped_clone_core_stack(retired_stack) }
@@ -483,7 +527,7 @@ fn step15_svc_serial() -> Option<Pl011> {
     })
 }
 
-fn arm_step30_post_fork_reschedule_trace() {
+pub(super) fn arm_step30_post_fork_reschedule_trace() {
     STEP30_POST_FORK_RESCHEDULE_TRACE_PENDING.store(true, Ordering::Release);
 }
 
@@ -495,8 +539,17 @@ pub(super) fn take_step30_post_fork_reschedule_trace() -> bool {
     STEP30_POST_FORK_RESCHEDULE_TRACE_PENDING.swap(false, Ordering::AcqRel)
 }
 
+#[inline]
+pub(super) fn step15_svc_trace_serial() -> Option<Pl011> {
+    if cfg!(feature = "step31-debian-shell") {
+        None
+    } else {
+        step15_svc_serial()
+    }
+}
+
 pub(super) fn trace_step30_post_fork_timer_irq() {
-    if let Some(serial) = step15_svc_serial() {
+    if let Some(serial) = step15_svc_trace_serial() {
         serial.write_str("KERNAL/S30I timer\n");
     }
 }
@@ -541,13 +594,13 @@ pub(super) fn trace_step30_post_fork_non_irq_fatal(
 }
 
 pub(super) fn trace_step30_post_fork_pre_reschedule() {
-    if let Some(serial) = step15_svc_serial() {
+    if let Some(serial) = step15_svc_trace_serial() {
         serial.write_str("KERNAL/S30I pre-reschedule\n");
     }
 }
 
 pub(super) fn trace_step30_post_fork_reschedule_current(cpu: u64, slot: u64, generation: u64) {
-    if let Some(serial) = step15_svc_serial() {
+    if let Some(serial) = step15_svc_trace_serial() {
         serial.write_str("KERNAL/S30R current cpu=");
         serial.write_u64(cpu);
         serial.write_str(" slot=");
@@ -559,7 +612,7 @@ pub(super) fn trace_step30_post_fork_reschedule_current(cpu: u64, slot: u64, gen
 }
 
 pub(super) fn trace_step30_post_fork_reschedule_return(slot: u64, generation: u64) {
-    if let Some(serial) = step15_svc_serial() {
+    if let Some(serial) = step15_svc_trace_serial() {
         serial.write_str("KERNAL/S30R return slot=");
         serial.write_u64(slot);
         serial.write_str(" generation=");
@@ -572,6 +625,16 @@ pub(super) fn trace_step30_post_fork_reschedule_error() {
     if let Some(serial) = step15_svc_serial() {
         serial.write_str("KERNAL/S30R error\n");
     }
+}
+
+pub(super) fn deliver_step30_signal_on_return_with_saved_mask(
+    frame: &mut ExceptionFrame,
+    saved_mask: kernal_linux_signal::SignalSet,
+) -> Result<(), ()> {
+    if frame.kind() == kernal_exceptions_aarch64::ExceptionKind::Irq {
+        return Err(());
+    }
+    signal_delivery::deliver_on_return_with_saved_mask(frame, saved_mask)
 }
 
 pub(super) fn deliver_step30_signal_on_return(frame: &mut ExceptionFrame) -> Result<(), ()> {
@@ -600,7 +663,15 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
                 drained_empty = true;
                 break;
             }
-            Err(()) => return false,
+            Err(()) => {
+                #[cfg(feature = "step31-debian-qemu")]
+                if let Some(serial) = step15_svc_serial() {
+                    serial.write_str("KERNAL/D13: pre-svc finalize failed nr=");
+                    serial.write_u64(frame.x[8]);
+                    serial.write_str("\n");
+                }
+                return false;
+            }
         }
     }
     if !drained_empty {
@@ -613,7 +684,13 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
         };
         match runtime::with_linux_runtime(|state| state.pending_thread_exit(scheduler_owner)) {
             Ok(None) => {}
-            Ok(Some(_)) | Err(_) => return false,
+            Ok(Some(_)) | Err(_) => {
+                #[cfg(feature = "step31-debian-qemu")]
+                if let Some(serial) = step15_svc_serial() {
+                    serial.write_str("KERNAL/D13: pre-svc pending exit drain failed\n");
+                }
+                return false;
+            }
         }
     }
 
@@ -634,7 +711,7 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
                 unsafe { scheduler.bootstrap_current_global_thread() }.ok()
             });
         let current_switch_generation = kernal_process_aarch64::current_user_switch_generation();
-        if let (Some(serial), Some(current)) = (step15_svc_serial(), current) {
+        if let (Some(serial), Some(current)) = (step15_svc_trace_serial(), current) {
             serial.write_str("KERNAL/S30T enter cpu=");
             serial.write_u64(u64::from(current.cpu.0));
             serial.write_str(" slot=");
@@ -652,7 +729,12 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
         }
 
         let result = deliver_step30_signal_on_return(frame);
-        if let (Some(serial), Some(current)) = (step15_svc_serial(), current) {
+        let trace_serial = if result.is_ok() {
+            step15_svc_trace_serial()
+        } else {
+            step15_svc_serial()
+        };
+        if let (Some(serial), Some(current)) = (trace_serial, current) {
             serial.write_str("KERNAL/S30T ");
             serial.write_str(if result.is_ok() { "ok" } else { "err" });
             serial.write_str(" cpu=");
@@ -673,7 +755,16 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
         return result.is_ok();
     }
 
-    deliver_step30_signal_on_return(frame).is_ok()
+    let ok = deliver_step30_signal_on_return(frame).is_ok();
+    #[cfg(feature = "step31-debian-qemu")]
+    if !ok {
+        if let Some(serial) = step15_svc_serial() {
+            serial.write_str("KERNAL/D13: signal deliver failed nr=");
+            serial.write_u64(frame.x[8]);
+            serial.write_str("\n");
+        }
+    }
+    ok
 }
 
 fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: &mut bool) -> bool {
@@ -705,13 +796,40 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             return false;
         }
-        Err(()) => return false,
+        Err(()) => {
+            #[cfg(feature = "step31-debian-qemu")]
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/D13: seccomp evaluate failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
+    #[cfg(feature = "step31-debian-shell")]
+    step32_dev::poll_console_rx_and_deliver_signals();
+
+    match step32_dev::try_handle_blocking_read(request, frame) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 32 /dev blocking read failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
     }
 
     match step32_dev::try_handle_syscall(request) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 32 /dev syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -779,7 +897,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     match step33_mounts::try_handle_syscall(request) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 33 mounts/proc/sys syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -799,10 +917,10 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
-    match step34_net::try_handle_syscall(request) {
+    match step34_net::try_handle_syscall(request, Some(frame)) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 34 net syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -822,10 +940,10 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
-    match step35_events_cgroup::try_handle_syscall(request) {
+    match step35_events_cgroup::try_handle_syscall(request, Some(frame)) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 35/36 events/cgroup syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -848,7 +966,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     match step37_38_systemd_udev::try_handle_syscall(request) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 37/38 systemd/udev syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -868,10 +986,35 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
+    match step_fd_util::try_handle_subsystem_dup_or_fcntl(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => return false,
+    }
+
+    match step33_ext4_vfs::try_handle_syscall(request) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_trace_serial() {
+                serial.write_str("KERNAL/ARM64: Step 33 ext4 VFS invariant abort on syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
     #[cfg(feature = "step29-qemu-proof")]
     match step29_fd::handle(request, frame) {
         Ok(step29_fd::HandleOutcome::Handled) => {
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 29 path/fd syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -882,7 +1025,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
         Ok(step29_fd::HandleOutcome::SignalFrameCommitted) => {
             *signal_frame_committed = true;
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 29 path/fd committed signal frame nr=");
                 serial.write_u64(request.number);
                 serial.write_str("\n");
@@ -903,10 +1046,10 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     // Dispatch Step-39 dpkg/xattr/locking helpers after Step-29 path/FD ownership (so real
     // overlay metadata operations like fchmod/utimensat update the active VFS inode state) and
     // before Step-29 FD-I/O so advisory fcntl locks (F_GETLK/F_SETLK/F_SETLKW) are not rejected.
-    match step39_dpkg::try_handle_syscall(request) {
+    match step39_dpkg::try_handle_syscall_with_frame(request, Some(frame)) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 39 dpkg/pkg syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -928,8 +1071,8 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
 
     #[cfg(feature = "step29-qemu-proof")]
     match step29_fd_io::handle(request, frame) {
-        Ok(true) => {
-            if let Some(serial) = step15_svc_serial() {
+        Ok(step29_fd_io::HandleOutcome::Handled) => {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 29 fd-io syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -938,7 +1081,16 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             return true;
         }
-        Ok(false) => {}
+        Ok(step29_fd_io::HandleOutcome::SignalFrameCommitted) => {
+            *signal_frame_committed = true;
+            if let Some(serial) = step15_svc_trace_serial() {
+                serial.write_str("KERNAL/ARM64: Step 29 fd-io committed signal frame nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(step29_fd_io::HandleOutcome::NotHandled) => {}
         Err(()) => {
             if let Some(serial) = step15_svc_serial() {
                 serial.write_str("KERNAL/ARM64: Step 29 fd-io invariant failed nr=");
@@ -951,7 +1103,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
 
     if request.number == 64 {
         if write::handle(frame) {
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 15 write result=");
                 serial.write_hex_u64(frame.x[0]);
                 serial.write_str("\n");
@@ -965,14 +1117,23 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     }
 
     if request.number == 214 && request.args[0] == 0 {
+        let current_cpu = super::current_cpu_index();
+        let Some(scheduler) = super::CPU_SCHEDULERS.get(current_cpu) else {
+            return false;
+        };
+        // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+        let Ok(current) = (unsafe { scheduler.bootstrap_current_global_thread() }) else {
+            return false;
+        };
         let current_break = runtime::with_linux_runtime(|runtime| {
-            let process_id = runtime.process().id();
-            let (vm, _, _, _) = runtime.minimum_vm_parts();
-            vm.current_break(process_id)
+            let Ok((vm, process, _, _)) = runtime.vm_parts_for_scheduler_thread(current) else {
+                return Err(kernal_linux_vm::Error::BackendInvariant);
+            };
+            vm.current_break(process.id())
         });
         if let Ok(Ok(current_break)) = current_break {
             frame.x[0] = current_break;
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 15 brk(0) query -> ");
                 serial.write_hex_u64(current_break);
                 serial.write_str("\n");
@@ -992,7 +1153,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         match live_vm::handle(call) {
             Ok(Ok(result)) => {
                 frame.x[0] = result;
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 brk -> ");
                     serial.write_hex_u64(result);
                     serial.write_str("\n");
@@ -1009,11 +1170,19 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     }
 
     if request.number == 226 {
-        match step28_mprotect::handle(request.args[0], request.args[1], request.args[2]) {
+        let outcome = if request.args[2] == 0x1
+            && request.args[1] != 0
+            && request.args[1] <= (runtime::STEP15_RUNTIME_VM_TX_PAGES as u64) * 4096
+        {
+            step28_mprotect::handle(request.args[0], request.args[1], request.args[2])
+        } else {
+            step31_runtime::handle_mprotect(request.args[0], request.args[1], request.args[2])
+        };
+        match outcome {
             Ok(Ok(result)) => {
                 frame.x[0] = result;
-                if let Some(serial) = step15_svc_serial() {
-                    serial.write_str("KERNAL/ARM64: Step 28 mprotect(PROT_READ) result=");
+                if let Some(serial) = step15_svc_trace_serial() {
+                    serial.write_str("KERNAL/ARM64: Step 28/31 mprotect result=");
                     serial.write_hex_u64(result);
                     serial.write_str("\n");
                 }
@@ -1021,8 +1190,8 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             Ok(Err(errno)) => {
                 frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
-                if let Some(serial) = step15_svc_serial() {
-                    serial.write_str("KERNAL/ARM64: Step 28 mprotect errno=");
+                if let Some(serial) = step15_svc_trace_serial() {
+                    serial.write_str("KERNAL/ARM64: Step 28/31 mprotect errno=");
                     serial.write_u64(errno.get() as u64);
                     serial.write_str(" prot=");
                     serial.write_hex_u64(request.args[2]);
@@ -1032,7 +1201,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             Err(()) => {
                 if let Some(serial) = step15_svc_serial() {
-                    serial.write_str("KERNAL/ARM64: Step 28 mprotect invariant failed\n");
+                    serial.write_str("KERNAL/ARM64: Step 28/31 mprotect invariant failed\n");
                 }
                 return false;
             }
@@ -1043,7 +1212,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         match clock_gettime(request.args[0], request.args[1]) {
             Ok(result) => {
                 frame.x[0] = result.as_u64_bits();
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 clock_gettime completed clock=");
                     serial.write_u64(request.args[0]);
                     serial.write_str("\n");
@@ -1052,7 +1221,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             Err(ClockGettimeError::Errno(errno)) => {
                 frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 clock_gettime errno=");
                     serial.write_u64(errno.get() as u64);
                     serial.write_str("\n");
@@ -1091,7 +1260,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         match vm_outcome {
             Ok(Ok(address)) => {
                 frame.x[0] = address;
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 mmap -> ");
                     serial.write_hex_u64(address);
                     serial.write_str("\n");
@@ -1100,7 +1269,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             Ok(Err(kernal_linux_vm::Error::Linux(errno))) => {
                 frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 mmap errno=");
                     serial.write_u64(errno.get() as u64);
                     serial.write_str("\n");
@@ -1124,7 +1293,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         match live_vm::handle(call) {
             Ok(Ok(result)) => {
                 frame.x[0] = result;
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 munmap result=");
                     serial.write_hex_u64(result);
                     serial.write_str("\n");
@@ -1133,7 +1302,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             }
             Ok(Err(kernal_linux_vm::Error::Linux(errno))) => {
                 frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 munmap errno=");
                     serial.write_u64(errno.get() as u64);
                     serial.write_str("\n");
@@ -1158,6 +1327,26 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     }
 
     if request.number == 98 {
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_os = "none",
+            feature = "step31-debian-qemu"
+        ))]
+        let call = match step31_runtime::try_prepare_debian_futex(request, frame) {
+            Ok(Some(call)) => call,
+            Ok(None) => return true,
+            Err(()) => {
+                if let Some(serial) = step15_svc_serial() {
+                    serial.write_str("KERNAL/ARM64: Step 31 Debian futex invariant failed\n");
+                }
+                return false;
+            }
+        };
+        #[cfg(not(all(
+            target_arch = "aarch64",
+            target_os = "none",
+            feature = "step31-debian-qemu"
+        )))]
         let call = MinimumRuntimeCall::Futex {
             user_address: request.args[0],
             operation: request.args[1],
@@ -1166,6 +1355,10 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             user_address2: request.args[4],
             value3: request.args[5],
         };
+        let is_wait_private = matches!(
+            call,
+            MinimumRuntimeCall::Futex { operation, .. } if operation == STEP15_FUTEX_WAIT_PRIVATE
+        );
 
         let current_cpu = super::current_cpu_index();
         let Some(scheduler) = super::CPU_SCHEDULERS.get(current_cpu) else {
@@ -1260,7 +1453,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
 
         match dispatched {
             Ok(kernal_linux_futex_trap_aarch64::DispatchOutcome::Complete) => {
-                if request.args[1] == STEP15_FUTEX_WAIT_PRIVATE
+                if is_wait_private
                     && finalize_step30_pending_exit_after_resume(current_cpu).is_err()
                 {
                     if let Some(serial) = step15_svc_serial() {
@@ -1271,7 +1464,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
                     return false;
                 }
 
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 futex result=");
                     serial.write_hex_u64(frame.x[0]);
                     serial.write_str("\n");
@@ -1281,7 +1474,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             Ok(kernal_linux_futex_trap_aarch64::DispatchOutcome::SignalInterrupted(
                 interrupted,
             )) => {
-                if interrupted != current || request.args[1] != STEP15_FUTEX_WAIT_PRIVATE {
+                if interrupted != current || !is_wait_private {
                     if let Some(serial) = step15_svc_serial() {
                         serial.write_str(
                             "KERNAL/ARM64: Step 30 futex signal interruption identity mismatch\n",
@@ -1310,7 +1503,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
 
                 match signal_delivery::deliver_interrupted_futex(frame, resumed) {
                     Ok(signal_delivery::InterruptedFutexDelivery::Restarted) => {
-                        if let Some(serial) = step15_svc_serial() {
+                        if let Some(serial) = step15_svc_trace_serial() {
                             serial.write_str(
                                 "KERNAL/ARM64: Step 30 futex signal interruption restarted\n",
                             );
@@ -1319,7 +1512,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
                     }
                     Ok(signal_delivery::InterruptedFutexDelivery::SignalFrameCommitted) => {
                         *signal_frame_committed = true;
-                        if let Some(serial) = step15_svc_serial() {
+                        if let Some(serial) = step15_svc_trace_serial() {
                             serial.write_str(
                                 "KERNAL/ARM64: Step 30 futex signal handler frame committed\n",
                             );
@@ -1343,6 +1536,15 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
                 return false;
             }
         }
+    }
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_os = "none",
+        feature = "step31-debian-qemu"
+    ))]
+    if let Some(handled) = step31_runtime::try_handle_debian_process_clone(request, frame) {
+        return handled;
     }
 
     if request.number == 220 {
@@ -1390,7 +1592,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
                     };
                     frame.x[0] = u64::from(published.child_pid().get());
                     arm_step30_post_fork_reschedule_trace();
-                    if let Some(serial) = step15_svc_serial() {
+                    if let Some(serial) = step15_svc_trace_serial() {
                         serial.write_str("KERNAL/ARM64: Step 30 fork parent result=");
                         serial.write_hex_u64(frame.x[0]);
                         serial.write_str("\n");
@@ -1430,13 +1632,16 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             child_tid: request.args[4],
         };
         let dispatched = runtime::with_linux_runtime(|state| {
-            let (process, address_space, objects, bindings, identities, exits) =
-                state.initial_leader_parts();
+            let Ok((process, address_space, objects, bindings, identities, exits)) =
+                state.thread_clone_parts_for_scheduler_thread(parent_thread)
+            else {
+                return Err(());
+            };
             // SAFETY: a lower-EL synchronous SVC runs inside CPU0's exception-owned scheduler
             // window with the current Process/TTBR0 binding unchanged. The runtime borrow above is
             // exclusive for exactly this synchronous transaction and ends before returning to EL0;
             // the canonical Core transaction owns staging, Process/TID authority and rollback.
-            unsafe {
+            Ok(unsafe {
                 kernal_core_aarch64::dispatch_clone_with_core_stacks(
                     call,
                     frame,
@@ -1449,11 +1654,14 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
                     scheduler,
                     super::SMOKE_WORKER_PRIORITY,
                 )
-            }
+            })
         });
 
         match dispatched {
-            Ok(Ok(())) => {
+            Ok(Ok(Ok(()))) => {
+                if (frame.x[0] as i64) < 0 {
+                    return true;
+                }
                 let child_tid = match u32::try_from(frame.x[0]).ok().and_then(NonZeroU32::new) {
                     Some(tid) => tid,
                     None => {
@@ -1475,14 +1683,14 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
                     }
                     return false;
                 }
-                if let Some(serial) = step15_svc_serial() {
+                if let Some(serial) = step15_svc_trace_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 clone parent result=");
                     serial.write_hex_u64(frame.x[0]);
                     serial.write_str("\n");
                 }
                 return true;
             }
-            Ok(Err(_)) | Err(_) => {
+            Ok(Ok(Err(_))) | Ok(Err(())) | Err(_) => {
                 if let Some(serial) = step15_svc_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 clone invariant failed\n");
                 }
@@ -1507,7 +1715,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     match step30_runtime::handle(request, frame) {
         Ok(step30_runtime::Outcome::Return(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 30 runtime syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -1538,10 +1746,26 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
+    match step31_runtime::handle_blocking_readv(request, frame) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 31 readv invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
+    }
+
     match step31_runtime::handle(request) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: Step 31 glibc syscall nr=");
                 serial.write_u64(request.number);
                 serial.write_str(" result=");
@@ -1561,6 +1785,26 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
+    if let Some(identity_result) = dispatch_current_identity_syscall(request) {
+        let Ok(result) = identity_result else {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 15 identity syscall invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        };
+        frame.x[0] = result.as_u64_bits();
+        if let Some(serial) = step15_svc_trace_serial() {
+            serial.write_str("KERNAL/ARM64: Step 15 identity syscall nr=");
+            serial.write_u64(request.number);
+            serial.write_str(" result=");
+            serial.write_hex_u64(frame.x[0]);
+            serial.write_str("\n");
+        }
+        return true;
+    }
+
     if is_classified_minimum_number(request.number) {
         if let Some(serial) = step15_svc_serial() {
             serial.write_str("KERNAL/ARM64: Step 15 first classified EL0 syscall nr=");
@@ -1576,7 +1820,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
 
     let result = unsupported(request);
     frame.x[0] = result.as_u64_bits();
-    if let Some(serial) = step15_svc_serial() {
+    if let Some(serial) = step15_svc_trace_serial() {
         serial.write_str("KERNAL/ARM64: Step 15 unsupported EL0 syscall nr=");
         serial.write_u64(request.number);
         serial.write_str(" -> ENOSYS\n");
@@ -1593,7 +1837,7 @@ fn dispatch_step_subsystem(
     match handler(request) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
-            if let Some(serial) = step15_svc_serial() {
+            if let Some(serial) = step15_svc_trace_serial() {
                 serial.write_str("KERNAL/ARM64: ");
                 serial.write_str(label);
                 serial.write_str(" syscall nr=");
@@ -1616,6 +1860,39 @@ fn dispatch_step_subsystem(
             Some(false)
         }
     }
+}
+
+/// Resolves `getpid` (172) and `gettid` (178) for the running scheduler thread's owning process.
+fn dispatch_current_identity_syscall(request: SyscallRequest) -> Option<Result<SyscallReturn, ()>> {
+    let want_pid = match request.number {
+        172 => true,
+        178 => false,
+        _ => return None,
+    };
+    let current_cpu = super::current_cpu_index();
+    let Some(scheduler) = super::CPU_SCHEDULERS.get(current_cpu) else {
+        return Some(Err(()));
+    };
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+    let Ok(current) = (unsafe { scheduler.bootstrap_current_global_thread() }) else {
+        return Some(Err(()));
+    };
+    if usize::from(current.cpu.0) != current_cpu {
+        return Some(Err(()));
+    }
+    let resolved = runtime::with_linux_runtime(|state| {
+        state.with_current_process_identity(current, |process, identities| {
+            if want_pid {
+                identities.bound_pid(process)
+            } else {
+                identities.bound_tid_for_scheduler_thread(process, current)
+            }
+        })
+    });
+    let Ok(Ok(Ok(id))) = resolved else {
+        return Some(Err(()));
+    };
+    Some(SyscallReturn::success(i64::from(id.get())).ok_or(()))
 }
 
 const fn is_classified_minimum_number(number: u64) -> bool {

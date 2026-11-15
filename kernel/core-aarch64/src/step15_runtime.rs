@@ -24,17 +24,19 @@ use kernal_scheduler::ThreadId;
 use kernal_scheduler_smp::GlobalThreadId;
 
 pub const STEP15_RUNTIME_CAPS: usize = 32;
-pub const STEP15_RUNTIME_OBJECTS: usize = 32;
-pub const STEP15_RUNTIME_VMAS: usize = 64;
+pub const STEP15_RUNTIME_OBJECTS: usize = 128;
+pub const STEP15_RUNTIME_VMAS: usize = 256;
 pub const STEP15_RUNTIME_THREADS: usize = 16;
-/// Fixed process capacity for the Step-30 shell lifecycle. Four concurrent Process generations keep
-/// the 32-object budget below saturation even when all sixteen thread-object slots are populated.
-pub const STEP15_RUNTIME_PROCESSES: usize = 4;
+/// Fixed process capacity for interactive Debian workloads and child pipelines. Sixteen concurrent
+/// Process generations fit cleanly within the 128-object budget.
+pub const STEP15_RUNTIME_PROCESSES: usize = 16;
 const STEP15_RUNTIME_ADDITIONAL_PROCESSES: usize = STEP15_RUNTIME_PROCESSES - 1;
 pub const STEP15_RUNTIME_GROUPS: usize = STEP15_RUNTIME_PROCESSES;
 pub const STEP15_RUNTIME_SIGNAL_PENDING: usize = 64;
 pub const STEP15_RUNTIME_VM_BREAKS: usize = STEP15_RUNTIME_PROCESSES;
 pub const STEP15_RUNTIME_VM_TX_PAGES: usize = STEP15_RUNTIME_VMAS;
+/// Transaction page cap for Step-31 dynamic `mmap(2)` / `mprotect(2)` (32 MiB per call).
+pub const STEP31_DYNAMIC_MMAP_TX_PAGES: usize = 8192;
 
 const EMPTY: u8 = 0;
 const INSTALLING: u8 = 1;
@@ -85,6 +87,82 @@ impl RuntimeProcessSlot {
     }
 }
 
+/// Per-process runtime naming, executable path, and cmdline metadata across fork/exec/prctl.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessMeta {
+    process: ObjectId,
+    comm: [u8; 16],
+    comm_len: u8,
+    exe_path: [u8; 128],
+    exe_len: u8,
+    cmdline: [u8; 128],
+    cmdline_len: u8,
+}
+
+impl ProcessMeta {
+    fn from_exec(process: ObjectId, exe_path: &[u8], cmdline: &[u8]) -> Self {
+        let mut exe_buf = [0u8; 128];
+        let mut exe_len = 0usize;
+        if !exe_path.is_empty() {
+            if !exe_path.starts_with(b"/") {
+                exe_buf[0] = b'/';
+                exe_len = 1;
+            }
+            let take = exe_path.len().min(exe_buf.len() - exe_len);
+            exe_buf[exe_len..exe_len + take].copy_from_slice(&exe_path[..take]);
+            exe_len += take;
+        }
+        let base = path_basename(&exe_buf[..exe_len]);
+        let mut comm_buf = [0u8; 16];
+        let comm_take = base.len().min(15);
+        comm_buf[..comm_take].copy_from_slice(&base[..comm_take]);
+
+        let mut cmd_buf = [0u8; 128];
+        let cmd_take = cmdline.len().min(cmd_buf.len());
+        cmd_buf[..cmd_take].copy_from_slice(&cmdline[..cmd_take]);
+
+        Self {
+            process,
+            comm: comm_buf,
+            comm_len: comm_take as u8,
+            exe_path: exe_buf,
+            exe_len: exe_len as u8,
+            cmdline: cmd_buf,
+            cmdline_len: cmd_take as u8,
+        }
+    }
+}
+
+/// Read-only generation-bound snapshot of one live or zombie Linux process for `/proc`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProcProcessSnapshot {
+    pub(super) process: ObjectId,
+    pub(super) pid: u32,
+    pub(super) ppid: u32,
+    pub(super) pgid: u32,
+    pub(super) sid: u32,
+    pub(super) uid: u32,
+    pub(super) gid: u32,
+    pub(super) state_char: u8,
+    pub(super) comm: [u8; 16],
+    pub(super) comm_len: usize,
+    pub(super) exe_path: [u8; 128],
+    pub(super) exe_len: usize,
+    pub(super) cmdline: [u8; 128],
+    pub(super) cmdline_len: usize,
+}
+
+fn path_basename(path: &[u8]) -> &[u8] {
+    let mut trimmed = path;
+    while trimmed.len() > 1 && trimmed.ends_with(b"/") {
+        trimmed = &trimmed[..trimmed.len() - 1];
+    }
+    match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(idx) if idx + 1 < trimmed.len() => &trimmed[idx + 1..],
+        _ => trimmed,
+    }
+}
+
 /// Persistent owner for the initial Step-15 Linux process plus bounded Step-30 child processes.
 ///
 /// Slot 0 remains the exact initial Process/AddressSpace pair so accepted Step-15 loader/VM callers
@@ -108,37 +186,162 @@ pub struct Step15LinuxRuntime {
     exits: ExitCoordinator<STEP15_RUNTIME_GROUPS>,
     pending_exits: [Option<(GlobalThreadId, ExitTicket)>; STEP15_RUNTIME_THREADS],
     vm: LinuxVmRuntime<STEP15_RUNTIME_VM_BREAKS, STEP15_RUNTIME_VM_TX_PAGES>,
+    process_meta: [Option<ProcessMeta>; STEP15_RUNTIME_PROCESSES],
 }
 
 impl Step15LinuxRuntime {
-    fn create<B: Backend>(backend: &mut B) -> Result<Self, Error> {
-        let mut objects = ObjectTable::<STEP15_RUNTIME_OBJECTS>::new();
-        let process = Process::<STEP15_RUNTIME_CAPS>::create(&mut objects, Personality::Linux)
-            .map_err(Error::Process)?;
-        let mut credentials = CredentialTable::new();
-        credentials
-            .bind_process(&process, LinuxCredentials::root())
-            .map_err(Error::Credentials)?;
-        let mut signals = SignalTable::new();
-        signals.bind_process(&process).map_err(Error::Signal)?;
-        let address_space =
-            BoundProcessAddressSpace::<STEP15_RUNTIME_VMAS>::create(&process, &objects, backend)
-                .map_err(Error::AddressSpace)?;
+    #[inline(never)]
+    unsafe fn init_signals_in_place(
+        dst: *mut SignalTable<
+            STEP15_RUNTIME_PROCESSES,
+            STEP15_RUNTIME_SIGNAL_PENDING,
+            STEP15_RUNTIME_THREADS,
+        >,
+    ) {
+        // SAFETY: caller guarantees `dst` points to writable uninitialized signal table storage.
+        unsafe { dst.write(SignalTable::new()) };
+    }
 
-        Ok(Self {
-            objects,
-            process,
-            address_space,
-            additional_processes: core::array::from_fn(|_| None),
-            bindings: ThreadObjectBindings::new(),
-            identities: LinuxIdentityTable::new(),
-            credentials,
-            signals,
-            wait: WaitTable::new(),
-            exits: ExitCoordinator::new(),
-            pending_exits: [None; STEP15_RUNTIME_THREADS],
-            vm: LinuxVmRuntime::new(),
-        })
+    #[inline(never)]
+    unsafe fn init_space_in_place<B: Backend>(
+        dst: *mut BoundProcessAddressSpace<STEP15_RUNTIME_VMAS>,
+        process: &Process<STEP15_RUNTIME_CAPS>,
+        objects: &ObjectTable<STEP15_RUNTIME_OBJECTS>,
+        backend: &mut B,
+    ) -> Result<(), Error> {
+        let space =
+            BoundProcessAddressSpace::<STEP15_RUNTIME_VMAS>::create(process, objects, backend)
+                .map_err(Error::AddressSpace)?;
+        // SAFETY: caller guarantees `dst` points to writable uninitialized address-space storage.
+        unsafe { dst.write(space) };
+        Ok(())
+    }
+
+    #[inline(never)]
+    unsafe fn init_remaining_in_place(dst: *mut Self) {
+        // SAFETY: caller guarantees `dst` points to writable storage and remaining fields are not yet initialized.
+        unsafe {
+            core::ptr::addr_of_mut!((*dst).bindings).write(ThreadObjectBindings::new());
+            core::ptr::addr_of_mut!((*dst).identities).write(LinuxIdentityTable::new());
+            core::ptr::addr_of_mut!((*dst).wait).write(WaitTable::new());
+            core::ptr::addr_of_mut!((*dst).exits).write(ExitCoordinator::new());
+            let pending_ptr = core::ptr::addr_of_mut!((*dst).pending_exits)
+                .cast::<Option<(GlobalThreadId, ExitTicket)>>();
+            for idx in 0..STEP15_RUNTIME_THREADS {
+                pending_ptr.add(idx).write(None);
+            }
+            core::ptr::addr_of_mut!((*dst).vm).write(LinuxVmRuntime::new());
+            let meta_ptr =
+                core::ptr::addr_of_mut!((*dst).process_meta).cast::<Option<ProcessMeta>>();
+            for idx in 0..STEP15_RUNTIME_PROCESSES {
+                meta_ptr.add(idx).write(None);
+            }
+        }
+    }
+
+    /// Constructs `Step15LinuxRuntime` directly into `dst` without staging the full multi-process
+    /// runtime table on the 256 KiB boot stack.
+    ///
+    /// # Safety
+    /// `dst` must be non-null, aligned, writable, and uninitialized.
+    unsafe fn initialize_in_place<B: Backend>(
+        dst: *mut Self,
+        backend: &mut B,
+    ) -> Result<(), Error> {
+        // SAFETY: `dst` points to uninitialized writable storage of `Self`.
+        let objects_ptr = unsafe { core::ptr::addr_of_mut!((*dst).objects) };
+        // SAFETY: `objects_ptr` targets uninitialized field storage inside `dst`.
+        unsafe { objects_ptr.write(ObjectTable::<STEP15_RUNTIME_OBJECTS>::new()) };
+        // SAFETY: `objects_ptr` was just initialized above and no other reference aliases it.
+        let objects = unsafe { &mut *objects_ptr };
+
+        // SAFETY: `dst` points to writable storage of `Self`.
+        let process_ptr = unsafe { core::ptr::addr_of_mut!((*dst).process) };
+        let process_val = match Process::<STEP15_RUNTIME_CAPS>::create(objects, Personality::Linux)
+        {
+            Ok(process) => process,
+            Err(error) => {
+                // SAFETY: roll back only `objects` before returning error.
+                unsafe { core::ptr::drop_in_place(objects_ptr) };
+                return Err(Error::Process(error));
+            }
+        };
+        // SAFETY: `process_ptr` targets uninitialized field storage inside `dst`.
+        unsafe { process_ptr.write(process_val) };
+        // SAFETY: `process_ptr` was initialized above and stays immutable for subsequent bindings.
+        let process = unsafe { &*process_ptr };
+
+        // SAFETY: `dst` points to writable storage of `Self`.
+        let credentials_ptr = unsafe { core::ptr::addr_of_mut!((*dst).credentials) };
+        // SAFETY: `credentials_ptr` targets uninitialized field storage inside `dst`.
+        unsafe { credentials_ptr.write(CredentialTable::new()) };
+        // SAFETY: `credentials_ptr` was initialized above and is disjoint from `process`.
+        if let Err(error) =
+            unsafe { &mut *credentials_ptr }.bind_process(process, LinuxCredentials::root())
+        {
+            // SAFETY: clean up only fields initialized so far on error.
+            unsafe {
+                core::ptr::drop_in_place(credentials_ptr);
+                core::ptr::drop_in_place(process_ptr);
+                core::ptr::drop_in_place(objects_ptr);
+            }
+            return Err(Error::Credentials(error));
+        }
+
+        // SAFETY: `dst` points to writable storage of `Self`.
+        let signals_ptr = unsafe { core::ptr::addr_of_mut!((*dst).signals) };
+        // SAFETY: `signals_ptr` targets uninitialized field storage inside `dst`.
+        unsafe { Self::init_signals_in_place(signals_ptr) };
+        // SAFETY: `signals_ptr` was initialized above and is disjoint from `process`.
+        if let Err(error) = unsafe { &mut *signals_ptr }.bind_process(process) {
+            // SAFETY: clean up only fields initialized so far on error.
+            unsafe {
+                core::ptr::drop_in_place(signals_ptr);
+                core::ptr::drop_in_place(credentials_ptr);
+                core::ptr::drop_in_place(process_ptr);
+                core::ptr::drop_in_place(objects_ptr);
+            }
+            return Err(Error::Signal(error));
+        }
+
+        // SAFETY: `dst` points to writable storage of `Self`.
+        let space_ptr = unsafe { core::ptr::addr_of_mut!((*dst).address_space) };
+        // SAFETY: `space_ptr` targets uninitialized field storage and borrows `process`/`objects` immutably.
+        if let Err(error) =
+            unsafe { Self::init_space_in_place(space_ptr, process, objects, backend) }
+        {
+            // SAFETY: clean up only fields initialized so far on error.
+            unsafe {
+                core::ptr::drop_in_place(signals_ptr);
+                core::ptr::drop_in_place(credentials_ptr);
+                core::ptr::drop_in_place(process_ptr);
+                core::ptr::drop_in_place(objects_ptr);
+            }
+            return Err(error);
+        }
+
+        // SAFETY: `dst` points to writable storage of `Self`; initialize each slot without a full-array stack temporary.
+        let additional_ptr = unsafe {
+            core::ptr::addr_of_mut!((*dst).additional_processes)
+                .cast::<Option<RuntimeProcessSlot>>()
+        };
+        for slot in 0..STEP15_RUNTIME_ADDITIONAL_PROCESSES {
+            // SAFETY: `slot < STEP15_RUNTIME_ADDITIONAL_PROCESSES` stays strictly within `additional_processes`.
+            unsafe { additional_ptr.add(slot).write(None) };
+        }
+        // SAFETY: remaining fields inside `dst` are uninitialized and disjoint from initialized fields.
+        unsafe { Self::init_remaining_in_place(dst) };
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn create<B: Backend>(backend: &mut B) -> Result<Self, Error> {
+        let mut storage = MaybeUninit::<Self>::uninit();
+        // SAFETY: `storage` is properly aligned writable uninitialized memory for `Self`.
+        unsafe {
+            Self::initialize_in_place(storage.as_mut_ptr(), backend)?;
+            Ok(storage.assume_init())
+        }
     }
 
     pub fn loader_parts(
@@ -238,9 +441,20 @@ impl Step15LinuxRuntime {
             identities
                 .bound_tid_for_scheduler_thread(selected, scheduler_thread)
                 .map_err(|_| Error::InvalidState)?;
-            exits
-                .begin_exit(ExitRequest { scope, status }, selected)
-                .map_err(Error::Exit)?
+            match scope {
+                ExitScope::Thread => {
+                    match exits.begin_exit(ExitRequest { scope, status }, selected) {
+                        Ok(ticket) => ticket,
+                        Err(kernal_linux_exit_lifecycle::Error::GroupExitDraining) => {
+                            exits.group_ticket(selected).map_err(Error::Exit)?
+                        }
+                        Err(err) => return Err(Error::Exit(err)),
+                    }
+                }
+                ExitScope::ThreadGroup => exits
+                    .begin_exit(ExitRequest { scope, status }, selected)
+                    .map_err(Error::Exit)?,
+            }
         };
         if ticket.process() != process_id {
             return Err(Error::InvalidState);
@@ -530,6 +744,8 @@ impl Step15LinuxRuntime {
         signals
             .inherit_child(&*identities, parent, child)
             .map_err(Error::Signal)?;
+        let child_id = child.id();
+        self.inherit_fork_process_meta(parent_id, child_id);
         Ok(child_pid)
     }
 
@@ -610,6 +826,8 @@ impl Step15LinuxRuntime {
             Ok(_) | Err(CredentialError::ProcessNotBound) => {}
             Err(error) => return Err(Error::Credentials(error)),
         }
+        let child_id = child.id();
+        self.clear_process_meta(child_id);
         self.identities
             .retire_process(child)
             .map_err(|_| Error::InvalidState)
@@ -1037,6 +1255,7 @@ impl Step15LinuxRuntime {
                 .map(ChildExitPublication::child_pid),
             Some(expected.pid())
         );
+        self.clear_process_meta(slot.process.id());
         Ok(())
     }
 
@@ -1131,7 +1350,210 @@ impl Step15LinuxRuntime {
             .and_then(Option::take)
             .ok_or(Error::InvalidState)?;
         debug_assert_eq!(removed.process.id(), expected_process);
+        self.clear_process_meta(expected_process);
         Ok((removed.process, removed.address_space))
+    }
+
+    fn set_process_meta_entry(&mut self, meta: ProcessMeta) {
+        if let Some(existing) = self
+            .process_meta
+            .iter_mut()
+            .find(|slot| slot.is_some_and(|entry| entry.process == meta.process))
+        {
+            *existing = Some(meta);
+            return;
+        }
+        if let Some(empty) = self.process_meta.iter_mut().find(|slot| slot.is_none()) {
+            *empty = Some(meta);
+        }
+    }
+
+    fn inherit_fork_process_meta(&mut self, parent_id: ObjectId, child_id: ObjectId) {
+        if let Some(parent_meta) = self
+            .process_meta
+            .iter()
+            .flatten()
+            .copied()
+            .find(|entry| entry.process == parent_id)
+        {
+            self.set_process_meta_entry(ProcessMeta {
+                process: child_id,
+                ..parent_meta
+            });
+        }
+    }
+
+    fn clear_process_meta(&mut self, process_id: ObjectId) {
+        for slot in &mut self.process_meta {
+            if slot.is_some_and(|entry| entry.process == process_id) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Records initial boot executable path, command name, and cmdline for the initial PID-1 process.
+    pub fn set_initial_process_metadata(
+        &mut self,
+        exe_path: &[u8],
+        argv0: &[u8],
+        argv_tail: &[&[u8]],
+    ) {
+        let mut cmd_buf = [0u8; 128];
+        let mut pos = 0usize;
+        for arg in core::iter::once(&argv0).chain(argv_tail.iter()) {
+            let take = arg.len().min(cmd_buf.len().saturating_sub(pos));
+            cmd_buf[pos..pos + take].copy_from_slice(&arg[..take]);
+            pos += take;
+            if pos < cmd_buf.len() {
+                cmd_buf[pos] = 0;
+                pos += 1;
+            }
+        }
+        let meta = ProcessMeta::from_exec(self.process.id(), exe_path, &cmd_buf[..pos]);
+        self.set_process_meta_entry(meta);
+    }
+
+    /// Updates executable path, basename comm, and NUL-separated cmdline on `execve` commit.
+    pub(super) fn commit_exec_metadata_for_scheduler_thread(
+        &mut self,
+        scheduler_thread: GlobalThreadId,
+        exe_path: &[u8],
+        cmdline: &[u8],
+    ) -> Result<(), Error> {
+        let (process, _, _) = self.process_parts_for_scheduler_thread(scheduler_thread)?;
+        let process_id = process.id();
+        self.set_process_meta_entry(ProcessMeta::from_exec(process_id, exe_path, cmdline));
+        Ok(())
+    }
+
+    /// Updates per-process `comm` via `prctl(PR_SET_NAME)` without cross-process leakage.
+    #[allow(dead_code)]
+    pub(super) fn set_current_process_comm(
+        &mut self,
+        scheduler_thread: GlobalThreadId,
+        raw_name: &[u8],
+    ) -> Result<(), Error> {
+        let (process, _, _) = self.process_parts_for_scheduler_thread(scheduler_thread)?;
+        let process_id = process.id();
+        let trimmed_len = raw_name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(raw_name.len())
+            .min(15);
+        let mut meta = self
+            .process_meta
+            .iter()
+            .flatten()
+            .copied()
+            .find(|entry| entry.process == process_id)
+            .unwrap_or_else(|| ProcessMeta::from_exec(process_id, b"/init", b""));
+        meta.comm = [0u8; 16];
+        meta.comm[..trimmed_len].copy_from_slice(&raw_name[..trimmed_len]);
+        meta.comm_len = trimmed_len as u8;
+        self.set_process_meta_entry(meta);
+        Ok(())
+    }
+
+    /// Reads per-process `comm` (NUL-padded `[u8; 16]`) for `prctl(PR_GET_NAME)`.
+    #[allow(dead_code)]
+    pub(super) fn current_process_comm(
+        &self,
+        scheduler_thread: GlobalThreadId,
+    ) -> Result<[u8; 16], Error> {
+        let (process, _, _) = self.process_parts_for_scheduler_thread(scheduler_thread)?;
+        let process_id = process.id();
+        Ok(self
+            .process_meta
+            .iter()
+            .flatten()
+            .find(|entry| entry.process == process_id)
+            .map_or(*b"init\0\0\0\0\0\0\0\0\0\0\0\0", |entry| entry.comm))
+    }
+
+    fn snapshot_for_identity(
+        &self,
+        view: kernal_linux_identity::ProcessIdentityView,
+    ) -> Option<ProcProcessSnapshot> {
+        let proc_ref = if self.process.id() == view.process {
+            &self.process
+        } else {
+            &self
+                .additional_processes
+                .iter()
+                .flatten()
+                .find(|slot| slot.process.id() == view.process)?
+                .process
+        };
+        let state_char = if proc_ref.state() == ProcessState::Exited {
+            b'Z'
+        } else {
+            b'R'
+        };
+        let (uid, gid) = self
+            .credentials
+            .credentials(proc_ref)
+            .map_or((0, 0), |creds| (creds.euid(), creds.egid()));
+        let meta = self
+            .process_meta
+            .iter()
+            .flatten()
+            .copied()
+            .find(|entry| entry.process == view.process)
+            .unwrap_or_else(|| ProcessMeta::from_exec(view.process, b"/init", b""));
+        Some(ProcProcessSnapshot {
+            process: view.process,
+            pid: view.pid.get(),
+            ppid: view.ppid,
+            pgid: view.pgid.get(),
+            sid: view.sid.get(),
+            uid,
+            gid,
+            state_char,
+            comm: meta.comm,
+            comm_len: usize::from(meta.comm_len),
+            exe_path: meta.exe_path,
+            exe_len: usize::from(meta.exe_len),
+            cmdline: meta.cmdline,
+            cmdline_len: usize::from(meta.cmdline_len),
+        })
+    }
+
+    /// Collects read-only process snapshots across all live and un-reaped zombie processes.
+    #[allow(dead_code)]
+    pub(super) fn collect_proc_snapshots(&self, out: &mut [Option<ProcProcessSnapshot>]) -> usize {
+        let mut views = [None; STEP15_RUNTIME_PROCESSES];
+        let count = self.identities.collect_process_views(&mut views);
+        let mut written = 0usize;
+        for view in views.into_iter().take(count).flatten() {
+            if written >= out.len() {
+                break;
+            }
+            if let Some(snap) = self.snapshot_for_identity(view) {
+                out[written] = Some(snap);
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// Resolves one read-only process snapshot by Linux PID.
+    #[allow(dead_code)]
+    pub(super) fn proc_snapshot_by_pid(&self, pid: NonZeroU32) -> Option<ProcProcessSnapshot> {
+        let view = self.identities.lookup_process_view_by_pid(pid)?;
+        self.snapshot_for_identity(view)
+    }
+
+    /// Resolves one read-only process snapshot for an exact scheduler thread's owning process.
+    #[allow(dead_code)]
+    pub(super) fn proc_snapshot_for_scheduler_thread(
+        &self,
+        scheduler_thread: GlobalThreadId,
+    ) -> Option<ProcProcessSnapshot> {
+        let (proc_ref, _, _) = self
+            .process_parts_for_scheduler_thread(scheduler_thread)
+            .ok()?;
+        let pid = self.identities.bound_pid(proc_ref).ok()?;
+        self.proc_snapshot_by_pid(pid)
     }
 
     /// Selects one retained Process/AddressSpace pair from an already generation-safe Process
@@ -1189,6 +1611,115 @@ impl Step15LinuxRuntime {
             .bound_tid_for_scheduler_thread(process, scheduler_thread)
             .map_err(|_| Error::InvalidState)?;
         Ok((process, address_space, tid))
+    }
+
+    /// Resolves one exact scheduler generation to mutable VM transaction parts for its owning Process.
+    #[allow(clippy::type_complexity)]
+    pub fn vm_parts_for_scheduler_thread(
+        &mut self,
+        scheduler_thread: GlobalThreadId,
+    ) -> Result<
+        (
+            &mut LinuxVmRuntime<STEP15_RUNTIME_VM_BREAKS, STEP15_RUNTIME_VM_TX_PAGES>,
+            &Process<STEP15_RUNTIME_CAPS>,
+            &ObjectTable<STEP15_RUNTIME_OBJECTS>,
+            &mut BoundProcessAddressSpace<STEP15_RUNTIME_VMAS>,
+        ),
+        Error,
+    > {
+        let process_id = {
+            let (process, _, _) = self.process_parts_for_scheduler_thread(scheduler_thread)?;
+            process.id()
+        };
+        let Self {
+            vm,
+            process,
+            objects,
+            address_space,
+            additional_processes,
+            ..
+        } = self;
+        if process.id() == process_id {
+            RuntimeProcessSlot::validate(&*process, &*address_space)?;
+            return Ok((vm, &*process, &*objects, address_space));
+        }
+        let slot = additional_processes
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.process.id() == process_id)
+            .ok_or(Error::InvalidState)?;
+        RuntimeProcessSlot::validate(&slot.process, &slot.address_space)?;
+        if slot.process.id() != process_id
+            || slot.address_space.owner_process() != process_id
+            || slot.address_space.address_space_object() != slot.process.address_space()
+        {
+            return Err(Error::InvalidState);
+        }
+        Ok((vm, &slot.process, &*objects, &mut slot.address_space))
+    }
+
+    /// Resolves one exact scheduler generation to mutable pthread-clone owner parts for its
+    /// owning Process (either the initial leader or a forked child slot).
+    #[allow(clippy::type_complexity)]
+    pub fn thread_clone_parts_for_scheduler_thread(
+        &mut self,
+        scheduler_thread: GlobalThreadId,
+    ) -> Result<
+        (
+            &mut Process<STEP15_RUNTIME_CAPS>,
+            &BoundProcessAddressSpace<STEP15_RUNTIME_VMAS>,
+            &mut ObjectTable<STEP15_RUNTIME_OBJECTS>,
+            &mut ThreadObjectBindings<STEP15_RUNTIME_THREADS>,
+            &mut LinuxIdentityTable<STEP15_RUNTIME_PROCESSES, STEP15_RUNTIME_THREADS>,
+            &ExitCoordinator<STEP15_RUNTIME_GROUPS>,
+        ),
+        Error,
+    > {
+        let process_id = {
+            let (process, _, _) = self.process_parts_for_scheduler_thread(scheduler_thread)?;
+            process.id()
+        };
+        let Self {
+            objects,
+            process,
+            address_space,
+            additional_processes,
+            bindings,
+            identities,
+            exits,
+            ..
+        } = self;
+        if process.id() == process_id {
+            RuntimeProcessSlot::validate(&*process, &*address_space)?;
+            return Ok((
+                process,
+                &*address_space,
+                objects,
+                bindings,
+                identities,
+                &*exits,
+            ));
+        }
+        let slot = additional_processes
+            .iter_mut()
+            .flatten()
+            .find(|slot| slot.process.id() == process_id)
+            .ok_or(Error::InvalidState)?;
+        RuntimeProcessSlot::validate(&slot.process, &slot.address_space)?;
+        if slot.process.id() != process_id
+            || slot.address_space.owner_process() != process_id
+            || slot.address_space.address_space_object() != slot.process.address_space()
+        {
+            return Err(Error::InvalidState);
+        }
+        Ok((
+            &mut slot.process,
+            &slot.address_space,
+            objects,
+            bindings,
+            identities,
+            &*exits,
+        ))
     }
 
     /// Replaces the Linux program break for the exact current scheduler generation after exec commit.
@@ -1556,28 +2087,44 @@ impl Step15LinuxRuntime {
         parent_thread: GlobalThreadId,
         child_tid: NonZeroU32,
     ) -> Result<GlobalThreadId, Error> {
+        let parent_process_id = self
+            .identities
+            .process_object_for_scheduler_thread(parent_thread)
+            .map_err(|_| Error::InvalidState)?;
         let Self {
             process,
             address_space,
+            additional_processes,
             identities,
             signals,
             ..
         } = self;
-        RuntimeProcessSlot::validate(&*process, &*address_space)?;
+        let target_process = if process.id() == parent_process_id {
+            RuntimeProcessSlot::validate(&*process, &*address_space)?;
+            &*process
+        } else {
+            let slot = additional_processes
+                .iter()
+                .flatten()
+                .find(|slot| slot.process.id() == parent_process_id)
+                .ok_or(Error::InvalidState)?;
+            RuntimeProcessSlot::validate(&slot.process, &slot.address_space)?;
+            &slot.process
+        };
         identities
-            .bound_tid_for_scheduler_thread(&*process, parent_thread)
+            .bound_tid_for_scheduler_thread(target_process, parent_thread)
             .map_err(|_| Error::InvalidState)?;
         let child_thread = identities
-            .scheduler_thread_for_tid(&*process, child_tid)
+            .scheduler_thread_for_tid(target_process, child_tid)
             .map_err(|_| Error::InvalidState)?;
         if child_thread == parent_thread {
             return Err(Error::InvalidState);
         }
         let parent_mask = signals
-            .thread_mask(&*identities, &*process, parent_thread)
+            .thread_mask(&*identities, target_process, parent_thread)
             .map_err(Error::Signal)?;
         signals
-            .bind_thread(&*identities, &*process, child_thread, parent_mask)
+            .bind_thread(&*identities, target_process, child_thread, parent_mask)
             .map_err(Error::Signal)?;
         Ok(child_thread)
     }
@@ -1861,10 +2408,12 @@ impl RuntimeCell {
             Err(_) => return Err(Error::InvalidState),
         }
 
-        match Step15LinuxRuntime::create(backend) {
-            Ok(runtime) => {
-                // SAFETY: successful EMPTY -> INSTALLING gives this path unique initialization.
-                unsafe { (*self.value.get()).write(runtime) };
+        // SAFETY: successful EMPTY -> INSTALLING grants unique writable ownership of `self.value`
+        // until READY or POISONED is published.
+        let dst = unsafe { (*self.value.get()).as_mut_ptr() };
+        // SAFETY: `dst` points to aligned uninitialized storage of `Step15LinuxRuntime`.
+        match unsafe { Step15LinuxRuntime::initialize_in_place(dst, backend) } {
+            Ok(()) => {
                 self.state.store(READY, Ordering::Release);
                 Ok(())
             }
@@ -3094,5 +3643,174 @@ mod tests {
         let mut replacement = TestBackend::new(4);
         assert_eq!(cell.initialize(&mut replacement), Err(Error::Poisoned));
         assert!(matches!(cell.with_runtime(|_| ()), Err(Error::Poisoned)));
+    }
+
+    #[test]
+    fn forked_process_thread_clone_parts_and_signal_mask_inheritance() {
+        use kernal_linux_signal::MaskHow;
+
+        let mut backend = TestBackend::new(32);
+        let mut runtime = Step15LinuxRuntime::create(&mut backend).unwrap();
+        let mut scheduler = RunQueue::<STEP15_RUNTIME_THREADS>::new();
+        let initial = bind_test_initial_generation(&mut runtime, &mut scheduler);
+        runtime.bind_initial_signal_thread(initial).unwrap();
+        let initial_id = runtime.process.id();
+
+        let mut child = Process::<STEP15_RUNTIME_CAPS>::create_fork_child(
+            &runtime.process,
+            &mut runtime.objects,
+        )
+        .unwrap();
+        runtime
+            .identities
+            .bind_child(&runtime.process, &child)
+            .unwrap();
+        runtime
+            .credentials
+            .inherit_child(&runtime.identities, &runtime.process, &child)
+            .unwrap();
+        runtime
+            .signals
+            .inherit_child(&runtime.identities, &runtime.process, &child)
+            .unwrap();
+        let child_local = scheduler.create(10).unwrap();
+        let child_leader = GlobalThreadId::new(CPU0, child_local);
+        let child_handle = child
+            .attach_thread(
+                &mut runtime.objects,
+                &mut runtime.bindings,
+                &scheduler,
+                CPU0,
+                child_leader,
+            )
+            .unwrap();
+        runtime
+            .identities
+            .bind_leader(
+                &child,
+                &runtime.objects,
+                &runtime.bindings,
+                &scheduler,
+                CPU0,
+                child_handle,
+            )
+            .unwrap();
+        let child_id = child.id();
+        let child_space = BoundProcessAddressSpace::<STEP15_RUNTIME_VMAS>::create(
+            &child,
+            &runtime.objects,
+            &mut backend,
+        )
+        .unwrap();
+        let child_slot = match runtime.install_additional_process(child, child_space) {
+            Ok(slot) => slot,
+            Err(_) => panic!("forked child process must fit"),
+        };
+        runtime
+            .inherit_unpublished_fork_child_signal_mask(initial, child_slot, child_id, child_leader)
+            .unwrap();
+
+        let blocked = SignalSet::empty().with(Signal::new(10).unwrap());
+        {
+            let child_process = runtime
+                .additional_processes
+                .iter()
+                .flatten()
+                .find(|slot| slot.process.id() == child_id)
+                .map(|slot| &slot.process)
+                .unwrap();
+            runtime
+                .signals
+                .update_thread_mask(
+                    &runtime.identities,
+                    child_process,
+                    child_leader,
+                    MaskHow::Set,
+                    blocked,
+                )
+                .unwrap();
+        }
+
+        let worker_local = scheduler.create(10).unwrap();
+        let worker_global = GlobalThreadId::new(CPU0, worker_local);
+        let worker_tid = {
+            let (process, address_space, objects, bindings, identities, _exits) = runtime
+                .thread_clone_parts_for_scheduler_thread(child_leader)
+                .unwrap();
+            assert_eq!(process.id(), child_id);
+            assert_eq!(address_space.owner_process(), child_id);
+            let worker_handle = process
+                .attach_thread(objects, bindings, &scheduler, CPU0, worker_global)
+                .unwrap();
+            identities
+                .tid_for(process, objects, bindings, &scheduler, CPU0, worker_handle)
+                .unwrap()
+        };
+
+        assert_eq!(
+            runtime
+                .inherit_same_process_thread_signal_mask(child_leader, worker_tid)
+                .unwrap(),
+            worker_global
+        );
+        let child_process = runtime
+            .additional_processes
+            .iter()
+            .flatten()
+            .find(|slot| slot.process.id() == child_id)
+            .map(|slot| &slot.process)
+            .unwrap();
+        assert_eq!(
+            runtime
+                .signals
+                .thread_mask(&runtime.identities, child_process, worker_global),
+            Ok(blocked)
+        );
+        assert_eq!(
+            runtime
+                .process_parts_for_scheduler_thread(initial)
+                .unwrap()
+                .0
+                .id(),
+            initial_id
+        );
+    }
+
+    #[test]
+    fn thread_exit_during_group_exit_draining_reuses_group_ticket() {
+        let mut backend = TestBackend::new(32);
+        let mut runtime = Step15LinuxRuntime::create(&mut backend).unwrap();
+        let mut scheduler = RunQueue::<STEP15_RUNTIME_THREADS>::new();
+        let leader = bind_test_initial_generation(&mut runtime, &mut scheduler);
+        let leader_id = runtime.process.id();
+
+        let worker_local = scheduler.create(10).unwrap();
+        let worker = GlobalThreadId::new(CPU0, worker_local);
+        {
+            let (process, _address_space, objects, bindings, identities, _exits) = runtime
+                .thread_clone_parts_for_scheduler_thread(leader)
+                .unwrap();
+            let worker_handle = process
+                .attach_thread(objects, bindings, &scheduler, CPU0, worker)
+                .unwrap();
+            let _ = identities
+                .tid_for(process, objects, bindings, &scheduler, CPU0, worker_handle)
+                .unwrap();
+        }
+
+        runtime.prepare_group_exit(leader, 42).unwrap();
+        assert!(runtime.exits.is_group_draining(&runtime.process));
+
+        runtime.prepare_thread_exit(worker, 0).unwrap();
+        let (_, worker_ticket) = runtime
+            .pending_exits
+            .iter()
+            .flatten()
+            .find(|(thread, _)| *thread == worker)
+            .copied()
+            .unwrap();
+        assert_eq!(worker_ticket.process(), leader_id);
+        assert_eq!(worker_ticket.scope(), ExitScope::ThreadGroup);
+        assert_eq!(worker_ticket.status(), 42);
     }
 }

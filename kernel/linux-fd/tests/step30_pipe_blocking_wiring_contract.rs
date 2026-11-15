@@ -36,5 +36,12 @@ fn blocking_boundary_is_not_collapsed_into_invariant() {
 fn wake_helpers_remain_post_commit_and_generation_exact() {
     assert!(PIPE_BLOCKING.contains("pub(crate) fn notify_after_write(pipe: PipeId)"));
     assert!(PIPE_BLOCKING.contains("pub(crate) fn notify_after_writer_close(pipe: PipeId)"));
+    assert!(PIPE_BLOCKING.contains("pub(crate) fn block_write("));
+    assert!(PIPE_BLOCKING.contains("pub(crate) fn notify_after_read(pipe: PipeId)"));
+    assert!(PIPE_BLOCKING.contains("pub(crate) fn notify_after_reader_close(pipe: PipeId)"));
+    assert!(
+        PIPE_BLOCKING
+            .contains("pub(crate) fn notify_after_endpoint_close(pipe: PipeId, end: PipeEnd)")
+    );
     assert!(PIPE_BLOCKING.contains("fn wake_exact(target: GlobalThreadId)"));
 }

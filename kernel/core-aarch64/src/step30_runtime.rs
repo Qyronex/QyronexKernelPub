@@ -14,14 +14,16 @@ use kernal_linux_abi::{
     linux_unsigned_int,
 };
 use kernal_linux_credentials::{
-    Error as CredentialError, LinuxCredentials, RobustListRegistration,
+    Error as CredentialError, LinuxCredentials, MAX_SUPPLEMENTARY_GROUPS, RobustListRegistration,
 };
 use kernal_linux_exec::ExecCommitHandoff;
 use kernal_linux_fd::ReleasedObject;
 use kernal_linux_identity::Error as IdentityError;
+#[cfg(feature = "step29-qemu-proof")]
+use kernal_linux_pipe::{End as PipeEnd, PipeId};
 use kernal_linux_signal::{
-    Disposition, Error as SignalError, MaskHow, SA_RESTORER, SIGCONT, Signal, SignalAction,
-    SignalHandler, SignalProvenance, SignalSet,
+    DefaultAction, Delivery, Disposition, Error as SignalError, MaskHow, SA_RESTORER, SIGCONT,
+    Signal, SignalAction, SignalHandler, SignalProvenance, SignalSet,
 };
 use kernal_linux_wait::{
     Error as WaitError, WaitEventClass, WaitInterests, WaitObservation, WaitOutcome,
@@ -219,6 +221,20 @@ enum BlockingWaitResolution {
     SignalFrameCommitted,
 }
 
+#[cfg(feature = "step31-debian-qemu")]
+fn stage_debian_exec_with_csprng(
+    call: Step30RuntimeCall,
+    current: kernal_scheduler_smp::GlobalThreadId,
+) -> Result<Result<super::step30_exec_input::PreparedExecImage, ExecPrepareError>, ()> {
+    let mut random = [0u8; super::entropy::AT_RANDOM_BYTES];
+    super::entropy::fill_getrandom(&mut random).map_err(|_| ())?;
+    // SAFETY: the synchronous SVC no-switch window owns this complete typed staging call.
+    Ok(unsafe {
+        super::step30_exec_input::stage_exec_image_with_core_frames(call, current, random)
+    }
+    .map_err(map_reversible_exec_error))
+}
+
 /// Handles the Step-30 runtime calls that are already fully composable from accepted owners.
 ///
 /// Calls whose semantic owner has not yet been wired remain `NotHandled`; the surrounding live trap
@@ -226,7 +242,7 @@ enum BlockingWaitResolution {
 /// dereferences a robust-list head during registration.
 pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Result<Outcome, ()> {
     let Some(call) = classify_step30_runtime(request) else {
-        return Ok(Outcome::NotHandled);
+        return handle_credential_mutation(request);
     };
 
     match call {
@@ -1275,19 +1291,22 @@ fn handle_live_exec(call: Step30RuntimeCall, frame: &mut ExceptionFrame) -> Resu
 
     // Ordinary Linux errno remains possible only while the old image is authoritative.
     // Successful typed staging commits AT_RANDOM and crosses the final reversible boundary.
-    let staged = super::entropy::with_exec_at_random(
-        |random| -> Result<super::step30_exec_input::PreparedExecImage, ExecPrepareError> {
-            // SAFETY: the synchronous SVC no-switch window owns this complete typed staging call.
-            unsafe {
-                super::step30_exec_input::stage_exec_image_with_core_frames(call, current, random)
-            }
-            .map_err(map_reversible_exec_error)
-        },
-    )
-    .map_err(|_| ())?;
+    let staged = match super::entropy::with_exec_at_random(|random| {
+        // SAFETY: the synchronous SVC no-switch window owns this complete typed staging call.
+        unsafe {
+            super::step30_exec_input::stage_exec_image_with_core_frames(call, current, random)
+        }
+        .map_err(map_reversible_exec_error)
+    }) {
+        Ok(staged) => staged,
+        #[cfg(feature = "step31-debian-qemu")]
+        Err(super::entropy::Error::Exhausted) => stage_debian_exec_with_csprng(call, current)?,
+        Err(_) => return Err(()),
+    };
     let image = match staged {
         Ok(image) => image,
         Err(ExecPrepareError::Linux(errno)) => {
+            rebind_exec_entry_generation_after_staging_error(frame);
             return Ok(Outcome::Return(SyscallReturn::error(errno)));
         }
         Err(ExecPrepareError::Invariant) => return Err(()),
@@ -1312,7 +1331,8 @@ fn handle_live_exec(call: Step30RuntimeCall, frame: &mut ExceptionFrame) -> Resu
         exec_fail_closed("KERNAL/ARM64: Step 30 exec process changed after staging\n");
     }
 
-    let (replacement, loaded) = image.into_staged().into_parts();
+    let (staged_image, exe_path, exe_len, cmdline, cmdline_len) = image.into_parts();
+    let (replacement, loaded) = (*staged_image).into_parts();
     let return_state = kernal_user_entry_aarch64::El0ReturnState::new(
         loaded.loaded.entry,
         kernal_user_entry_aarch64::EL0T_SPSR_EL1,
@@ -1395,9 +1415,10 @@ fn handle_live_exec(call: Step30RuntimeCall, frame: &mut ExceptionFrame) -> Resu
         .unwrap_or_else(|_| {
             exec_fail_closed("KERNAL/ARM64: Step 30 exec thread-state reset failed\n")
         });
-    commit_exec_identity_marker(current).unwrap_or_else(|_| {
-        exec_fail_closed("KERNAL/ARM64: Step 30 exec identity marker failed\n")
-    });
+    commit_exec_identity_marker(current, &exe_path[..exe_len], &cmdline[..cmdline_len])
+        .unwrap_or_else(|_| {
+            exec_fail_closed("KERNAL/ARM64: Step 30 exec identity marker failed\n")
+        });
 
     frame.x.fill(0);
     frame.elr_el1 = return_state.return_pc();
@@ -1437,11 +1458,27 @@ fn prepare_exec_cloexec(
 fn consume_exec_released_objects<const N: usize>(
     path_runtime: &mut super::step29_runtime::Step29PathRuntime<'_>,
     released: [Option<ReleasedObject>; N],
-) -> Result<(), ()> {
+    released_subsystems: &mut [Option<kernal_linux_fd::SubsystemHandle>],
+    #[cfg(feature = "step29-qemu-proof")] closed_pipes: &mut [Option<(PipeId, PipeEnd)>],
+) -> Result<(usize, usize), ()> {
     let (_fds, pipes, overlay) = path_runtime.fd_pipe_overlay_parts();
+    let mut subsys_count = 0usize;
+    let mut pipe_count = 0usize;
     for object in released.into_iter().flatten() {
         match object {
-            ReleasedObject::Pipe(endpoint) => pipes.close(endpoint).map_err(|_| ())?,
+            ReleasedObject::Pipe(endpoint) => {
+                pipes.close(endpoint).map_err(|_| ())?;
+                #[cfg(feature = "step29-qemu-proof")]
+                {
+                    let key = (endpoint.pipe(), endpoint.end());
+                    if !closed_pipes[..pipe_count].contains(&Some(key))
+                        && pipe_count < closed_pipes.len()
+                    {
+                        closed_pipes[pipe_count] = Some(key);
+                        pipe_count += 1;
+                    }
+                }
+            }
             ReleasedObject::RetainedDirectory(directory) => {
                 overlay.release_directory(directory).map_err(|_| ())?;
             }
@@ -1451,9 +1488,26 @@ fn consume_exec_released_objects<const N: usize>(
             ReleasedObject::WritableRegular(retained) => {
                 overlay.release_retained_regular(retained).map_err(|_| ())?;
             }
+            ReleasedObject::Subsystem(handle) => {
+                if subsys_count < released_subsystems.len() {
+                    released_subsystems[subsys_count] = Some(handle);
+                    subsys_count += 1;
+                }
+            }
         }
     }
-    Ok(())
+    Ok((subsys_count, pipe_count))
+}
+
+fn rebind_exec_entry_generation_after_staging_error(frame: &mut ExceptionFrame) {
+    if let Some(generation) =
+        kernal_process_aarch64::current_user_switch_generation().and_then(NonZeroU64::new)
+    {
+        // Recoverable staging errors after touching TTBR0 restore the original active binding,
+        // advancing the canonical switch generation while returning on this unchanged frame.
+        // SAFETY: handle_live_exec runs synchronously inside the IRQ-masked SVC window.
+        unsafe { frame.rebind_entry_switch_generation(generation) };
+    }
 }
 
 fn commit_exec_cloexec(
@@ -1461,6 +1515,12 @@ fn commit_exec_cloexec(
     process_id: kernal_capability::ObjectId,
     handoff: ExecCommitHandoff<{ super::step29_runtime::STEP29_RUNTIME_FDS }>,
 ) -> Result<(), ()> {
+    let mut released_subsystems = [None; super::step29_runtime::STEP29_RUNTIME_FDS];
+    let mut subsys_count = 0usize;
+    #[cfg(feature = "step29-qemu-proof")]
+    let mut closed_pipes = [None; super::step29_runtime::STEP29_RUNTIME_FDS];
+    #[cfg(feature = "step29-qemu-proof")]
+    let mut closed_pipe_count = 0usize;
     let result = super::runtime::with_linux_runtime(|state| {
         let (process, address_space, _tid) = state.process_parts_for_scheduler_thread(current)?;
         if process.id() != process_id {
@@ -1473,13 +1533,35 @@ fn commit_exec_cloexec(
             let released = handoff
                 .commit_close_on_exec(process, path_runtime.fds())
                 .map_err(|_| ())?;
-            consume_exec_released_objects(path_runtime, released)
+            let (s_count, p_count) = consume_exec_released_objects(
+                path_runtime,
+                released,
+                &mut released_subsystems,
+                #[cfg(feature = "step29-qemu-proof")]
+                &mut closed_pipes,
+            )?;
+            subsys_count = s_count;
+            #[cfg(feature = "step29-qemu-proof")]
+            {
+                closed_pipe_count = p_count;
+            }
+            #[cfg(not(feature = "step29-qemu-proof"))]
+            let _ = p_count;
+            Ok::<(), ()>(())
         })
         .map_err(|_| super::runtime::Error::InvalidState)?;
         committed.map_err(|_| super::runtime::Error::InvalidState)
     });
     match result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            super::step_fd_util::release_subsystem_handles(&released_subsystems[..subsys_count]);
+            super::step_fd_util::on_subsystem_process_exec(process_id);
+            #[cfg(feature = "step29-qemu-proof")]
+            for (pipe, end) in closed_pipes[..closed_pipe_count].iter().flatten() {
+                super::futex::pipe_blocking::notify_after_endpoint_close(*pipe, *end)?;
+            }
+            Ok(())
+        }
         _ => Err(()),
     }
 }
@@ -1496,14 +1578,24 @@ fn commit_exec_signal_reset(current: GlobalThreadId) -> Result<(), ()> {
     }
 }
 
-fn commit_exec_identity_marker(current: GlobalThreadId) -> Result<(), ()> {
+fn commit_exec_identity_marker(
+    current: GlobalThreadId,
+    exe_path: &[u8],
+    cmdline: &[u8],
+) -> Result<(), ()> {
     let result = super::runtime::with_linux_runtime(|state| {
-        state.with_current_process_identity(current, |process, identities| {
+        match state.with_current_process_identity(current, |process, identities| {
             identities.mark_execed(process)
-        })
+        }) {
+            Ok(Ok(())) => {}
+            _ => return Err(()),
+        }
+        state
+            .commit_exec_metadata_for_scheduler_thread(current, exe_path, cmdline)
+            .map_err(|_| ())
     });
     match result {
-        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(())) => Ok(()),
         _ => Err(()),
     }
 }
@@ -1924,9 +2016,10 @@ fn block_until_wait_ready(
                     }
                     Err(super::runtime::Error::Wait(WaitError::StaleWaiter)) => continue,
                     Err(super::runtime::Error::Wait(WaitError::WaiterAlreadyCommitted)) => {
-                        if cancel_blocking_wait(receipt)? {
+                        if !cancel_blocking_wait(receipt)? {
                             return Err(BlockingWaitError::Invariant);
                         }
+                        continue;
                     }
                     Err(error) => return Err(map_blocking_wait_owner_error(error)),
                 }
@@ -2150,6 +2243,253 @@ fn credential_scalar(value: u32) -> Result<SyscallReturn, ()> {
     SyscallReturn::success(i64::from(value)).ok_or(())
 }
 
+pub(super) fn current_linux_tid() -> Option<NonZeroU32> {
+    let current = super::step_fd_util::current_scheduler_thread()?;
+    super::runtime::with_linux_runtime(|state| {
+        state
+            .process_parts_for_scheduler_thread(current)
+            .map(|(_, _, tid)| tid)
+            .ok()
+    })
+    .ok()
+    .flatten()
+}
+
+pub(super) fn current_uid_gid() -> Option<(u32, u32)> {
+    current_credentials()
+        .ok()
+        .map(|creds| (creds.euid(), creds.egid()))
+}
+
+pub(super) fn current_in_group(gid: u32) -> bool {
+    let Some(current) = super::step_fd_util::current_scheduler_thread() else {
+        return false;
+    };
+    super::runtime::with_linux_runtime(|state| {
+        state
+            .with_current_process_credentials(current, |process, credentials| {
+                credentials
+                    .groups(process)
+                    .map(|g| g.contains(&gid))
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
+fn current_scheduler_global_thread() -> Result<GlobalThreadId, ()> {
+    let current_cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
+    if usize::from(current.cpu.0) != current_cpu {
+        return Err(());
+    }
+    Ok(current)
+}
+
+fn decode_optional_id(raw: u64) -> Option<u32> {
+    let v = linux_unsigned_int(raw);
+    (v != u32::MAX).then_some(v)
+}
+
+fn map_cred_error(err: CredentialError) -> Result<Errno, ()> {
+    match err {
+        CredentialError::PermissionDenied => Ok(Errno::EPERM),
+        CredentialError::InvalidArgument => Ok(Errno::EINVAL),
+        _ => Err(()),
+    }
+}
+
+fn mutate_current_credentials<R>(
+    f: impl FnOnce(&mut LinuxCredentials) -> Result<R, CredentialError>,
+) -> Result<Result<R, Errno>, ()> {
+    let current = current_scheduler_global_thread()?;
+    let res = super::runtime::with_linux_runtime(|state| {
+        state.with_current_process_credentials(current, |process, credentials| {
+            credentials.update_credentials(process, f)
+        })
+    })
+    .map_err(|_| ())?
+    .map_err(|_| ())?;
+    match res {
+        Ok(val) => Ok(Ok(val)),
+        Err(err) => Ok(Err(map_cred_error(err)?)),
+    }
+}
+
+fn write_three_ids_to_user(ptrs: [u64; 3], ids: [u32; 3]) -> Result<Result<i64, Errno>, ()> {
+    for (ptr, id) in ptrs.into_iter().zip(ids) {
+        if let Err(err) = kernal_usercopy_aarch64::copy_to_user(ptr, &id.to_le_bytes()) {
+            return Ok(Err(map_wait_usercopy_error(err)?));
+        }
+    }
+    Ok(Ok(0))
+}
+
+fn handle_credential_mutation(request: SyscallRequest) -> Result<Outcome, ()> {
+    const NR_SETREGID: u64 = 143;
+    const NR_SETGID: u64 = 144;
+    const NR_SETREUID: u64 = 145;
+    const NR_SETUID: u64 = 146;
+    const NR_SETRESUID: u64 = 147;
+    const NR_GETRESUID: u64 = 148;
+    const NR_SETRESGID: u64 = 149;
+    const NR_GETRESGID: u64 = 150;
+    const NR_SETFSUID: u64 = 151;
+    const NR_SETFSGID: u64 = 152;
+    const NR_GETGROUPS: u64 = 158;
+    const NR_SETGROUPS: u64 = 159;
+
+    let res: Result<i64, Errno> = match request.number {
+        NR_SETREGID => mutate_current_credentials(|c| {
+            c.set_regid(
+                decode_optional_id(request.args[0]),
+                decode_optional_id(request.args[1]),
+            )
+        })?
+        .map(|()| 0),
+        NR_SETGID => {
+            let Some(gid) = decode_optional_id(request.args[0]) else {
+                return Ok(Outcome::Return(SyscallReturn::error(Errno::EINVAL)));
+            };
+            mutate_current_credentials(|c| c.set_gid(gid))?.map(|()| 0)
+        }
+        NR_SETREUID => mutate_current_credentials(|c| {
+            c.set_reuid(
+                decode_optional_id(request.args[0]),
+                decode_optional_id(request.args[1]),
+            )
+        })?
+        .map(|()| 0),
+        NR_SETUID => {
+            let Some(uid) = decode_optional_id(request.args[0]) else {
+                return Ok(Outcome::Return(SyscallReturn::error(Errno::EINVAL)));
+            };
+            mutate_current_credentials(|c| c.set_uid(uid))?.map(|()| 0)
+        }
+        NR_SETRESUID => mutate_current_credentials(|c| {
+            c.set_resuid(
+                decode_optional_id(request.args[0]),
+                decode_optional_id(request.args[1]),
+                decode_optional_id(request.args[2]),
+            )
+        })?
+        .map(|()| 0),
+        NR_GETRESUID => {
+            let c = current_credentials()?;
+            write_three_ids_to_user(
+                [request.args[0], request.args[1], request.args[2]],
+                [c.ruid(), c.euid(), c.suid()],
+            )?
+        }
+        NR_SETRESGID => mutate_current_credentials(|c| {
+            c.set_resgid(
+                decode_optional_id(request.args[0]),
+                decode_optional_id(request.args[1]),
+                decode_optional_id(request.args[2]),
+            )
+        })?
+        .map(|()| 0),
+        NR_GETRESGID => {
+            let c = current_credentials()?;
+            write_three_ids_to_user(
+                [request.args[0], request.args[1], request.args[2]],
+                [c.rgid(), c.egid(), c.sgid()],
+            )?
+        }
+        NR_SETFSUID => mutate_current_credentials(|c| {
+            Ok(i64::from(c.set_fsuid(decode_optional_id(request.args[0]))))
+        })?,
+        NR_SETFSGID => mutate_current_credentials(|c| {
+            Ok(i64::from(c.set_fsgid(decode_optional_id(request.args[0]))))
+        })?,
+        NR_GETGROUPS => {
+            let size = linux_signed_int(request.args[0]);
+            if size < 0 {
+                Err(Errno::EINVAL)
+            } else {
+                let current = current_scheduler_global_thread()?;
+                let mut groups = [0u32; MAX_SUPPLEMENTARY_GROUPS];
+                let len = super::runtime::with_linux_runtime(|state| {
+                    state.with_current_process_credentials(current, |process, credentials| {
+                        credentials.groups(process).map(|slice| {
+                            groups[..slice.len()].copy_from_slice(slice);
+                            slice.len()
+                        })
+                    })
+                })
+                .map_err(|_| ())?
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+                if size == 0 {
+                    Ok(len as i64)
+                } else if (size as usize) < len {
+                    Err(Errno::EINVAL)
+                } else {
+                    let mut raw = [0u8; MAX_SUPPLEMENTARY_GROUPS * 4];
+                    for (i, g) in groups[..len].iter().enumerate() {
+                        raw[i * 4..i * 4 + 4].copy_from_slice(&g.to_le_bytes());
+                    }
+                    match kernal_usercopy_aarch64::copy_to_user(request.args[1], &raw[..len * 4]) {
+                        Ok(()) => Ok(len as i64),
+                        Err(err) => Err(map_wait_usercopy_error(err)?),
+                    }
+                }
+            }
+        }
+        NR_SETGROUPS => {
+            let size = usize::try_from(request.args[0]).unwrap_or(usize::MAX);
+            let priv_root = current_credentials()?.euid() == 0;
+            if !priv_root {
+                Err(Errno::EPERM)
+            } else if size > MAX_SUPPLEMENTARY_GROUPS {
+                Err(Errno::EINVAL)
+            } else {
+                let mut groups = [0u32; MAX_SUPPLEMENTARY_GROUPS];
+                if size > 0 {
+                    let mut raw = [0u8; MAX_SUPPLEMENTARY_GROUPS * 4];
+                    if let Err(err) = kernal_usercopy_aarch64::copy_from_user(
+                        &mut raw[..size * 4],
+                        request.args[1],
+                    ) {
+                        return Ok(Outcome::Return(SyscallReturn::error(
+                            map_wait_usercopy_error(err)?,
+                        )));
+                    }
+                    for i in 0..size {
+                        groups[i] = u32::from_le_bytes([
+                            raw[i * 4],
+                            raw[i * 4 + 1],
+                            raw[i * 4 + 2],
+                            raw[i * 4 + 3],
+                        ]);
+                    }
+                }
+                let current = current_scheduler_global_thread()?;
+                let r = super::runtime::with_linux_runtime(|state| {
+                    state.with_current_process_credentials(current, |process, credentials| {
+                        credentials.set_groups(process, &groups[..size])
+                    })
+                })
+                .map_err(|_| ())?
+                .map_err(|_| ())?;
+                match r {
+                    Ok(()) => Ok(0),
+                    Err(err) => Err(map_cred_error(err)?),
+                }
+            }
+        }
+        _ => return Ok(Outcome::NotHandled),
+    };
+    let ret = match res {
+        Ok(v) => SyscallReturn::success(v).ok_or(())?,
+        Err(e) => SyscallReturn::error(e),
+    };
+    Ok(Outcome::Return(ret))
+}
+
 fn decode_prctl_request(
     option: u64,
     arg2: u64,
@@ -2250,6 +2590,181 @@ fn validate_robust_registration(
         Err(CredentialError::UserRange(_)) => Err(RegistrationError::Errno(Errno::EFAULT)),
         Err(_) => Err(RegistrationError::Invariant),
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingSignalAction {
+    DiscardableIgnore,
+    StopOrContinue,
+    Interrupt,
+}
+
+fn current_thread_pending_signal_action() -> Result<Option<PendingSignalAction>, ()> {
+    let current_cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
+    let prepared = super::runtime::with_linux_runtime(|state| {
+        state.with_current_process_signals(current, |process, identities, signals| {
+            signals
+                .prepare_delivery_for_thread(identities, process, current)
+                .map_err(|_| ())
+        })
+    })
+    .map_err(|_| ())?
+    .map_err(|_| ())??;
+
+    Ok(match prepared.map(|p| p.delivery()) {
+        None => None,
+        Some(Delivery::Default {
+            action: DefaultAction::Ignore,
+            ..
+        }) => Some(PendingSignalAction::DiscardableIgnore),
+        Some(Delivery::Default {
+            action: DefaultAction::Stop | DefaultAction::Continue,
+            ..
+        }) => Some(PendingSignalAction::StopOrContinue),
+        Some(
+            Delivery::Handler { .. }
+            | Delivery::Default {
+                action: DefaultAction::Terminate { .. },
+                ..
+            },
+        ) => Some(PendingSignalAction::Interrupt),
+    })
+}
+
+/// Evaluates pending signals during a blocking SVC wait: discards ignored signals and processes
+/// Stop/Continue transitions synchronously when a frame is available, returning `Ok(true)` iff the
+/// blocking wait must abort with `-EINTR` for a user handler or fatal termination.
+pub(super) fn check_pending_signal_during_wait(
+    mut frame: Option<&mut ExceptionFrame>,
+) -> Result<bool, ()> {
+    for _ in 0..8 {
+        let Some(action) = current_thread_pending_signal_action()? else {
+            return Ok(false);
+        };
+        match action {
+            PendingSignalAction::DiscardableIgnore | PendingSignalAction::StopOrContinue => {
+                if let Some(frame_ref) = frame.as_deref_mut() {
+                    super::deliver_step30_signal_on_return(frame_ref)?;
+                } else if action == PendingSignalAction::DiscardableIgnore {
+                    return Ok(false);
+                } else {
+                    return Ok(true);
+                }
+            }
+            PendingSignalAction::Interrupt => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+/// Returns `true` if `signal_num` is currently ignored (`SIG_IGN`) or masked by the current thread.
+pub(super) fn current_signal_is_ignored_or_blocked(signal_num: u8) -> Result<bool, ()> {
+    let Some(signal) = Signal::new(signal_num) else {
+        return Ok(false);
+    };
+    let current_cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
+    super::runtime::with_linux_runtime(|state| {
+        state.with_current_process_signals(current, |process, identities, signals| {
+            let disp = signals.disposition(process, signal).map_err(|_| ())?;
+            let mask = signals
+                .thread_mask(identities, process, current)
+                .map_err(|_| ())?;
+            Ok::<bool, ()>(disp == Disposition::Ignore || mask.contains(signal))
+        })
+    })
+    .map_err(|_| ())?
+    .map_err(|_| ())?
+}
+
+/// Queues kernel-generated TTY signal `signal_num` to every process in `pgid`, interrupting any
+/// Step-30 blocked waits and issuing SMP reschedule IPIs when needed.
+pub(super) fn deliver_tty_signal_to_pgid(pgid: NonZeroU32, signal_num: u8) -> Result<bool, ()> {
+    let Some(signal) = Signal::new(signal_num) else {
+        return Ok(false);
+    };
+    let current_cpu = super::super::current_cpu_index();
+    let targets = super::runtime::with_linux_runtime(|state| state.signal_target_pids(Some(pgid)))
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+    let mut delivered = false;
+    let mut notifications = SignalNotifyPlan::new();
+    for target in targets.iter() {
+        let send_res = super::runtime::with_linux_runtime(|state| {
+            let result = state.with_process_signal_target_for_pid(
+                target,
+                |process, _credentials, identities, signals| match signals
+                    .queue_signal(process, signal)
+                {
+                    Ok(()) => match process_signal_notify_targets(process, identities) {
+                        Ok(notify_targets) => SignalSendResult::Queued(notify_targets),
+                        Err(()) => SignalSendResult::Invariant,
+                    },
+                    Err(error) => SignalSendResult::OwnerError(error),
+                },
+            )?;
+            Ok::<_, super::runtime::Error>(result.unwrap_or(SignalSendResult::MissingTarget))
+        })
+        .map_err(|_| ())?
+        .map_err(|_| ())?;
+        if let SignalSendResult::Queued(notify_targets) = send_res {
+            delivered = true;
+            super::signal_delivery::interrupt_and_wake_process_wait_after_signal(target)?;
+            notifications.include_targets(current_cpu, notify_targets)?;
+        }
+    }
+    if delivered {
+        notifications.deliver()?;
+    }
+    Ok(delivered)
+}
+
+/// Replaces the current thread's signal mask with `new_mask` and returns the previous mask.
+pub(super) fn swap_current_thread_sigmask(new_mask: SignalSet) -> Result<SignalSet, ()> {
+    let current_cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
+    super::runtime::with_linux_runtime(|state| {
+        state.with_current_process_signals(current, |process, identities, signals| {
+            signals
+                .update_thread_mask(identities, process, current, MaskHow::Set, new_mask)
+                .map_err(|_| ())
+        })
+    })
+    .map_err(|_| ())?
+    .map_err(|_| ())?
+}
+
+/// Cooperatively yields the current scheduler thread inside a blocking SVC wait and rebinds
+/// `frame`'s switch generation when the address space generation advanced while switched out.
+pub(super) fn yield_and_rebind_frame(frame: Option<&mut ExceptionFrame>) -> Result<(), ()> {
+    let current_cpu = super::super::current_cpu_index();
+    let _ = super::drain_step30_pending_exits_before_wait(current_cpu);
+    if let Some(scheduler) = super::super::CPU_SCHEDULERS.get(current_cpu) {
+        // SAFETY: IRQ-masked SVC window owns this PE's cooperative yield and destination
+        // TTBR0 activation callback.
+        if let Ok(_resumed) = unsafe {
+            scheduler.bootstrap_yield_with_destination_address_space(
+                super::activate_step30_scheduler_destination,
+            )
+        } && let Some(frame_ref) = frame
+        {
+            let generation = kernal_process_aarch64::current_user_switch_generation()
+                .and_then(NonZeroU64::new)
+                .ok_or(())?;
+            if generation.get() != frame_ref.entry_switch_generation() {
+                // SAFETY: current resumed as the active owner generation.
+                unsafe { frame_ref.rebind_entry_switch_generation(generation) };
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

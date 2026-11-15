@@ -99,10 +99,18 @@ pub(super) unsafe fn interrupt_wait_after_signal(
         return Ok(route);
     }
 
-    // SAFETY: the same quiescence window applies to the standalone Pipe waiter serializer. Futex has
-    // already proved absence for this exact generation before Pipe may claim interruption authority.
+    // SAFETY: the same quiescence window applies to the standalone Pipe waiter serializers. Futex
+    // has already proved absence for this exact generation before Pipe may claim interruption authority.
     let pipe = unsafe { pipe_wait::interrupt(target) }.map_err(|_| BlockingInterruptError::Pipe)?;
-    Ok(pipe_signal_interrupt_route(target, pipe))
+    let route = pipe_signal_interrupt_route(target, pipe);
+    if route != SignalInterruptRoute::NotWaiting {
+        return Ok(route);
+    }
+
+    // SAFETY: same quiescence window for blocking pipe write waiters.
+    let pipe_write =
+        unsafe { pipe_wait::interrupt_write(target) }.map_err(|_| BlockingInterruptError::Pipe)?;
+    Ok(pipe_signal_interrupt_route(target, pipe_write))
 }
 
 /// Observes whether one exact scheduler generation still retains a signal-owned blocking marker.
@@ -116,22 +124,28 @@ pub(super) unsafe fn interrupt_wait_after_signal(
 pub(super) unsafe fn interruption_pending_after_resume(
     target: GlobalThreadId,
 ) -> Result<bool, BlockingInterruptError> {
-    // SAFETY: delegated caller contract matches both serialized owner observation requirements.
+    // SAFETY: delegated caller contract matches all serialized owner observation requirements.
     let futex_pending =
         unsafe { futexes().interruption_pending(target) }.map_err(BlockingInterruptError::Futex)?;
     // SAFETY: same exact-generation, non-reentrant owner window.
-    let pipe_pending = unsafe { pipe_wait::interruption_pending(target) }
+    let pipe_read_pending = unsafe { pipe_wait::interruption_pending(target) }
         .map_err(|_| BlockingInterruptError::Pipe)?;
-    if futex_pending && pipe_pending {
+    // SAFETY: same exact-generation, non-reentrant owner window.
+    let pipe_write_pending = unsafe { pipe_wait::interruption_pending_write(target) }
+        .map_err(|_| BlockingInterruptError::Pipe)?;
+    let count = usize::from(futex_pending)
+        + usize::from(pipe_read_pending)
+        + usize::from(pipe_write_pending);
+    if count > 1 {
         return Err(BlockingInterruptError::AmbiguousOwner);
     }
-    Ok(futex_pending || pipe_pending)
+    Ok(count == 1)
 }
 
 /// Consumes one exact retained blocking interruption after canonical signal policy has committed.
 ///
 /// A false result means neither owner retains the exact marker and must never be converted into
-/// fabricated EINTR/restart behavior. If both owners claim the generation, fail closed.
+/// fabricated EINTR/restart behavior. If multiple owners claim the generation, fail closed.
 ///
 /// # Safety
 /// The caller must prevent same-CPU owner reentrancy and must own the exact `target` generation whose
@@ -139,25 +153,33 @@ pub(super) unsafe fn interruption_pending_after_resume(
 pub(super) unsafe fn consume_interrupted_after_signal(
     target: GlobalThreadId,
 ) -> Result<bool, BlockingInterruptError> {
-    // First identify the unique owner without consuming either marker.
+    // First identify the unique owner without consuming any marker.
     // SAFETY: delegated exact-generation/non-reentrant owner contract.
     let futex_pending =
         unsafe { futexes().interruption_pending(target) }.map_err(BlockingInterruptError::Futex)?;
     // SAFETY: same owner window.
-    let pipe_pending = unsafe { pipe_wait::interruption_pending(target) }
+    let pipe_read_pending = unsafe { pipe_wait::interruption_pending(target) }
         .map_err(|_| BlockingInterruptError::Pipe)?;
-    match (futex_pending, pipe_pending) {
-        (true, true) => Err(BlockingInterruptError::AmbiguousOwner),
-        (true, false) => {
+    // SAFETY: same owner window.
+    let pipe_write_pending = unsafe { pipe_wait::interruption_pending_write(target) }
+        .map_err(|_| BlockingInterruptError::Pipe)?;
+    match (futex_pending, pipe_read_pending, pipe_write_pending) {
+        (true, false, false) => {
             // SAFETY: the observation above selected the sole retained owner for this exact target.
             unsafe { futexes().consume_interrupted(target) }.map_err(BlockingInterruptError::Futex)
         }
-        (false, true) => {
+        (false, true, false) => {
             // SAFETY: the observation above selected the sole retained owner for this exact target.
             unsafe { pipe_wait::consume_interrupted(target) }
                 .map_err(|_| BlockingInterruptError::Pipe)
         }
-        (false, false) => Ok(false),
+        (false, false, true) => {
+            // SAFETY: the observation above selected the sole retained owner for this exact target.
+            unsafe { pipe_wait::consume_interrupted_write(target) }
+                .map_err(|_| BlockingInterruptError::Pipe)
+        }
+        (false, false, false) => Ok(false),
+        _ => Err(BlockingInterruptError::AmbiguousOwner),
     }
 }
 
@@ -235,5 +257,102 @@ mod tests {
             pipe_signal_interrupt_route(target, pipe_wait::InterruptOutcome::WakeRequired),
             SignalInterruptRoute::Wake(target)
         );
+    }
+
+    #[test]
+    fn pipe_write_wait_signal_interruption_and_ambiguity_cleanup() {
+        let mut pipes = kernal_linux_pipe::PipeTable::<1, 4>::new();
+        let pipe_id = pipes.create().unwrap().reader.pipe();
+
+        let target_pre = GlobalThreadId::new(
+            CpuIndex(3),
+            ThreadId {
+                slot: 11,
+                generation: 5,
+            },
+        );
+        let target_sleeping = GlobalThreadId::new(
+            CpuIndex(3),
+            ThreadId {
+                slot: 12,
+                generation: 6,
+            },
+        );
+        let target_ambiguous = GlobalThreadId::new(
+            CpuIndex(3),
+            ThreadId {
+                slot: 13,
+                generation: 7,
+            },
+        );
+
+        unsafe {
+            pipe_wait::prepare_write(pipe_id, target_pre).unwrap();
+            assert_eq!(
+                interrupt_wait_after_signal(target_pre),
+                Ok(SignalInterruptRoute::Retained)
+            );
+            assert_eq!(
+                pipe_wait::commit_write(target_pre),
+                Ok(pipe_wait::WaitCommit::AlreadyWoken)
+            );
+            assert_eq!(interruption_pending_after_resume(target_pre), Ok(true));
+            assert_eq!(consume_interrupted_after_signal(target_pre), Ok(true));
+            assert_eq!(interruption_pending_after_resume(target_pre), Ok(false));
+            assert_eq!(consume_interrupted_after_signal(target_pre), Ok(false));
+
+            pipe_wait::prepare_write(pipe_id, target_sleeping).unwrap();
+            assert_eq!(
+                pipe_wait::commit_write(target_sleeping),
+                Ok(pipe_wait::WaitCommit::Sleep)
+            );
+            assert_eq!(
+                interrupt_wait_after_signal(target_sleeping),
+                Ok(SignalInterruptRoute::Wake(target_sleeping))
+            );
+            assert_eq!(
+                interrupt_wait_after_signal(target_sleeping),
+                Ok(SignalInterruptRoute::AlreadyInterrupted)
+            );
+            assert_eq!(interruption_pending_after_resume(target_sleeping), Ok(true));
+            assert_eq!(consume_interrupted_after_signal(target_sleeping), Ok(true));
+            assert_eq!(consume_interrupted_after_signal(target_sleeping), Ok(false));
+
+            pipe_wait::prepare(pipe_id, target_ambiguous).unwrap();
+            assert_eq!(
+                pipe_wait::commit(target_ambiguous),
+                Ok(pipe_wait::WaitCommit::Sleep)
+            );
+            pipe_wait::prepare_write(pipe_id, target_ambiguous).unwrap();
+            assert_eq!(
+                pipe_wait::commit_write(target_ambiguous),
+                Ok(pipe_wait::WaitCommit::Sleep)
+            );
+            assert_eq!(
+                pipe_wait::interrupt(target_ambiguous),
+                Ok(pipe_wait::InterruptOutcome::WakeRequired)
+            );
+            assert_eq!(
+                pipe_wait::interrupt_write(target_ambiguous),
+                Ok(pipe_wait::InterruptOutcome::WakeRequired)
+            );
+            assert_eq!(
+                interruption_pending_after_resume(target_ambiguous),
+                Err(BlockingInterruptError::AmbiguousOwner)
+            );
+            assert_eq!(
+                consume_interrupted_after_signal(target_ambiguous),
+                Err(BlockingInterruptError::AmbiguousOwner)
+            );
+            assert_eq!(pipe_wait::consume_interrupted(target_ambiguous), Ok(true));
+            assert_eq!(
+                pipe_wait::consume_interrupted_write(target_ambiguous),
+                Ok(true)
+            );
+            assert_eq!(
+                interruption_pending_after_resume(target_ambiguous),
+                Ok(false)
+            );
+        }
     }
 }

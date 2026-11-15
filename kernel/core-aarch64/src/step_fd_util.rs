@@ -1,11 +1,545 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
-use kernal_linux_abi::{Errno, SyscallReturn};
+use alloc::vec::Vec;
+use kernal_capability::ObjectId;
+use kernal_linux_abi::{
+    Errno, SyscallRequest, SyscallReturn, linux_signed_int, linux_unsigned_int,
+};
+use kernal_linux_fd::{OpenObjectKind, SubsystemHandle};
 
 pub(super) const ARM64_STAT_BYTES: usize = 128;
 pub(super) const S_IFREG_MODE: u32 = 0o100_444;
 pub(super) const S_IFCHR_MODE: u32 = 0o020_660;
 pub(super) const S_IFBLK_MODE: u32 = 0o060_660;
+
+pub(super) const SUBSYS_DEV: u8 = 1;
+pub(super) const SUBSYS_PROC_SYS: u8 = 2;
+pub(super) const SUBSYS_NET: u8 = 3;
+pub(super) const SUBSYS_EVENT: u8 = 4;
+pub(super) const SUBSYS_HW: u8 = 5;
+pub(super) const SUBSYS_EXT4: u8 = 6;
+
+const F_DUPFD: u32 = 0;
+const F_GETFD: u32 = 1;
+const F_SETFD: u32 = 2;
+const F_GETFL: u32 = 3;
+const F_SETFL: u32 = 4;
+const F_DUPFD_CLOEXEC: u32 = 1030;
+const FD_CLOEXEC: i32 = 1;
+const O_CLOEXEC_U32: u32 = 0x0008_0000;
+
+/// Per-process native-slot reference table tracking direct (`64..192`) subsystem descriptor
+/// ownership and `FD_CLOEXEC` across `fork`, `dup`, `execve`, and `exit`.
+#[derive(Clone, Copy)]
+pub(super) struct DirectProcessRefs<const P: usize> {
+    owners: [Option<(ObjectId, bool)>; P],
+}
+
+impl<const P: usize> DirectProcessRefs<P> {
+    pub(super) const fn empty() -> Self {
+        Self { owners: [None; P] }
+    }
+
+    pub(super) fn init(&mut self, owner: ObjectId, cloexec: bool) {
+        self.owners = [None; P];
+        if P > 0 {
+            self.owners[0] = Some((owner, cloexec));
+        }
+    }
+
+    pub(super) fn has_owner(&self, owner: ObjectId) -> bool {
+        self.owners.iter().flatten().any(|(id, _)| *id == owner)
+    }
+
+    pub(super) fn get_cloexec(&self, owner: ObjectId) -> Option<bool> {
+        self.owners
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == owner)
+            .map(|(_, cloexec)| *cloexec)
+    }
+
+    pub(super) fn set_cloexec(&mut self, owner: ObjectId, cloexec: bool) -> bool {
+        for (id, flag) in self.owners.iter_mut().flatten() {
+            if *id == owner {
+                *flag = cloexec;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(super) fn on_fork(&mut self, parent: ObjectId, child: ObjectId) {
+        let Some(cloexec) = self.get_cloexec(parent) else {
+            return;
+        };
+        if self.has_owner(child) {
+            return;
+        }
+        if let Some(slot) = self.owners.iter_mut().find(|entry| entry.is_none()) {
+            *slot = Some((child, cloexec));
+        }
+    }
+
+    pub(super) fn close_owner(&mut self, owner: ObjectId) -> bool {
+        let mut closed = false;
+        for slot in &mut self.owners {
+            if matches!(slot, Some((id, _)) if *id == owner) {
+                *slot = None;
+                closed = true;
+            }
+        }
+        closed
+    }
+
+    pub(super) fn close_cloexec_for(&mut self, owner: ObjectId) {
+        for slot in &mut self.owners {
+            if matches!(slot, Some((id, true)) if *id == owner) {
+                *slot = None;
+            }
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.owners.iter().all(Option::is_none)
+    }
+}
+
+pub(super) fn current_scheduler_thread() -> Option<kernal_scheduler_smp::GlobalThreadId> {
+    let current_cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu)?;
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked scheduler window.
+    unsafe { scheduler.bootstrap_current_global_thread() }.ok()
+}
+
+pub(super) fn current_process_object() -> Option<ObjectId> {
+    let current = current_scheduler_thread()?;
+    super::runtime::with_linux_runtime(|state| {
+        let (process, address_space, _tid) =
+            state.process_parts_for_scheduler_thread(current).ok()?;
+        address_space.current_owner(process).ok()?;
+        Some(process.id())
+    })
+    .ok()
+    .flatten()
+}
+
+fn write_prefixed_u64(prefix: &[u8], val: u64, suffix: &[u8], out: &mut [u8]) -> usize {
+    let mut c = prefix.len().min(out.len());
+    out[..c].copy_from_slice(&prefix[..c]);
+    let mut digits = [0u8; 20];
+    let mut v = val;
+    let mut pos = digits.len();
+    loop {
+        pos -= 1;
+        digits[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let slice = &digits[pos..];
+    let take_digits = out.len().saturating_sub(c).min(slice.len());
+    out[c..c + take_digits].copy_from_slice(&slice[..take_digits]);
+    c += take_digits;
+    let take_suffix = out.len().saturating_sub(c).min(suffix.len());
+    out[c..c + take_suffix].copy_from_slice(&suffix[..take_suffix]);
+    c + take_suffix
+}
+
+fn describe_subsystem_handle(handle: SubsystemHandle, out: &mut [u8]) -> Option<usize> {
+    match handle.kind {
+        SUBSYS_DEV => {
+            super::step32_dev::describe_dev_slot(handle.slot, Some(handle.generation), None, out)
+        }
+        SUBSYS_PROC_SYS => super::step33_mounts::describe_proc_sys_slot(
+            handle.slot,
+            Some(handle.generation),
+            None,
+            out,
+        ),
+        SUBSYS_NET => Some(write_prefixed_u64(
+            b"socket:[",
+            u64::from(handle.slot),
+            b"]",
+            out,
+        )),
+        SUBSYS_EVENT => Some(write_prefixed_u64(
+            b"anon_inode:[event:",
+            u64::from(handle.slot),
+            b"]",
+            out,
+        )),
+        SUBSYS_HW => super::step42_hardware::describe_hw_slot(
+            handle.slot,
+            Some(handle.generation),
+            None,
+            out,
+        ),
+        SUBSYS_EXT4 => super::step33_ext4_vfs::describe_ext4_slot(
+            handle.slot,
+            Some(handle.generation),
+            None,
+            out,
+        ),
+        _ => None,
+    }
+}
+
+pub(super) fn collect_process_fd_numbers(process: ObjectId, out: &mut Vec<i32>) {
+    let _ = super::step29_runtime::with_process(process, |runtime| {
+        for fd in 0..super::step29_runtime::STEP29_RUNTIME_FDS as i32 {
+            if runtime.fds().object_kind(fd).is_ok() {
+                out.push(fd);
+            }
+        }
+    });
+    super::step32_dev::append_open_dev_fds(process, out);
+    super::step33_mounts::append_open_proc_sys_fds(process, out);
+    super::step42_hardware::append_open_hw_fds(process, out);
+    super::step33_ext4_vfs::append_open_ext4_fds(process, out);
+    super::step34_net::append_open_socket_fds(process, out);
+}
+
+pub(super) fn describe_process_fd_target(
+    process: ObjectId,
+    fd: i32,
+    out: &mut [u8],
+) -> Option<usize> {
+    if (0..super::step29_runtime::STEP29_RUNTIME_FDS as i32).contains(&fd) {
+        let mut kind_res = None;
+        let _ = super::step29_runtime::with_process(process, |runtime| {
+            if let Ok(kind) = runtime.fds().object_kind(fd) {
+                kind_res = Some(kind);
+            }
+        });
+        return match kind_res? {
+            OpenObjectKind::External(_) => {
+                let take = b"/dev/console".len().min(out.len());
+                out[..take].copy_from_slice(&b"/dev/console"[..take]);
+                Some(take)
+            }
+            OpenObjectKind::Pipe => Some(write_prefixed_u64(b"pipe:[", fd as u64, b"]", out)),
+            OpenObjectKind::File => Some(write_prefixed_u64(b"/file:[", fd as u64, b"]", out)),
+            OpenObjectKind::Directory => Some(write_prefixed_u64(b"/dir:[", fd as u64, b"]", out)),
+            OpenObjectKind::Subsystem(handle) => describe_subsystem_handle(handle, out),
+        };
+    }
+    let raw_fd = fd as u64;
+    if super::step32_dev::is_dev_fd(raw_fd) {
+        let slot = (fd - super::step32_dev::DEV_FD_BASE) as u16;
+        return super::step32_dev::describe_dev_slot(slot, None, Some(process), out);
+    }
+    if super::step33_mounts::is_proc_sys_fd(raw_fd) {
+        let slot = (fd - super::step33_mounts::PROC_SYS_FD_BASE) as u16;
+        return super::step33_mounts::describe_proc_sys_slot(slot, None, Some(process), out);
+    }
+    if super::step42_hardware::is_hw_fd(raw_fd) {
+        let slot = (fd - super::step42_hardware::HW_FD_BASE) as u16;
+        return super::step42_hardware::describe_hw_slot(slot, None, Some(process), out);
+    }
+    if super::step33_ext4_vfs::is_ext4_fd(raw_fd) {
+        let slot = (fd - super::step33_ext4_vfs::EXT4_FD_BASE) as u16;
+        return super::step33_ext4_vfs::describe_ext4_slot(slot, None, Some(process), out);
+    }
+    if super::step34_net::is_socket_fd(raw_fd) {
+        let slot = (fd - super::step34_net::SOCK_FD_BASE) as u16;
+        return Some(write_prefixed_u64(b"socket:[", u64::from(slot), b"]", out));
+    }
+    None
+}
+
+pub(super) fn lookup_aliased_subsystem(process: ObjectId, raw_fd: u64) -> Option<SubsystemHandle> {
+    let fd = linux_signed_int(raw_fd);
+    if fd < 0 || fd >= super::step29_runtime::STEP29_RUNTIME_FDS as i32 {
+        return None;
+    }
+    super::step29_runtime::with_process(process, |runtime| {
+        runtime.fds().subsystem_handle(fd).ok().flatten()
+    })
+    .ok()
+    .flatten()
+}
+
+pub(super) fn lookup_aliased_subsystem_current(raw_fd: u64) -> Option<SubsystemHandle> {
+    let fd = linux_signed_int(raw_fd);
+    if fd < 0 || fd >= super::step29_runtime::STEP29_RUNTIME_FDS as i32 {
+        return None;
+    }
+    let process = current_process_object()?;
+    lookup_aliased_subsystem(process, raw_fd)
+}
+
+pub(super) fn release_subsystem_handle(handle: SubsystemHandle) {
+    match handle.kind {
+        SUBSYS_DEV => super::step32_dev::release_alias_handle(handle),
+        SUBSYS_PROC_SYS => super::step33_mounts::release_alias_handle(handle),
+        SUBSYS_NET => super::step34_net::release_alias_handle(handle),
+        SUBSYS_EVENT => super::step35_events_cgroup::release_alias_handle(handle),
+        SUBSYS_HW => super::step42_hardware::release_alias_handle(handle),
+        SUBSYS_EXT4 => super::step33_ext4_vfs::release_alias_handle(handle),
+        _ => {}
+    }
+}
+
+pub(super) fn release_subsystem_handles(handles: &[Option<SubsystemHandle>]) {
+    for handle in handles.iter().flatten().copied() {
+        release_subsystem_handle(handle);
+    }
+}
+
+pub(super) fn on_subsystem_process_fork(parent: ObjectId, child: ObjectId) {
+    super::step32_dev::on_process_fork(parent, child);
+    super::step33_mounts::on_process_fork(parent, child);
+    super::step42_hardware::on_process_fork(parent, child);
+    super::step33_ext4_vfs::on_process_fork(parent, child);
+    super::step34_net::on_process_fork(parent, child);
+}
+
+pub(super) fn on_subsystem_process_exec(process: ObjectId) {
+    super::step32_dev::on_process_exec(process);
+    super::step33_mounts::on_process_exec(process);
+    super::step42_hardware::on_process_exec(process);
+    super::step33_ext4_vfs::on_process_exec(process);
+    super::step34_net::on_process_exec(process);
+}
+
+pub(super) fn on_subsystem_process_exit(process: ObjectId) {
+    super::step32_dev::on_process_exit(process);
+    super::step33_mounts::on_process_exit(process);
+    super::step42_hardware::on_process_exit(process);
+    super::step33_ext4_vfs::on_process_exit(process);
+    super::step34_net::on_process_exit(process);
+    super::step39_dpkg::on_process_exit(process);
+}
+
+fn retain_native_subsystem_fd(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<Option<(SubsystemHandle, u64)>, Errno> {
+    if super::step32_dev::is_dev_fd(raw_fd) {
+        return super::step32_dev::retain_alias_handle(process, raw_fd).map(Some);
+    }
+    if super::step33_mounts::is_proc_sys_fd(raw_fd) {
+        return super::step33_mounts::retain_alias_handle(process, raw_fd).map(Some);
+    }
+    if super::step34_net::is_socket_fd(raw_fd) {
+        return super::step34_net::retain_alias_handle(process, raw_fd).map(Some);
+    }
+    if super::step35_events_cgroup::is_event_fd(raw_fd) {
+        return super::step35_events_cgroup::retain_alias_handle(process, raw_fd).map(Some);
+    }
+    if super::step42_hardware::is_hw_fd(raw_fd) {
+        return super::step42_hardware::retain_alias_handle(process, raw_fd).map(Some);
+    }
+    if super::step33_ext4_vfs::is_ext4_fd(raw_fd) {
+        return super::step33_ext4_vfs::retain_alias_handle(process, raw_fd).map(Some);
+    }
+    Ok(None)
+}
+
+fn try_native_fcntl_meta(
+    process: ObjectId,
+    raw_fd: u64,
+    cmd: u32,
+    argi: i32,
+) -> Option<Result<i64, Errno>> {
+    if super::step32_dev::is_dev_fd(raw_fd) {
+        return super::step32_dev::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
+    if super::step33_mounts::is_proc_sys_fd(raw_fd) {
+        return super::step33_mounts::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
+    if super::step34_net::is_socket_fd(raw_fd) {
+        return super::step34_net::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
+    if super::step35_events_cgroup::is_event_fd(raw_fd) {
+        return super::step35_events_cgroup::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
+    if super::step42_hardware::is_hw_fd(raw_fd) {
+        return super::step42_hardware::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
+    if super::step33_ext4_vfs::is_ext4_fd(raw_fd) {
+        return super::step33_ext4_vfs::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
+    if matches!(cmd, F_GETFL | F_SETFL)
+        && let Some(handle) = lookup_aliased_subsystem(process, raw_fd)
+    {
+        return match handle.kind {
+            SUBSYS_DEV => super::step32_dev::handle_native_fcntl(process, raw_fd, cmd, argi),
+            SUBSYS_PROC_SYS => {
+                super::step33_mounts::handle_native_fcntl(process, raw_fd, cmd, argi)
+            }
+            SUBSYS_NET => super::step34_net::handle_native_fcntl(process, raw_fd, cmd, argi),
+            SUBSYS_EVENT => {
+                super::step35_events_cgroup::handle_native_fcntl(process, raw_fd, cmd, argi)
+            }
+            SUBSYS_HW => super::step42_hardware::handle_native_fcntl(process, raw_fd, cmd, argi),
+            SUBSYS_EXT4 => super::step33_ext4_vfs::handle_native_fcntl(process, raw_fd, cmd, argi),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// Intercepts `dup(2)`, `dup3(2)`, and `fcntl(2)` targeting a native subsystem descriptor window
+/// (`64..192`) so callers can duplicate or redirect `/dev/*`, `/proc/*`, sockets, and event/timer/
+/// signalfds onto standard or high `0..64` process descriptors cleanly.
+pub(super) fn try_handle_subsystem_dup_or_fcntl(
+    request: SyscallRequest,
+) -> Result<Option<SyscallReturn>, ()> {
+    match request.number {
+        // dup(oldfd) -> lowest free 0..64 FD alias
+        23 => {
+            let Some(process) = current_process_object() else {
+                return Err(());
+            };
+            let retained = match retain_native_subsystem_fd(process, request.args[0]) {
+                Ok(Some(v)) => v,
+                Ok(None) => return Ok(None),
+                Err(errno) => return Ok(Some(SyscallReturn::error(errno))),
+            };
+            let res = super::step29_runtime::with_process(process, |runtime| {
+                runtime
+                    .fds()
+                    .open_subsystem_from(0, retained.0, false, retained.1)
+            });
+            match res {
+                Ok(Ok(token)) => Ok(Some(encode_result(Ok(i64::from(token.fd()))))),
+                Ok(Err(_)) | Err(_) => {
+                    release_subsystem_handle(retained.0);
+                    Ok(Some(SyscallReturn::error(Errno::EMFILE)))
+                }
+            }
+        }
+        // dup3(oldfd, newfd, flags)
+        24 => {
+            let raw_old = request.args[0];
+            let raw_new = request.args[1];
+            let raw_flags = request.args[2];
+            let Some(process) = current_process_object() else {
+                return Err(());
+            };
+            let retained = match retain_native_subsystem_fd(process, raw_old) {
+                Ok(Some(v)) => v,
+                Ok(None) => return Ok(None),
+                Err(errno) => return Ok(Some(SyscallReturn::error(errno))),
+            };
+            let flags = linux_signed_int(raw_flags) as u32;
+            if flags & !O_CLOEXEC_U32 != 0 {
+                release_subsystem_handle(retained.0);
+                return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+            }
+            let cloexec = flags & O_CLOEXEC_U32 != 0;
+            let oldfd = linux_signed_int(raw_old);
+            let newfd = linux_signed_int(raw_new);
+            if oldfd == newfd {
+                release_subsystem_handle(retained.0);
+                return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+            }
+            if newfd < 0 || newfd >= super::step29_runtime::STEP29_RUNTIME_FDS as i32 {
+                release_subsystem_handle(retained.0);
+                return Ok(Some(SyscallReturn::error(Errno::EBADF)));
+            }
+            let mut dropped_subsys: Option<SubsystemHandle> = None;
+            #[cfg(feature = "step29-qemu-proof")]
+            let mut closed_pipe: Option<(
+                kernal_linux_pipe::PipeId,
+                kernal_linux_pipe::End,
+            )> = None;
+            let res = super::step29_runtime::with_process(process, |runtime| {
+                let (fds, pipes, overlay) = runtime.fd_pipe_overlay_parts();
+                fds.bind_subsystem_exact(newfd, retained.0, cloexec, retained.1, |released| {
+                    match released {
+                        kernal_linux_fd::ReleasedObject::Pipe(ep) => {
+                            pipes.close(ep).map_err(|_| Errno::EIO)?;
+                            #[cfg(feature = "step29-qemu-proof")]
+                            {
+                                closed_pipe = Some((ep.pipe(), ep.end()));
+                            }
+                            Ok(())
+                        }
+                        kernal_linux_fd::ReleasedObject::RetainedDirectory(d) => {
+                            overlay.release_directory(d).map_err(|_| Errno::EIO)
+                        }
+                        kernal_linux_fd::ReleasedObject::RetainedReadOnly(l) => {
+                            overlay.release_open(l).map_err(|_| Errno::EIO)
+                        }
+                        kernal_linux_fd::ReleasedObject::WritableRegular(r) => {
+                            overlay.release_retained_regular(r).map_err(|_| Errno::EIO)
+                        }
+                        kernal_linux_fd::ReleasedObject::Subsystem(h) => {
+                            dropped_subsys = Some(h);
+                            Ok(())
+                        }
+                    }
+                })
+            });
+            if let Some(prev) = dropped_subsys {
+                release_subsystem_handle(prev);
+            }
+            #[cfg(feature = "step29-qemu-proof")]
+            if let Some((pipe, end)) = closed_pipe {
+                super::futex::pipe_blocking::notify_after_endpoint_close(pipe, end)
+                    .map_err(|_| ())?;
+            }
+            match res {
+                Ok(Ok(Ok(token))) => Ok(Some(encode_result(Ok(i64::from(token.fd()))))),
+                Ok(Ok(Err(errno))) => {
+                    release_subsystem_handle(retained.0);
+                    Ok(Some(SyscallReturn::error(errno)))
+                }
+                Ok(Err(_)) | Err(_) => {
+                    release_subsystem_handle(retained.0);
+                    Ok(Some(SyscallReturn::error(Errno::EMFILE)))
+                }
+            }
+        }
+        // fcntl(fd, cmd, arg) on native subsystem windows
+        25 => {
+            let raw_fd = request.args[0];
+            let cmd = linux_unsigned_int(request.args[1]);
+            let argi = linux_signed_int(request.args[2]);
+            let Some(process) = current_process_object() else {
+                return Err(());
+            };
+            if matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC) {
+                let retained = match retain_native_subsystem_fd(process, raw_fd) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(None),
+                    Err(errno) => return Ok(Some(SyscallReturn::error(errno))),
+                };
+                if argi < 0 || argi >= super::step29_runtime::STEP29_RUNTIME_FDS as i32 {
+                    release_subsystem_handle(retained.0);
+                    return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+                }
+                let cloexec = cmd == F_DUPFD_CLOEXEC;
+                let res = super::step29_runtime::with_process(process, |runtime| {
+                    runtime
+                        .fds()
+                        .open_subsystem_from(argi, retained.0, cloexec, retained.1)
+                });
+                return match res {
+                    Ok(Ok(token)) => Ok(Some(encode_result(Ok(i64::from(token.fd()))))),
+                    Ok(Err(_)) | Err(_) => {
+                        release_subsystem_handle(retained.0);
+                        Ok(Some(SyscallReturn::error(Errno::EMFILE)))
+                    }
+                };
+            }
+            if matches!(cmd, F_GETFD | F_SETFD | F_GETFL | F_SETFL) {
+                if let Some(res) = try_native_fcntl_meta(process, raw_fd, cmd, argi) {
+                    return Ok(Some(encode_result(res)));
+                }
+            } else if try_native_fcntl_meta(process, raw_fd, cmd, argi).is_some() {
+                return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+            }
+            let _ = (FD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL, F_SETFL);
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
 
 pub(super) fn encode_result(res: Result<i64, Errno>) -> SyscallReturn {
     match res {
@@ -36,6 +570,103 @@ pub(super) fn read_user_cstr(user_ptr: u64, out: &mut [u8]) -> Result<usize, Err
         *slot = byte[0];
     }
     Err(Errno::ENAMETOOLONG)
+}
+
+pub(super) const ARM64_STATX_BYTES: usize = 256;
+pub(super) const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+
+pub(super) fn read_user_iovec(user_iov: u64, index: usize) -> Result<(u64, usize), Errno> {
+    if user_iov == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let addr = (index as u64)
+        .checked_mul(16)
+        .and_then(|off| user_iov.checked_add(off))
+        .ok_or(Errno::EFAULT)?;
+    let mut raw = [0u8; 16];
+    copy_from_user(&mut raw, addr)?;
+    let base = u64::from_le_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]);
+    let len = u64::from_le_bytes([
+        raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15],
+    ]);
+    let len_usize = usize::try_from(len).map_err(|_| Errno::EINVAL)?;
+    Ok((base, len_usize))
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct StatMeta {
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+    pub nlink: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub rdev: u64,
+    pub size: u64,
+    pub blksize: u32,
+    pub blocks: u64,
+    pub atime_sec: i64,
+    pub atime_nsec: u64,
+    pub mtime_sec: i64,
+    pub mtime_nsec: u64,
+    pub ctime_sec: i64,
+    pub ctime_nsec: u64,
+}
+
+pub(super) fn write_aarch64_stat_meta(user_stat: u64, meta: &StatMeta) -> Result<i64, Errno> {
+    let mut buf = [0u8; ARM64_STAT_BYTES];
+    buf[0..8].copy_from_slice(&meta.dev.to_le_bytes());
+    buf[8..16].copy_from_slice(&meta.ino.to_le_bytes());
+    buf[16..20].copy_from_slice(&meta.mode.to_le_bytes());
+    buf[20..24].copy_from_slice(&meta.nlink.to_le_bytes());
+    buf[24..28].copy_from_slice(&meta.uid.to_le_bytes());
+    buf[28..32].copy_from_slice(&meta.gid.to_le_bytes());
+    buf[32..40].copy_from_slice(&meta.rdev.to_le_bytes());
+    buf[48..56].copy_from_slice(&(meta.size as i64).to_le_bytes());
+    buf[56..60].copy_from_slice(&(meta.blksize as i32).to_le_bytes());
+    buf[64..72].copy_from_slice(&(meta.blocks as i64).to_le_bytes());
+    buf[72..80].copy_from_slice(&meta.atime_sec.to_le_bytes());
+    buf[80..88].copy_from_slice(&meta.atime_nsec.to_le_bytes());
+    buf[88..96].copy_from_slice(&meta.mtime_sec.to_le_bytes());
+    buf[96..104].copy_from_slice(&meta.mtime_nsec.to_le_bytes());
+    buf[104..112].copy_from_slice(&meta.ctime_sec.to_le_bytes());
+    buf[112..120].copy_from_slice(&meta.ctime_nsec.to_le_bytes());
+    copy_to_user(user_stat, &buf)?;
+    Ok(0)
+}
+
+pub(super) fn write_aarch64_statx_meta(user_statx: u64, meta: &StatMeta) -> Result<i64, Errno> {
+    if user_statx == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut buf = [0u8; ARM64_STATX_BYTES];
+    buf[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    buf[4..8].copy_from_slice(&meta.blksize.to_le_bytes());
+    buf[16..20].copy_from_slice(&meta.nlink.to_le_bytes());
+    buf[20..24].copy_from_slice(&meta.uid.to_le_bytes());
+    buf[24..28].copy_from_slice(&meta.gid.to_le_bytes());
+    buf[28..30].copy_from_slice(&(meta.mode as u16).to_le_bytes());
+    buf[32..40].copy_from_slice(&meta.ino.to_le_bytes());
+    buf[40..48].copy_from_slice(&meta.size.to_le_bytes());
+    buf[48..56].copy_from_slice(&meta.blocks.to_le_bytes());
+    buf[64..72].copy_from_slice(&meta.atime_sec.to_le_bytes());
+    buf[72..76].copy_from_slice(&(meta.atime_nsec as u32).to_le_bytes());
+    buf[96..104].copy_from_slice(&meta.ctime_sec.to_le_bytes());
+    buf[104..108].copy_from_slice(&(meta.ctime_nsec as u32).to_le_bytes());
+    buf[112..120].copy_from_slice(&meta.mtime_sec.to_le_bytes());
+    buf[120..124].copy_from_slice(&(meta.mtime_nsec as u32).to_le_bytes());
+    let rdev_major = ((meta.rdev >> 8) & 0xff) as u32;
+    let rdev_minor = (meta.rdev & 0xff) as u32;
+    buf[128..132].copy_from_slice(&rdev_major.to_le_bytes());
+    buf[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
+    let dev_major = ((meta.dev >> 8) & 0xff) as u32;
+    let dev_minor = (meta.dev & 0xff) as u32;
+    buf[136..140].copy_from_slice(&dev_major.to_le_bytes());
+    buf[140..144].copy_from_slice(&dev_minor.to_le_bytes());
+    copy_to_user(user_statx, &buf)?;
+    Ok(0)
 }
 
 pub(super) fn write_aarch64_stat(user_stat: u64, mode: u32, size: u64) -> Result<i64, Errno> {

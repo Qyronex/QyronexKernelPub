@@ -31,6 +31,8 @@ pub(super) fn handle_thread_exit(raw_status: u64) -> bool {
         }
     };
 
+    let only_process_thread =
+        super::live_vm::exact_current_is_only_bound_process_thread(current).unwrap_or(false);
     // Persist the exact lifecycle ticket outside the exiting stack, but retain only stable raw owner
     // pointers across the subsequent context switch. The runtime borrow is fully released before the
     // clear-child-tid/futex/scheduler composition may wake or switch another pthread.
@@ -39,18 +41,20 @@ pub(super) fn handle_thread_exit(raw_status: u64) -> bool {
         let (process, address_space, tid) = state.process_parts_for_scheduler_thread(current)?;
         Ok::<_, super::runtime::Error>((
             NonNull::from(process),
+            process.id(),
             NonNull::from(address_space),
             tid.get(),
         ))
     });
-    let Ok(Ok((process, address_space, exiting_tid))) = owners else {
+    let Ok(Ok((process, process_id, address_space, exiting_tid))) = owners else {
         if let Some(serial) = super::step15_svc_serial() {
             serial.write_str("KERNAL/ARM64: Step 15 exit lifecycle prepare failed\n");
         }
         return false;
     };
+    let retire_process_id = only_process_thread.then_some(process_id);
 
-    if let Some(serial) = super::step15_svc_serial() {
+    if let Some(serial) = super::step15_svc_trace_serial() {
         serial.write_str("KERNAL/ARM64: Step 15 thread exit prepared slot=");
         serial.write_u64(current.local.slot as u64);
         serial.write_str(" generation=");
@@ -74,32 +78,7 @@ pub(super) fn handle_thread_exit(raw_status: u64) -> bool {
             super::futex::futexes(),
             exiting_tid,
             super::activate_step30_scheduler_destination,
-            |exited| {
-                let wakes = super::runtime::with_linux_runtime(|state| {
-                    state.notify_wait_exit_transition_for_scheduler_thread(exited)
-                })
-                .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?
-                .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
-                let Some(wakes) = wakes else {
-                    return Ok(());
-                };
-                for target in wakes.iter() {
-                    let target_index = usize::from(target.cpu.0);
-                    if target_index == current_cpu {
-                        // SAFETY: Running->Exited is committed and scheduler table borrows are gone;
-                        // the cleanup owner window remains quiescent until successor selection.
-                        unsafe { scheduler.bootstrap_wake_local_exact(target) }
-                            .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
-                    } else {
-                        let target_scheduler = super::super::CPU_SCHEDULERS
-                            .get(target_index)
-                            .ok_or(kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
-                        super::remote_wake_with_reschedule(target_scheduler, target)
-                            .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
-                    }
-                }
-                Ok(())
-            },
+            |exited| notify_exit_transition(current_cpu, exited, retire_process_id),
             |target| {
                 let target_index = usize::from(target.cpu.0);
                 if target_index == current_cpu {
@@ -150,23 +129,27 @@ pub(super) fn handle_group_exit(raw_status: u64) -> bool {
         }
     };
 
+    let only_process_thread =
+        super::live_vm::exact_current_is_only_bound_process_thread(current).unwrap_or(false);
     let owners = super::runtime::with_linux_runtime(|state| {
         state.prepare_group_exit(current, raw_status as u8)?;
         let (process, address_space, tid) = state.process_parts_for_scheduler_thread(current)?;
         Ok::<_, super::runtime::Error>((
             NonNull::from(process),
+            process.id(),
             NonNull::from(address_space),
             tid.get(),
         ))
     });
-    let Ok(Ok((process, address_space, exiting_tid))) = owners else {
+    let Ok(Ok((process, process_id, address_space, exiting_tid))) = owners else {
         if let Some(serial) = super::step15_svc_serial() {
             serial.write_str("KERNAL/ARM64: Step 15 exit_group lifecycle prepare failed\n");
         }
         return false;
     };
+    let retire_process_id = only_process_thread.then_some(process_id);
 
-    if let Some(serial) = super::step15_svc_serial() {
+    if let Some(serial) = super::step15_svc_trace_serial() {
         serial.write_str("KERNAL/ARM64: Step 15 exit_group prepared slot=");
         serial.write_u64(current.local.slot as u64);
         serial.write_str(" generation=");
@@ -189,32 +172,7 @@ pub(super) fn handle_group_exit(raw_status: u64) -> bool {
             super::futex::futexes(),
             exiting_tid,
             super::activate_step30_scheduler_destination,
-            |exited| {
-                let wakes = super::runtime::with_linux_runtime(|state| {
-                    state.notify_wait_exit_transition_for_scheduler_thread(exited)
-                })
-                .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?
-                .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
-                let Some(wakes) = wakes else {
-                    return Ok(());
-                };
-                for target in wakes.iter() {
-                    let target_index = usize::from(target.cpu.0);
-                    if target_index == current_cpu {
-                        // SAFETY: Running->Exited is committed and scheduler table borrows are gone;
-                        // the cleanup owner window remains quiescent until successor selection.
-                        unsafe { scheduler.bootstrap_wake_local_exact(target) }
-                            .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
-                    } else {
-                        let target_scheduler = super::super::CPU_SCHEDULERS
-                            .get(target_index)
-                            .ok_or(kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
-                        super::remote_wake_with_reschedule(target_scheduler, target)
-                            .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
-                    }
-                }
-                Ok(())
-            },
+            |exited| notify_exit_transition(current_cpu, exited, retire_process_id),
             |target| {
                 let target_index = usize::from(target.cpu.0);
                 if target_index == current_cpu {
@@ -258,18 +216,22 @@ pub(super) fn handle_fatal_signal(signal: u8, core_dumped: bool) -> ! {
         ),
     };
 
+    let only_process_thread =
+        super::live_vm::exact_current_is_only_bound_process_thread(current).unwrap_or(false);
     let owners = super::runtime::with_linux_runtime(|state| {
         state.prepare_signal_termination(current, signal, core_dumped)?;
         let (process, address_space, tid) = state.process_parts_for_scheduler_thread(current)?;
         Ok::<_, super::runtime::Error>((
             NonNull::from(process),
+            process.id(),
             NonNull::from(address_space),
             tid.get(),
         ))
     });
-    let Ok(Ok((process, address_space, exiting_tid))) = owners else {
+    let Ok(Ok((process, process_id, address_space, exiting_tid))) = owners else {
         fatal_signal_fail_closed("KERNAL/ARM64: Step 30 fatal signal lifecycle prepare failed\n");
     };
+    let retire_process_id = only_process_thread.then_some(process_id);
 
     if let Some(serial) = super::step15_svc_serial() {
         serial.write_str("KERNAL/ARM64: Step 30 fatal signal prepared slot=");
@@ -295,32 +257,7 @@ pub(super) fn handle_fatal_signal(signal: u8, core_dumped: bool) -> ! {
             super::futex::futexes(),
             exiting_tid,
             super::activate_step30_scheduler_destination,
-            |exited| {
-                let wakes = super::runtime::with_linux_runtime(|state| {
-                    state.notify_wait_exit_transition_for_scheduler_thread(exited)
-                })
-                .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?
-                .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
-                let Some(wakes) = wakes else {
-                    return Ok(());
-                };
-                for target in wakes.iter() {
-                    let target_index = usize::from(target.cpu.0);
-                    if target_index == current_cpu {
-                        // SAFETY: Running->Exited is committed and scheduler table borrows are gone;
-                        // the cleanup owner window remains quiescent until successor selection.
-                        unsafe { scheduler.bootstrap_wake_local_exact(target) }
-                            .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
-                    } else {
-                        let target_scheduler = super::super::CPU_SCHEDULERS
-                            .get(target_index)
-                            .ok_or(kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
-                        super::remote_wake_with_reschedule(target_scheduler, target)
-                            .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
-                    }
-                }
-                Ok(())
-            },
+            |exited| notify_exit_transition(current_cpu, exited, retire_process_id),
             |target| {
                 let target_index = usize::from(target.cpu.0);
                 if target_index == current_cpu {
@@ -336,6 +273,46 @@ pub(super) fn handle_fatal_signal(signal: u8, core_dumped: bool) -> ! {
 
     let _ = dispatched;
     fatal_signal_fail_closed("KERNAL/ARM64: Step 30 fatal signal exit returned unexpectedly\n")
+}
+
+fn notify_exit_transition<E>(
+    current_cpu: usize,
+    exited: kernal_scheduler_smp::GlobalThreadId,
+    retire_process_id: Option<kernal_capability::ObjectId>,
+) -> Result<(), kernal_linux_clone_exit_aarch64::ExitError<E>> {
+    let scheduler = super::super::CPU_SCHEDULERS
+        .get(current_cpu)
+        .ok_or(kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
+    let wakes = super::runtime::with_linux_runtime(|state| {
+        state.notify_wait_exit_transition_for_scheduler_thread(exited)
+    })
+    .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?
+    .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
+    if let Some(wakes) = wakes {
+        for target in wakes.iter() {
+            let target_index = usize::from(target.cpu.0);
+            if target_index == current_cpu {
+                // SAFETY: Running->Exited is committed and scheduler table borrows are gone;
+                // the cleanup owner window remains quiescent until successor selection.
+                unsafe { scheduler.bootstrap_wake_local_exact(target) }
+                    .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
+            } else {
+                let target_scheduler = super::super::CPU_SCHEDULERS
+                    .get(target_index)
+                    .ok_or(kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
+                super::remote_wake_with_reschedule(target_scheduler, target)
+                    .map_err(kernal_linux_clone_exit_aarch64::ExitError::Scheduler)?;
+            }
+        }
+    }
+    #[cfg(feature = "step29-qemu-proof")]
+    if let Some(process_id) = retire_process_id {
+        super::step29_runtime::retire_on_process_exit(process_id)
+            .map_err(|_| kernal_linux_clone_exit_aarch64::ExitError::Invariant)?;
+    }
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    let _ = retire_process_id;
+    Ok(())
 }
 
 fn fatal_signal_fail_closed(message: &str) -> ! {

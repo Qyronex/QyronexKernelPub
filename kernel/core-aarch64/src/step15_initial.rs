@@ -8,7 +8,7 @@ use kernal_core_aarch64::{
 use kernal_protected_boot_aarch64::{ProtectedInitrd, RuntimeTablePool};
 use kernal_scheduler_cpu::CpuSchedulerCell;
 use kernal_scheduler_smp::GlobalThreadId;
-use kernal_user_elf_runtime_aarch64::LinuxProcessStart;
+use kernal_user_elf_runtime_aarch64::{LinuxProcessStart, aarch64_elf_interpreter_path};
 
 use super::{entropy, loader_frames, memory, runtime};
 
@@ -20,7 +20,7 @@ use super::{entropy, loader_frames, memory, runtime};
 /// Debian executable before allocation. Keep the production transaction fixed-capacity and
 /// fail-closed, but give the Debian proof a still-small 3 MiB ceiling. Exact required pages are
 /// computed and checked before the first frame is removed from the allocator.
-const INITIAL_FRAME_CAPACITY: usize = 768;
+const INITIAL_FRAME_CAPACITY: usize = 1024;
 const INITIAL_SEGMENTS: usize = 16;
 const STEP28_PROOF_IDLE: u8 = 0;
 const STEP28_ARCHIVE_SELECTED: u8 = 1;
@@ -64,6 +64,93 @@ pub unsafe fn load_and_publish<const SCHED_THREADS: usize, const WAKES: usize>(
     scheduler: &'static CpuSchedulerCell<SCHED_THREADS, WAKES>,
     priority: u8,
 ) -> Result<PublishedInitialLinuxLeader, Error> {
+    if cfg!(feature = "step31-debian-qemu") {
+        return initrd.with_bytes(|archive| {
+            let parsed = kernal_cpio::Archive::parse(archive).map_err(|_| Error::Initramfs)?;
+            let image_path: &[u8] = b"bin/dash";
+            let entry = parsed
+                .get(image_path)
+                .map_err(|_| Error::Initramfs)?
+                .ok_or(Error::Initramfs)?;
+            if !entry.is_regular_file() || entry.mode() & 0o111 == 0 {
+                return Err(Error::Initramfs);
+            }
+            initrd
+                .proof()
+                .parse_initramfs_aarch64_elf(archive, image_path)
+                .map_err(|_| Error::Initramfs)?;
+            let interpreter = match aarch64_elf_interpreter_path(entry.data()) {
+                Ok(Some(interp_path)) => {
+                    let rel_path = interp_path.strip_prefix(b"/").unwrap_or(interp_path);
+                    let interp_entry = parsed
+                        .get(rel_path)
+                        .map_err(|_| Error::Initramfs)?
+                        .ok_or(Error::Initramfs)?;
+                    if !interp_entry.is_regular_file() {
+                        return Err(Error::Initramfs);
+                    }
+                    initrd
+                        .proof()
+                        .parse_initramfs_aarch64_elf(archive, rel_path)
+                        .map_err(|_| Error::Initramfs)?;
+                    Some(interp_entry.data())
+                }
+                Ok(None) => None,
+                Err(_) => return Err(Error::Initramfs),
+            };
+            STEP28_PROOF_STATE
+                .compare_exchange(
+                    STEP28_PROOF_IDLE,
+                    STEP28_ARCHIVE_SELECTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| Error::Initramfs)?;
+
+            let argv0: &[u8] = b"/bin/dash";
+            let mut argv_tail: [&[u8]; 1] = [b"-i"];
+            if !cfg!(feature = "step31-debian-shell")
+                && let Ok(Some(script)) = parsed.get(b"etc/kernal-init")
+                && script.is_regular_file()
+            {
+                argv_tail[0] = b"/etc/kernal-init";
+            }
+            let envp: [&[u8]; 4] = [
+                b"PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+                b"HOME=/root",
+                b"TERM=vt100",
+                b"PS1=debian13# ",
+            ];
+            let random = entropy::take_at_random().map_err(Error::Entropy)?;
+            let mut start = LinuxProcessStart::new(argv0, random);
+            start.argv_tail = &argv_tail;
+            start.envp = &envp;
+
+            // SAFETY: selected image & optional interpreter borrows remain scoped to `with_bytes`;
+            // caller holds the synchronous loader/backend/scheduler mutation window.
+            let leader = unsafe {
+                load_and_publish_image_with_start(
+                    b"/bin/dash",
+                    entry.data(),
+                    interpreter,
+                    start,
+                    backend,
+                    scheduler,
+                    priority,
+                )
+            }?;
+            STEP28_PROOF_STATE
+                .compare_exchange(
+                    STEP28_ARCHIVE_SELECTED,
+                    STEP28_LEADER_LOADED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map_err(|_| Error::Initramfs)?;
+            Ok(leader)
+        });
+    }
+
     if cfg!(feature = "step28-qemu-proof") {
         return initrd.with_bytes(|archive| {
             let parsed = kernal_cpio::Archive::parse(archive).map_err(|_| Error::Initramfs)?;
@@ -161,7 +248,23 @@ pub unsafe fn load_and_publish_image<const SCHED_THREADS: usize, const WAKES: us
 ) -> Result<PublishedInitialLinuxLeader, Error> {
     let random = entropy::take_at_random().map_err(Error::Entropy)?;
     let start = LinuxProcessStart::new(argv0, random);
+    // SAFETY: delegated directly to the shared initial-image loader with `interpreter: None`.
+    unsafe {
+        load_and_publish_image_with_start(argv0, image, None, start, backend, scheduler, priority)
+    }
+}
 
+unsafe fn load_and_publish_image_with_start<const SCHED_THREADS: usize, const WAKES: usize>(
+    exe_path: &[u8],
+    image: &[u8],
+    interpreter: Option<&[u8]>,
+    start: LinuxProcessStart<'_>,
+    backend: &mut RuntimeTablePool,
+    scheduler: &'static CpuSchedulerCell<SCHED_THREADS, WAKES>,
+    priority: u8,
+) -> Result<PublishedInitialLinuxLeader, Error> {
+    let initial_argv0 = start.argv0;
+    let initial_argv_tail = start.argv_tail;
     let loaded = runtime::with_linux_runtime(|state| {
         let (process, objects, space) = state.loader_parts();
         memory::with_live_frame_pool(|pool| {
@@ -169,14 +272,23 @@ pub unsafe fn load_and_publish_image<const SCHED_THREADS: usize, const WAKES: us
             // mutation window. The nested frame-pool/runtime borrows are synchronous and cannot
             // escape this closure or survive a scheduler switch.
             unsafe {
-                loader_frames::load_initial_linux_elf_with_core_frames::<
+                loader_frames::load_initial_linux_elf_with_optional_interpreter_with_core_frames::<
                     INITIAL_FRAME_CAPACITY,
                     INITIAL_SEGMENTS,
                     { runtime::STEP15_RUNTIME_CAPS },
                     { runtime::STEP15_RUNTIME_OBJECTS },
                     { runtime::STEP15_RUNTIME_VMAS },
                     RuntimeTablePool,
-                >(image, start, pool, process, objects, space, backend)
+                >(
+                    image,
+                    interpreter,
+                    start,
+                    pool,
+                    process,
+                    objects,
+                    space,
+                    backend,
+                )
             }
         })
     });
@@ -226,6 +338,7 @@ pub unsafe fn load_and_publish_image<const SCHED_THREADS: usize, const WAKES: us
         state
             .bind_initial_signal_thread(GlobalThreadId::new(owner, leader.scheduler_thread()))
             .map_err(Error::Runtime)?;
+        state.set_initial_process_metadata(exe_path, initial_argv0, initial_argv_tail);
         Ok(leader)
     })
     .map_err(Error::Runtime)?

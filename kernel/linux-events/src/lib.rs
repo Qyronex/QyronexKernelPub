@@ -369,6 +369,15 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         Ok(count)
     }
 
+    /// Returns the Linux `POLL*`/`EPOLL*` readiness bitmask for an event/timer/signal/inotify/memfd/pidfd slot.
+    pub fn poll_readiness(&self, idx: usize) -> Result<u32, Errno> {
+        let slot = self.slots.get(idx).ok_or(Errno::EBADF)?;
+        if matches!(slot, EventObject::Empty) {
+            return Err(Errno::EBADF);
+        }
+        Ok(self.internal_readiness(idx))
+    }
+
     fn internal_readiness(&self, idx: usize) -> u32 {
         match self.slots.get(idx) {
             Some(EventObject::EventFd { counter, .. }) => {
@@ -1025,5 +1034,20 @@ mod tests {
         let mut read_back = [0u8; 16];
         let r = table.read(mfd, &mut read_back).unwrap();
         assert_eq!(&read_back[..r], b"ACTIVE=1\n");
+    }
+
+    #[test]
+    fn poll_readiness_reflects_event_timer_memfd_and_closed_slots() {
+        let mut table = EventTable::<8, 64>::new();
+        let efd = table.eventfd2(0, 0).unwrap();
+        assert_eq!(table.poll_readiness(efd), Ok(EPOLLOUT));
+        table.write(efd, &1u64.to_le_bytes()).unwrap();
+        assert_eq!(table.poll_readiness(efd), Ok(EPOLLIN | EPOLLOUT));
+
+        let mfd = table.memfd_create(b"x", 0).unwrap();
+        assert_eq!(table.poll_readiness(mfd), Ok(EPOLLIN | EPOLLOUT));
+
+        table.close(efd).unwrap();
+        assert_eq!(table.poll_readiness(efd), Err(Errno::EBADF));
     }
 }

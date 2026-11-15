@@ -502,3 +502,41 @@ pub use initial_leader::{
     InitialLeaderPublishError, PublishedInitialLinuxLeader,
     publish_initial_linux_leader_with_core_stack,
 };
+
+#[cfg(not(test))]
+mod heap_support {
+    use kernal_heap::{HeapError, HeapStats, LockedArenaHeap};
+
+    #[global_allocator]
+    static KERNEL_HEAP: LockedArenaHeap = LockedArenaHeap::empty();
+
+    /// Initializes the bare-metal global kernel heap once over `[start, end)`.
+    ///
+    /// # Safety
+    ///
+    /// `start` and `end` must delimit a mapped, zeroed, exclusively owned RW linker BSS region
+    /// matching the currently active address space (TTBR1 high-half or pre-MMU physical).
+    pub unsafe fn init_kernel_heap(start: *mut u8, end: *mut u8) -> Result<HeapStats, HeapError> {
+        let start_addr = start as usize;
+        let end_addr = end as usize;
+        if end_addr <= start_addr {
+            return Err(HeapError::InvalidRange);
+        }
+        let len = end_addr - start_addr;
+        // SAFETY: forwarded to `LockedArenaHeap::init_range` under the caller's guarantees.
+        unsafe { KERNEL_HEAP.init_range(start, len)? };
+        Ok(KERNEL_HEAP.stats())
+    }
+
+    pub fn kernel_heap_stats() -> HeapStats {
+        KERNEL_HEAP.stats()
+    }
+}
+
+#[cfg(not(test))]
+pub use heap_support::{init_kernel_heap, kernel_heap_stats};
+
+#[cfg(test)]
+pub fn kernel_heap_stats() -> kernal_heap::HeapStats {
+    kernal_heap::HeapStats::default()
+}

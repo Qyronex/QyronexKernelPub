@@ -17,10 +17,25 @@ pub const MAP_FIXED: u64 = 0x10;
 pub const MAP_DENYWRITE: u64 = 0x0800;
 /// Linux `MAP_EXECUTABLE` flag (`0x1000`, ignored per Linux UAPI, passed by `ld.so`).
 pub const MAP_EXECUTABLE: u64 = 0x1000;
+/// Linux `MAP_NORESERVE` flag (`0x4000`, ignored on eager-backing mappings).
+pub const MAP_NORESERVE: u64 = 0x4000;
+/// Linux `MAP_POPULATE` flag (`0x8000`, satisfied by eager page population).
+pub const MAP_POPULATE: u64 = 0x8000;
+/// Linux `MAP_NONBLOCK` flag (`0x10000`, ignored together with `MAP_POPULATE`).
+pub const MAP_NONBLOCK: u64 = 0x10000;
+/// Linux `MAP_STACK` flag (`0x20000`, advisory stack mapping hint passed by `glibc` `pthread_create`).
+pub const MAP_STACK: u64 = 0x20000;
 
-/// Complete mask of `mmap(2)` flags accepted by the Step-31 dynamic linker VM owner.
-pub const STEP31_ALLOWED_MMAP_FLAGS: u64 =
-    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_DENYWRITE | MAP_EXECUTABLE;
+/// Complete mask of `mmap(2)` flags accepted by the Step-31 dynamic linker and libc VM owner.
+pub const STEP31_ALLOWED_MMAP_FLAGS: u64 = MAP_PRIVATE
+    | MAP_ANONYMOUS
+    | MAP_FIXED
+    | MAP_DENYWRITE
+    | MAP_EXECUTABLE
+    | MAP_NORESERVE
+    | MAP_POPULATE
+    | MAP_NONBLOCK
+    | MAP_STACK;
 
 /// Extension of [`PageBackend`] that can populate a freshly allocated physical frame with file
 /// bytes before exposing the mapping to userspace.
@@ -146,12 +161,20 @@ pub fn mmap_step31_dynamic<const TX_PAGES: usize, B: DynamicPageBackend>(
     };
     validate_page_range(start, len)?;
 
-    let mut displaced_frames = [None; TX_PAGES];
+    let mut had_displaced = false;
     if spec.fixed {
-        for (page, slot) in displaced_frames.iter_mut().enumerate().take(pages) {
+        for page in 0..pages {
             let va = start + page as u64 * PAGE_SIZE;
             match backend.unmap_page(va) {
-                Ok(frame) => *slot = Some(frame),
+                Ok(frame) => {
+                    if core::num::NonZeroU64::new(frame).is_none()
+                        || backend.free_page(frame).is_err()
+                    {
+                        backend.poison();
+                        return Err(Error::BackendInvariant);
+                    }
+                    had_displaced = true;
+                }
                 Err(BackendFailure::NotMapped) => {}
                 Err(_) => {
                     backend.poison();
@@ -192,30 +215,22 @@ pub fn mmap_step31_dynamic<const TX_PAGES: usize, B: DynamicPageBackend>(
         let frame = match alloc_result {
             Ok(frame) => frame,
             Err(BackendFailure::NoMemory) => {
-                rollback_dynamic_mmap(backend, start, page, &displaced_frames[..pages]);
+                rollback_dynamic_mmap(backend, start, page, had_displaced);
                 return Err(no_memory_error());
             }
             Err(_) => {
-                rollback_dynamic_mmap(backend, start, page, &displaced_frames[..pages]);
+                rollback_dynamic_mmap(backend, start, page, had_displaced);
                 return Err(Error::BackendInvariant);
             }
         };
 
         if let Err(err) = backend.map_page(va, frame, spec.perms) {
             let _ = backend.free_page(frame);
-            rollback_dynamic_mmap(backend, start, page, &displaced_frames[..pages]);
+            rollback_dynamic_mmap(backend, start, page, had_displaced);
             return match err {
                 BackendFailure::NoMemory => Err(no_memory_error()),
                 _ => Err(Error::BackendInvariant),
             };
-        }
-    }
-
-    // Commit: reclaim any frames displaced by MAP_FIXED.
-    for displaced in displaced_frames.into_iter().take(pages).flatten() {
-        if backend.free_page(displaced).is_err() {
-            backend.poison();
-            return Err(Error::BackendInvariant);
         }
     }
 
@@ -231,6 +246,9 @@ pub fn mprotect_step31<const TX_PAGES: usize, B: PageBackend>(
     backend: &mut B,
 ) -> Result<(), Error> {
     let perms = parse_step31_perms(protection)?;
+    if length == 0 {
+        return validate_page_range(address, PAGE_SIZE);
+    }
     let len = page_rounded_length(length).ok_or(Error::Linux(Errno::EINVAL))?;
     validate_page_range(address, len)?;
     let pages = usize::try_from(len / PAGE_SIZE).map_err(|_| no_memory_error())?;
@@ -278,7 +296,7 @@ fn rollback_dynamic_mmap<B: PageBackend>(
     backend: &mut B,
     start: u64,
     mapped_new: usize,
-    displaced_frames: &[Option<u64>],
+    had_displaced: bool,
 ) {
     let mut complete = true;
     for page in (0..mapped_new).rev() {
@@ -292,7 +310,7 @@ fn rollback_dynamic_mmap<B: PageBackend>(
             Err(_) => complete = false,
         }
     }
-    if displaced_frames.iter().any(Option::is_some) {
+    if had_displaced {
         // Displaced frames may have had heterogeneous original permissions; quarantine if a
         // MAP_FIXED replacement fails mid-transaction.
         complete = false;
@@ -511,5 +529,43 @@ mod tests {
             Err(Error::Linux(Errno::EINVAL))
         );
         assert!(!backend.poisoned);
+    }
+
+    #[test]
+    fn dynamic_mmap_admits_advisory_stack_noreserve_and_populate_flags() {
+        let mut backend = TestDynamicBackend::new();
+        let stack_guard = mmap_step31_dynamic::<16, _>(
+            0,
+            2 * PAGE_SIZE,
+            PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK,
+            u64::MAX,
+            0,
+            MmapFileBacking::Anonymous,
+            &mut backend,
+        )
+        .unwrap();
+        assert_eq!(backend.page_at(stack_guard).unwrap().0, VmPerms::NONE);
+        mprotect_step31::<16, _>(
+            stack_guard + PAGE_SIZE,
+            PAGE_SIZE,
+            PROT_READ | PROT_WRITE,
+            &mut backend,
+        )
+        .unwrap();
+        assert_eq!(
+            backend.page_at(stack_guard + PAGE_SIZE).unwrap().0,
+            VmPerms::READ.union(VmPerms::WRITE)
+        );
+
+        let hint_spec = validate_step31_mmap_spec(
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK,
+            u64::MAX,
+            0,
+        )
+        .unwrap();
+        assert!(hint_spec.anonymous);
+        assert!(!hint_spec.fixed);
     }
 }

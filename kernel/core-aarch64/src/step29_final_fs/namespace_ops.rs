@@ -465,16 +465,32 @@ fn readlinkat(
     raw_buffer_size: u64,
 ) -> Result<u64, Error> {
     let path = super::super::copy_user_path(user_path)?;
+    readlinkat_bytes(
+        process,
+        raw_dirfd,
+        path.as_bytes(),
+        user_buffer,
+        raw_buffer_size,
+    )
+}
+
+pub(super) fn readlinkat_bytes(
+    process: kernal_capability::ObjectId,
+    raw_dirfd: u64,
+    path: &[u8],
+    user_buffer: u64,
+    raw_buffer_size: u64,
+) -> Result<u64, Error> {
     let capacity = core::cmp::min(
         usize::try_from(raw_buffer_size).unwrap_or(usize::MAX),
         LINUX_PATH_MAX,
     );
     super::super::super::step29_runtime::with_process(process, |runtime| {
-        let base = base_for_path(runtime, raw_dirfd, path.as_bytes())?;
+        let base = base_for_path(runtime, raw_dirfd, path)?;
         let mut output = [0u8; LINUX_PATH_MAX];
         let copied = runtime
             .overlay()
-            .readlink_from(base, path.as_bytes(), &mut output[..capacity])
+            .readlink_from(base, path, &mut output[..capacity])
             .map_err(map_overlay_error)?;
         if copied != 0 {
             kernal_usercopy_aarch64::copy_to_user(user_buffer, &output[..copied])
@@ -496,11 +512,19 @@ fn faccessat(
         return Err(Error::Linux(Errno::EINVAL));
     }
     let path = super::super::copy_user_path(user_path)?;
+    faccessat_bytes(process, raw_dirfd, path.as_bytes())
+}
+
+pub(super) fn faccessat_bytes(
+    process: kernal_capability::ObjectId,
+    raw_dirfd: u64,
+    path: &[u8],
+) -> Result<u64, Error> {
     super::super::super::step29_runtime::with_process(process, |runtime| {
-        let base = base_for_path(runtime, raw_dirfd, path.as_bytes())?;
+        let base = base_for_path(runtime, raw_dirfd, path)?;
         let logical = runtime
             .overlay()
-            .resolve_following_from(base, path.as_bytes())
+            .resolve_following_from(base, path)
             .map_err(map_overlay_error)?;
         runtime
             .overlay()

@@ -681,6 +681,7 @@ impl Step15LinuxRuntime {
             .take()
             .ok_or(Error::InvalidState)?;
         debug_assert_eq!(removed.process.id(), process_id);
+        self.clear_process_meta(process_id);
         Ok(wakes)
     }
 

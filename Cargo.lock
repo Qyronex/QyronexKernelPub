@@ -218,6 +218,7 @@ dependencies = [
  "kernal-fdt-aarch64",
  "kernal-frame-allocator",
  "kernal-gicv3-aarch64",
+ "kernal-heap",
  "kernal-kmap-aarch64",
  "kernal-linux-aarch64-abi",
  "kernal-linux-abi",
@@ -361,6 +362,10 @@ dependencies = [
 
 [[package]]
 name = "kernal-handoff"
+version = "0.1.0"
+
+[[package]]
+name = "kernal-heap"
 version = "0.1.0"
 
 [[package]]

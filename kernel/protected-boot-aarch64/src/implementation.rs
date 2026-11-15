@@ -309,6 +309,8 @@ unsafe extern "C" {
     static __text_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    static __rela_dyn_start: u8;
+    static __rela_dyn_end: u8;
     static __data_start: u8;
     static __data_end: u8;
     static __bss_start: u8;
@@ -347,6 +349,11 @@ pub extern "C" fn kernal_aarch64_protected_boot(dtb_physical: u64) -> ! {
     let layout = linker_layout()
         .and_then(BootstrapLayout::validate)
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected linker layout rejected\n"));
+    // SAFETY: MMU is still disabled, secondary PEs have not started, and `.rodata` has not yet been
+    // write-protected; rebasing R_AARCH64_RELATIVE entries now makes all `.rodata` pointers valid in
+    // the TTBR1 high-alias execution regime after TTBR0 is retired.
+    unsafe { relocate_rodata_high_aliases(&layout) }
+        .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected high relocation failed\n"));
     let physical_mmio = [serial_region, gic.distributor, gic.redistributor];
     let aliases = plan_mmio_aliases(layout, &physical_mmio)
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected MMIO alias plan failed\n"));
@@ -758,6 +765,53 @@ fn linker_layout() -> Result<BootstrapLayout, mmu::Error> {
             symbol_address(core::ptr::addr_of!(__boot_page_tables_end)),
         ),
     })
+}
+
+/// Rewrites `R_AARCH64_RELATIVE` entries in `.rela.dyn` from physical link addresses into
+/// canonical `TTBR1` high-alias addresses before MMU/W^X protection locks `.rodata` read-only.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+unsafe fn relocate_rodata_high_aliases(layout: &BootstrapLayout) -> Result<(), ()> {
+    const R_AARCH64_RELATIVE: u64 = 1027;
+    const RELA_ENTRY_SIZE: u64 = 24;
+
+    let start = symbol_address(core::ptr::addr_of!(__rela_dyn_start));
+    let end = symbol_address(core::ptr::addr_of!(__rela_dyn_end));
+    if end < start || (end - start) % RELA_ENTRY_SIZE != 0 {
+        return Err(());
+    }
+
+    let mut cursor = start;
+    while cursor < end {
+        // SAFETY: `[start, end)` is the linker-delimited `.rela.dyn` array in readable RAM before
+        // `.rodata` write protection; `cursor` advances by 24 bytes within bounds.
+        let (r_offset, r_info, r_addend) = unsafe {
+            (
+                read_volatile(cursor as *const u64),
+                read_volatile((cursor + 8) as *const u64),
+                read_volatile((cursor + 16) as *const i64),
+            )
+        };
+        if (r_info & 0xffff_ffff) != R_AARCH64_RELATIVE || (r_offset & 7) != 0 {
+            return Err(());
+        }
+        let slot_end = r_offset.checked_add(8).ok_or(())?;
+        let in_rodata = layout.rodata.start <= r_offset && slot_end <= layout.rodata.end;
+        let in_data = layout.data.start <= r_offset && slot_end <= layout.data.end;
+        let overlaps_rela = slot_end > start && r_offset < end;
+        if (!in_rodata && !in_data) || overlaps_rela {
+            return Err(());
+        }
+        let target = u64::try_from(r_addend).map_err(|_| ())?;
+        if target < layout.kernel_phys_base || target >= layout.bss.end {
+            return Err(());
+        }
+        let high = layout.high_alias(target).map_err(|_| ())?;
+        // SAFETY: `r_offset` is 8-byte aligned inside `.rodata`/`.data` before MMU activation and
+        // never overlaps `.text` or the active `.rela.dyn` table.
+        unsafe { write_volatile(r_offset as *mut u64, high) };
+        cursor += RELA_ENTRY_SIZE;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]

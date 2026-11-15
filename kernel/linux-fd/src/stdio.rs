@@ -34,10 +34,18 @@ pub(super) enum RetainedReadOnlyBacking {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubsystemHandle {
+    pub kind: u8,
+    pub slot: u16,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ExternalBacking {
     Stdio(ExternalObject),
     RetainedReadOnly(RetainedReadOnlyBacking),
     WritableRegular(RetainedRegularHandle),
+    Subsystem(SubsystemHandle),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +54,7 @@ pub enum OpenObjectKind {
     Directory,
     Pipe,
     External(ExternalObject),
+    Subsystem(SubsystemHandle),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -417,7 +426,8 @@ impl<const N: usize> FdTable<N> {
             | OpenObject::External(ExternalBacking::RetainedReadOnly(
                 RetainedReadOnlyBacking::Directory(_),
             ))
-            | OpenObject::External(ExternalBacking::Stdio(_)) => Err(Error::NotFile),
+            | OpenObject::External(ExternalBacking::Stdio(_))
+            | OpenObject::External(ExternalBacking::Subsystem(_)) => Err(Error::NotFile),
         }
     }
 
@@ -694,7 +704,117 @@ impl<const N: usize> FdTable<N> {
             OpenObject::External(ExternalBacking::Stdio(external)) => {
                 OpenObjectKind::External(external)
             }
+            OpenObject::External(ExternalBacking::Subsystem(handle)) => {
+                OpenObjectKind::Subsystem(handle)
+            }
         })
+    }
+
+    /// Updates mutable file status flags (`O_APPEND | O_NONBLOCK`) on a live OFD (`fcntl(F_SETFL)`).
+    pub fn set_status_flags(&mut self, fd: i32, flags: u64) -> Result<(), Error> {
+        let open_file = self.descriptor(fd)?.open_file;
+        let state = self.open_file_state_mut(open_file)?;
+        state.status_flags =
+            (state.status_flags & !MUTABLE_STATUS_FLAGS) | (flags & MUTABLE_STATUS_FLAGS);
+        Ok(())
+    }
+
+    /// Allocates the lowest free descriptor `>= minimum_fd` backed by an external subsystem handle.
+    pub fn open_subsystem_from(
+        &mut self,
+        minimum_fd: i32,
+        handle: SubsystemHandle,
+        close_on_exec: bool,
+        status_flags: u64,
+    ) -> Result<FdToken, Error> {
+        let start = usize::try_from(minimum_fd).map_err(|_| Error::InvalidMinimumFd)?;
+        if start >= N {
+            return Err(Error::InvalidMinimumFd);
+        }
+        self.open_object_from(
+            start,
+            OpenObject::External(ExternalBacking::Subsystem(handle)),
+            close_on_exec,
+            status_flags,
+        )
+    }
+
+    /// Atomically binds `target_fd` (`0..N`) to an external subsystem handle, releasing any prior
+    /// object only when its final OFD reference drops (`dup2`/`dup3` cross-domain target).
+    pub fn bind_subsystem_exact<E, F>(
+        &mut self,
+        target_fd: i32,
+        handle: SubsystemHandle,
+        close_on_exec: bool,
+        status_flags: u64,
+        release: F,
+    ) -> Result<Result<FdToken, E>, Error>
+    where
+        F: FnOnce(ReleasedObject) -> Result<(), E>,
+    {
+        let target_index = self
+            .descriptor_slot_index(target_fd)
+            .map_err(|_| Error::InvalidTargetFd)?;
+        let slot = self.descriptors[target_index];
+        if slot.retired {
+            return Err(Error::TableFull);
+        }
+        let target_generation = next_descriptor_generation(
+            slot.generation,
+            self.descriptor_generation_origin,
+            self.descriptor_generation_stride,
+        )
+        .ok_or(Error::TableFull)?;
+
+        let close_plan = if slot.state.is_some() {
+            let plan = self.prepare_close(target_fd)?;
+            if plan.expected_refs > 1 {
+                self.open_file_candidate()?;
+            }
+            Some(plan)
+        } else {
+            self.open_file_candidate()?;
+            None
+        };
+
+        if let Some(plan) = close_plan {
+            if let Some(released) = plan.release
+                && let Err(err) = release(released)
+            {
+                return Ok(Err(err));
+            }
+            self.commit_close(plan)?;
+        }
+
+        let (open_file_index, open_file_generation) = self.open_file_candidate()?;
+        let open_file = OpenFileId {
+            index: open_file_index,
+            generation: open_file_generation,
+        };
+        self.open_files[open_file_index].generation = open_file_generation;
+        self.open_files[open_file_index].refs = 1;
+        self.open_files[open_file_index].state = Some(OpenState {
+            object: OpenObject::External(ExternalBacking::Subsystem(handle)),
+            offset: 0,
+            status_flags,
+        });
+        self.descriptors[target_index].generation = target_generation;
+        self.descriptors[target_index].state = Some(DescriptorState {
+            open_file,
+            close_on_exec,
+        });
+        Ok(Ok(FdToken {
+            fd: target_fd,
+            generation: target_generation,
+        }))
+    }
+
+    /// Returns the aliased [`SubsystemHandle`] when `fd` names an aliased external subsystem FD.
+    pub fn subsystem_handle(&self, fd: i32) -> Result<Option<SubsystemHandle>, Error> {
+        match self.object_kind(fd)? {
+            OpenObjectKind::Subsystem(handle) => Ok(Some(handle)),
+            _ => Ok(None),
+        }
     }
 
     fn standard_open_file_candidates(&self) -> Result<[(usize, u64); 3], Error> {

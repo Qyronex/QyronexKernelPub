@@ -195,16 +195,22 @@ fn newfstatat(
     flags: u32,
 ) -> Result<u64, Error> {
     let path = super::super::copy_user_path(user_path)?;
+    newfstatat_bytes(process, raw_dirfd, path.as_bytes(), user_stat, flags)
+}
+
+pub(super) fn newfstatat_bytes(
+    process: kernal_capability::ObjectId,
+    raw_dirfd: u64,
+    path: &[u8],
+    user_stat: u64,
+    flags: u32,
+) -> Result<u64, Error> {
     super::super::super::step29_runtime::with_process(process, |runtime| {
-        let base = base_for_path(runtime, raw_dirfd, path.as_bytes())?;
+        let base = base_for_path(runtime, raw_dirfd, path)?;
         let logical = if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            runtime
-                .overlay()
-                .resolve_nofollow_from(base, path.as_bytes())
+            runtime.overlay().resolve_nofollow_from(base, path)
         } else {
-            runtime
-                .overlay()
-                .resolve_following_from(base, path.as_bytes())
+            runtime.overlay().resolve_following_from(base, path)
         }
         .map_err(map_overlay_error)?;
         let metadata = runtime
@@ -388,17 +394,30 @@ fn statx(
     raw_mask: u64,
     user_statx: u64,
 ) -> Result<u64, Error> {
-    if linux_unsigned_int(raw_flags) & !STATX_SUPPORTED_FLAGS != 0 {
+    let flags = linux_unsigned_int(raw_flags);
+    if flags & !STATX_SUPPORTED_FLAGS != 0 {
         return Err(Error::Linux(Errno::EINVAL));
     }
     let _requested_mask = linux_unsigned_int(raw_mask);
     let path = super::super::copy_user_path(user_path)?;
+    statx_bytes(process, raw_dirfd, path.as_bytes(), flags, user_statx)
+}
+
+pub(super) fn statx_bytes(
+    process: kernal_capability::ObjectId,
+    raw_dirfd: u64,
+    path: &[u8],
+    flags: u32,
+    user_statx: u64,
+) -> Result<u64, Error> {
     super::super::super::step29_runtime::with_process(process, |runtime| {
-        let base = base_for_path(runtime, raw_dirfd, path.as_bytes())?;
-        let logical = runtime
-            .overlay()
-            .resolve_following_from(base, path.as_bytes())
-            .map_err(map_overlay_error)?;
+        let base = base_for_path(runtime, raw_dirfd, path)?;
+        let logical = if flags & AT_SYMLINK_NOFOLLOW != 0 {
+            runtime.overlay().resolve_nofollow_from(base, path)
+        } else {
+            runtime.overlay().resolve_following_from(base, path)
+        }
+        .map_err(map_overlay_error)?;
         let metadata = runtime
             .overlay()
             .metadata(logical)

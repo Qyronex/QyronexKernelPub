@@ -420,6 +420,49 @@ pub unsafe fn handle_step31_dynamic_mmap<
     )
 }
 
+/// Executes one Step-31 `mprotect(2)` transaction (`PROT_NONE`, `PROT_READ`, `PROT_READ |
+/// PROT_WRITE`, `PROT_READ | PROT_EXEC`, `PROT_EXEC`) for the current process while rejecting W+X.
+///
+/// # Safety
+/// Same exclusive hierarchy-mutation and quiescence contract as [`handle_current`].
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn handle_step31_mprotect<
+    const TX_PAGES: usize,
+    const CAPS: usize,
+    const OBJECTS: usize,
+    const VMAS: usize,
+    const RESERVED: usize,
+    const EXTENTS: usize,
+    B: Backend,
+    Z: AnonymousPageZeroer<B>,
+>(
+    process: &Process<CAPS>,
+    objects: &ObjectTable<OBJECTS>,
+    space: &mut BoundProcessAddressSpace<VMAS>,
+    page_tables: &mut B,
+    reserved: &ReservationSet<RESERVED>,
+    frames: &mut ExtentAllocator<EXTENTS>,
+    zeroer: &mut Z,
+    address: u64,
+    length: u64,
+    protection: u64,
+) -> Result<(), Error> {
+    // SAFETY: delegated caller contract establishes the exclusive hierarchy owner window for the
+    // exact backend/zeroer pair for the full lifetime of the transaction adapter.
+    let mut backend = unsafe {
+        Aarch64VmBackend::new(
+            process,
+            objects,
+            space,
+            page_tables,
+            reserved,
+            frames,
+            zeroer,
+        )
+    };
+    kernal_linux_vm::mprotect_step31::<TX_PAGES, _>(address, length, protection, &mut backend)
+}
+
 /// Executes one canonical Step-15 VM call for the current process through the existing AArch64
 /// address-space, frame and anonymous-page-zeroing owners.
 ///

@@ -11,7 +11,7 @@ use kernal_linux_bootstrap::OutputFd;
 use kernal_linux_fd::{
     Error as FdError, ExternalObject, OpenObjectKind, ReleasedObject, SeekWhence,
 };
-use kernal_linux_pipe::{Error as PipeError, PipeId};
+use kernal_linux_pipe::{End as PipeEnd, Error as PipeError, PipeId};
 use kernal_linux_vfs::{Error as VfsError, InitramfsRoot};
 use kernal_usercopy::{Error as UsercopyError, MAX_USERCOPY_BYTES};
 
@@ -24,6 +24,7 @@ const F_DUPFD: u32 = 0;
 const F_GETFD: u32 = 1;
 const F_SETFD: u32 = 2;
 const F_GETFL: u32 = 3;
+const F_SETFL: u32 = 4;
 const F_DUPFD_CLOEXEC: u32 = 1030;
 const FD_CLOEXEC: i32 = 1;
 const SEEK_SET: u32 = 0;
@@ -36,47 +37,75 @@ enum Error {
     Invariant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum HandleOutcome {
+    NotHandled,
+    Handled,
+    SignalFrameCommitted,
+}
+
 enum WriteOutcome {
     Returned {
         value: u64,
         wake_pipe: Option<PipeId>,
     },
     External(OutputFd),
+    BlockingWaitRequired,
 }
 
 /// Routes the Step-29 descriptor-I/O extension backed by the accepted FD/OFD and pipe owners.
-pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Result<bool, ()> {
+pub(super) fn handle(
+    request: SyscallRequest,
+    frame: &mut ExceptionFrame,
+) -> Result<HandleOutcome, ()> {
     // write(2) must be intercepted before the legacy Step-15 numeric fd==1/2 fallback. The
     // canonical FD/OFD object decides whether this is a pipe, an inherited External stream, or an
     // invalid write target, so dup/dup3 aliases never gain or lose authority based on their number.
     if request.number == 64 {
         let process = current_process().map_err(|_| ())?;
-        match write(process, frame.x[0], frame.x[1], frame.x[2]) {
-            Ok(WriteOutcome::Returned { value, wake_pipe }) => {
-                // `write()` has returned, so its Step29 Runtime/FD/Pipe borrow is fully released.
-                // Only now may normal pipe readiness route an exact scheduler wake.
-                if let Some(pipe) = wake_pipe {
-                    super::futex::pipe_blocking::notify_after_write(pipe)?;
+        loop {
+            match write(process, frame.x[0], frame.x[1], frame.x[2]) {
+                Ok(WriteOutcome::Returned { value, wake_pipe }) => {
+                    // `write()` has returned, so its Step29 Runtime/FD/Pipe borrow is fully released.
+                    // Only now may normal pipe readiness route an exact scheduler wake.
+                    if let Some(pipe) = wake_pipe {
+                        super::futex::pipe_blocking::notify_after_write(pipe)?;
+                    }
+                    frame.x[0] = SyscallReturn::success(value as i64)
+                        .ok_or(())?
+                        .as_u64_bits();
+                    return Ok(HandleOutcome::Handled);
                 }
-                frame.x[0] = SyscallReturn::success(value as i64)
-                    .ok_or(())?
-                    .as_u64_bits();
-                return Ok(true);
+                Ok(WriteOutcome::External(output)) => {
+                    super::write::handle_bound_output(frame, output)?;
+                    return Ok(HandleOutcome::Handled);
+                }
+                Ok(WriteOutcome::BlockingWaitRequired) => {
+                    match super::futex::pipe_blocking::block_write(
+                        process, frame.x[0], frame.x[2], frame,
+                    )
+                    .map_err(|_| ())?
+                    {
+                        super::futex::pipe_blocking::BlockingWriteOutcome::Retry => continue,
+                        super::futex::pipe_blocking::BlockingWriteOutcome::Restarted => {
+                            return Ok(HandleOutcome::Handled);
+                        }
+                        super::futex::pipe_blocking::BlockingWriteOutcome::SignalFrameCommitted => {
+                            return Ok(HandleOutcome::SignalFrameCommitted);
+                        }
+                    }
+                }
+                Err(Error::Linux(errno)) => {
+                    frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
+                    return Ok(HandleOutcome::Handled);
+                }
+                Err(Error::Invariant) => return Err(()),
             }
-            Ok(WriteOutcome::External(output)) => {
-                super::write::handle_bound_output(frame, output)?;
-                return Ok(true);
-            }
-            Err(Error::Linux(errno)) => {
-                frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
-                return Ok(true);
-            }
-            Err(Error::Invariant) => return Err(()),
         }
     }
 
     let Some(call) = classify_fd_io(request) else {
-        return Ok(false);
+        return Ok(HandleOutcome::NotHandled);
     };
 
     let process = current_process().map_err(|_| ())?;
@@ -103,11 +132,11 @@ pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Res
             frame.x[0] = SyscallReturn::success(value as i64)
                 .ok_or(())?
                 .as_u64_bits();
-            Ok(true)
+            Ok(HandleOutcome::Handled)
         }
         Err(Error::Linux(errno)) => {
             frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
-            Ok(true)
+            Ok(HandleOutcome::Handled)
         }
         Err(Error::Invariant) => Err(()),
     }
@@ -153,13 +182,18 @@ fn write(
                 // endpoint from the same generation-safe descriptor is an internal invariant.
                 let endpoint = fds.pipe_endpoint(fd).map_err(|_| Error::Invariant)?;
                 let nonblocking = status & u64::from(O_NONBLOCK) != 0;
-                let written =
-                    super::step29_pipe_io::write(pipes, endpoint, user_buffer, count, nonblocking)
-                        .map_err(map_pipe_io_error)?;
-                Ok(WriteOutcome::Returned {
-                    value: written,
-                    wake_pipe: (written != 0).then_some(endpoint.pipe()),
-                })
+                match super::step29_pipe_io::write(pipes, endpoint, user_buffer, count, nonblocking)
+                {
+                    Ok(written) => Ok(WriteOutcome::Returned {
+                        value: written,
+                        wake_pipe: (written != 0).then_some(endpoint.pipe()),
+                    }),
+                    Err(super::step29_pipe_io::Error::BlockingWaitRequired) => {
+                        Ok(WriteOutcome::BlockingWaitRequired)
+                    }
+                    Err(super::step29_pipe_io::Error::Linux(errno)) => Err(Error::Linux(errno)),
+                    Err(super::step29_pipe_io::Error::Invariant) => Err(Error::Invariant),
+                }
             }
             OpenObjectKind::External(ExternalObject::Stdout) => {
                 Ok(WriteOutcome::External(OutputFd::Stdout))
@@ -169,7 +203,8 @@ fn write(
             }
             OpenObjectKind::External(ExternalObject::Stdin)
             | OpenObjectKind::File
-            | OpenObjectKind::Directory => Err(Error::Linux(Errno::EBADF)),
+            | OpenObjectKind::Directory
+            | OpenObjectKind::Subsystem(_) => Err(Error::Linux(Errno::EBADF)),
         }
     })
     .map_err(|_| Error::Invariant)?
@@ -197,11 +232,17 @@ fn dup3(process: ObjectId, raw_oldfd: u64, raw_newfd: u64, raw_flags: u64) -> Re
     }
     validate_exact_target(newfd)?;
 
-    super::step29_runtime::with_process(process, |runtime| {
+    let mut closed_pipe: Option<(PipeId, PipeEnd)> = None;
+    let mut dropped_subsys: Option<kernal_linux_fd::SubsystemHandle> = None;
+    let res = super::step29_runtime::with_process(process, |runtime| {
         let (fds, pipes, overlay) = runtime.fd_pipe_overlay_parts();
         let duplicated = fds
             .duplicate_exact_with_release(oldfd, newfd, close_on_exec, |released| match released {
-                ReleasedObject::Pipe(endpoint) => pipes.close(endpoint).map_err(map_pipe_error),
+                ReleasedObject::Pipe(endpoint) => {
+                    pipes.close(endpoint).map_err(map_pipe_error)?;
+                    closed_pipe = Some((endpoint.pipe(), endpoint.end()));
+                    Ok(())
+                }
                 ReleasedObject::RetainedDirectory(directory) => overlay
                     .release_directory(directory)
                     .map_err(|_| Error::Invariant),
@@ -211,12 +252,24 @@ fn dup3(process: ObjectId, raw_oldfd: u64, raw_newfd: u64, raw_flags: u64) -> Re
                 ReleasedObject::WritableRegular(retained) => overlay
                     .release_retained_regular(retained)
                     .map_err(|_| Error::Invariant),
+                ReleasedObject::Subsystem(handle) => {
+                    dropped_subsys = Some(handle);
+                    Ok(())
+                }
             })
             .map_err(map_fd_error)?;
         let token = duplicated?;
         u64::try_from(token.fd()).map_err(|_| Error::Invariant)
     })
-    .map_err(|_| Error::Invariant)?
+    .map_err(|_| Error::Invariant)?;
+    if let Some(handle) = dropped_subsys {
+        super::step_fd_util::release_subsystem_handle(handle);
+    }
+    if let Some((pipe, end)) = closed_pipe {
+        super::futex::pipe_blocking::notify_after_endpoint_close(pipe, end)
+            .map_err(|_| Error::Invariant)?;
+    }
+    res
 }
 
 fn fcntl(process: ObjectId, raw_fd: u64, raw_cmd: u64, raw_arg: u64) -> Result<u64, Error> {
@@ -246,6 +299,11 @@ fn fcntl(process: ObjectId, raw_fd: u64, raw_cmd: u64, raw_arg: u64) -> Result<u
                 Ok(0)
             }
             F_GETFL => fds.status_flags(fd).map_err(map_fd_error),
+            F_SETFL => {
+                fds.set_status_flags(fd, u64::from(linux_unsigned_int(raw_arg)))
+                    .map_err(map_fd_error)?;
+                Ok(0)
+            }
             _ => Err(Error::Linux(Errno::EINVAL)),
         }
     })
@@ -495,14 +553,6 @@ fn map_pipe_error(error: PipeError) -> Error {
         | PipeError::InvalidLength
         | PipeError::CapacityZero
         | PipeError::EpochExhausted => Error::Invariant,
-    }
-}
-
-fn map_pipe_io_error(error: super::step29_pipe_io::Error) -> Error {
-    match error {
-        super::step29_pipe_io::Error::Linux(errno) => Error::Linux(errno),
-        super::step29_pipe_io::Error::BlockingWaitRequired
-        | super::step29_pipe_io::Error::Invariant => Error::Invariant,
     }
 }
 

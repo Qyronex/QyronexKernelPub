@@ -6,6 +6,9 @@ use core::ptr::NonNull;
 use kernal_exceptions_aarch64::ExceptionFrame;
 use kernal_futex::Error as FutexError;
 use kernal_linux_abi::{Errno, MinimumRuntimeCall, SyscallReturn};
+pub use kernal_linux_futex::{
+    DebianFutexPlan, classify_debian_futex, compute_debian_futex_deadline_ns,
+};
 use kernal_linux_futex::{MinimumFutexCall, decode_minimum};
 use kernal_linux_futex_aarch64::{FutexAccessError, read_private_word};
 use kernal_linux_futex_runtime::{
@@ -402,6 +405,20 @@ unsafe fn dispatch_private_futex_raw_inner<
                     };
                     match switched {
                         Ok(resumed) if resumed == current => {
+                            #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+                            if activate_destination.is_some() {
+                                let mut frame = frame;
+                                let generation =
+                                    kernal_process_aarch64::current_user_switch_generation()
+                                        .and_then(core::num::NonZeroU64::new)
+                                        .ok_or(Error::Invariant)?;
+                                // SAFETY: the exact generation is current again in the same
+                                // IRQ-masked SVC owner window; refresh only the entry switch-gen
+                                // witness after a real scheduler switch before EL0 return.
+                                unsafe {
+                                    frame.as_mut().rebind_entry_switch_generation(generation)
+                                };
+                            }
                             // SAFETY: the exact generation is current again in the same IRQ-masked
                             // owner window. Observe only; Core must commit signal policy before the
                             // retained futex interruption can be consumed.

@@ -50,6 +50,8 @@ pub(super) enum Error {
     UnsupportedProcessClonePlan,
     RollbackFailed,
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    ChildTidFault,
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     Kmap(kernal_kmap_aarch64::Error),
     #[cfg(all(target_arch = "aarch64", target_os = "none"))]
     Runtime(super::runtime::Error),
@@ -223,6 +225,28 @@ pub(super) unsafe fn stage_fork_scheduler_generation<const THREADS: usize, const
     receipt: UnpublishedForkReceipt,
     priority: u8,
 ) -> Result<StagedForkSchedulerReceipt, ForkSchedulerStageError> {
+    // SAFETY: delegated caller contract matches `stage_fork_scheduler_generation_with_clear_child_tid`.
+    unsafe {
+        stage_fork_scheduler_generation_with_clear_child_tid(scheduler, receipt, priority, None)
+    }
+}
+
+/// Transfers `receipt` into a staged scheduler generation and optionally registers one Linux
+/// `CLONE_CHILD_CLEARTID` address owned by that exact generation.
+///
+/// # Safety
+/// Identical to [`stage_fork_scheduler_generation`].
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(dead_code)]
+pub(super) unsafe fn stage_fork_scheduler_generation_with_clear_child_tid<
+    const THREADS: usize,
+    const WAKES: usize,
+>(
+    scheduler: &'static CpuSchedulerCell<THREADS, WAKES>,
+    receipt: UnpublishedForkReceipt,
+    priority: u8,
+    clear_child_tid: Option<u64>,
+) -> Result<StagedForkSchedulerReceipt, ForkSchedulerStageError> {
     let prepared = receipt.prepared_stack();
     let context = prepared.context();
     let stack = context.stack();
@@ -233,7 +257,7 @@ pub(super) unsafe fn stage_fork_scheduler_generation<const THREADS: usize, const
             stack,
             receipt.address_space_token(),
             context.user_thread_pointer(),
-            None,
+            clear_child_tid,
         )
     } {
         Ok(staged) => staged,
@@ -1223,8 +1247,74 @@ fn retire_unpublished_fork_break(
 /// must either publish the returned receipt through the later exact staged-scheduler transaction or
 /// call `rollback_unpublished_fork_transaction` before allowing parent VMA policy to change.
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn write_child_tid_to_unpublished_space<B: Backend>(
+    runtime: &Step15LinuxRuntime,
+    current: GlobalThreadId,
+    child: &Process<{ super::runtime::STEP15_RUNTIME_CAPS }>,
+    child_space: &BoundProcessAddressSpace<{ super::runtime::STEP15_RUNTIME_VMAS }>,
+    child_tid_va: u64,
+    child_tid: NonZeroU32,
+    backend: &mut B,
+    kmap: &KmapController,
+) -> Result<(), Error> {
+    if !child_tid_va.is_multiple_of(4) || kernal_usercopy::UserRange::new(child_tid_va, 4).is_err()
+    {
+        return Err(Error::ChildTidFault);
+    }
+    let page_va = child_tid_va & !(PAGE_SIZE - 1);
+    let page_offset = usize::try_from(child_tid_va - page_va).map_err(|_| Error::ChildTidFault)?;
+    let child_phys = runtime
+        .with_fork_snapshot_parent(current, |_parent, _parent_space, objects| {
+            let mut idx = 0usize;
+            let mut writable = false;
+            while let Some(vma) = child_space
+                .user_vma_at(child, objects, child.address_space_handle(), idx)
+                .map_err(|_| Error::AddressSpace)?
+            {
+                if child_tid_va >= vma.start
+                    && child_tid_va + 4 <= vma.start.saturating_add(vma.len)
+                    && vma.perms.writable()
+                {
+                    writable = true;
+                    break;
+                }
+                idx = idx.checked_add(1).ok_or(Error::Invariant)?;
+            }
+            if !writable {
+                return Err(Error::ChildTidFault);
+            }
+            child_space
+                .translate_user(
+                    child,
+                    objects,
+                    child.address_space_handle(),
+                    backend,
+                    page_va,
+                )
+                .map_err(|_| Error::ChildTidFault)
+        })
+        .map_err(Error::Runtime)??;
+    // SAFETY: `child_phys` belongs solely to the unpublished `child_space` and `kmap` + `backend`
+    // hold the active CPU's exclusive kmap/page-table mutation window.
+    unsafe {
+        kmap.write_frame_bytes(
+            backend,
+            child_phys,
+            page_offset,
+            &child_tid.get().to_le_bytes(),
+        )
+    }
+    .map_err(Error::Kmap)
+}
+
+/// Stages an unpublished fork transaction, optionally seeding one aligned writable user
+/// `CLONE_CHILD_SETTID` word in the unpublished child snapshot before returning the staging receipt.
+///
+/// # Safety
+/// Identical to [`stage_unpublished_fork_transaction`].
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 #[allow(clippy::too_many_arguments, dead_code)]
-pub(super) unsafe fn stage_unpublished_fork_transaction<B: Backend>(
+pub(super) unsafe fn stage_unpublished_fork_transaction_with_child_tid<B: Backend>(
     runtime: &mut Step15LinuxRuntime,
     current: GlobalThreadId,
     plan: ProcessClonePlan,
@@ -1234,6 +1324,7 @@ pub(super) unsafe fn stage_unpublished_fork_transaction<B: Backend>(
     backend: &mut B,
     frame_pool: &mut Step15FramePool,
     kmap: &mut KmapController,
+    child_tid_set: Option<u64>,
 ) -> Result<UnpublishedForkReceipt, Error> {
     require_private_fork_plan(plan)?;
 
@@ -1278,6 +1369,33 @@ pub(super) unsafe fn stage_unpublished_fork_transaction<B: Backend>(
             };
         }
     };
+
+    if let Some(child_tid_va) = child_tid_set
+        && let Err(error) = write_child_tid_to_unpublished_space(
+            runtime,
+            current,
+            &child,
+            &child_space,
+            child_tid_va,
+            child_pid,
+            backend,
+            kmap,
+        )
+    {
+        // SAFETY: child remains unpublished; roll back snapshot, identity, and frames cleanly.
+        return unsafe {
+            abort_completed_fork_staging(
+                runtime,
+                current,
+                child,
+                child_space,
+                None,
+                backend,
+                frame_pool,
+                error,
+            )
+        };
+    }
 
     if let Err(error) = inherit_unpublished_fork_break(runtime, current, &child) {
         // SAFETY: no scheduler authority exists; snapshot and Linux identity/policy remain under the
@@ -1448,6 +1566,41 @@ pub(super) unsafe fn stage_unpublished_fork_transaction<B: Backend>(
         prepared_stack,
         wait_publication,
     })
+}
+
+/// Stages an unpublished fork transaction without seeding `CLONE_CHILD_SETTID`.
+///
+/// # Safety
+/// Caller must guarantee exclusive ownership of `runtime`, `backend`, `frame_pool`, and `kmap`
+/// for the synchronous staging window.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(super) unsafe fn stage_unpublished_fork_transaction<B: Backend>(
+    runtime: &mut Step15LinuxRuntime,
+    current: GlobalThreadId,
+    plan: ProcessClonePlan,
+    parent_registers: &[u64; 31],
+    parent_return: El0ReturnState,
+    parent_tls: u64,
+    backend: &mut B,
+    frame_pool: &mut Step15FramePool,
+    kmap: &mut KmapController,
+) -> Result<UnpublishedForkReceipt, Error> {
+    // SAFETY: delegated caller contract matches `stage_unpublished_fork_transaction_with_child_tid`.
+    unsafe {
+        stage_unpublished_fork_transaction_with_child_tid(
+            runtime,
+            current,
+            plan,
+            parent_registers,
+            parent_return,
+            parent_tls,
+            backend,
+            frame_pool,
+            kmap,
+            None,
+        )
+    }
 }
 
 /// Rolls back one successful `stage_unpublished_fork_transaction` receipt before any scheduler

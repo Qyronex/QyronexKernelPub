@@ -90,35 +90,33 @@ fn close_pipe_owned(
     let fd = linux_signed_int(raw_fd);
     let outcome = super::super::super::step29_runtime::with_process(
         process,
-        |runtime| -> Result<Option<Option<PipeId>>, Error> {
+        |runtime| -> Result<Option<Option<(PipeId, PipeEnd)>>, Error> {
             let (fds, pipes) = runtime.fd_pipe_parts();
             match fds.object_kind(fd) {
                 Ok(OpenObjectKind::Pipe) => {}
                 Ok(_) | Err(_) => return Ok(None),
             }
 
-            let mut final_writer = None;
+            let mut closed_end: Option<(PipeId, PipeEnd)> = None;
             let closed: Result<(), Error> = fds
                 .close_with_release(fd, |released| {
                     let endpoint = released.pipe_endpoint();
                     pipes.close(endpoint).map_err(|_| Error::Invariant)?;
-                    if endpoint.end() == PipeEnd::Write {
-                        final_writer = Some(endpoint.pipe());
-                    }
+                    closed_end = Some((endpoint.pipe(), endpoint.end()));
                     Ok(())
                 })
                 .map_err(super::super::map_fd_error)?;
             closed?;
-            Ok(Some(final_writer))
+            Ok(Some(closed_end))
         },
     )
     .map_err(|_| Error::Invariant)??;
 
-    let Some(final_writer) = outcome else {
+    let Some(closed_end) = outcome else {
         return Ok(None);
     };
-    if let Some(pipe) = final_writer {
-        super::super::super::futex::pipe_blocking::notify_after_writer_close(pipe)
+    if let Some((pipe, end)) = closed_end {
+        super::super::super::futex::pipe_blocking::notify_after_endpoint_close(pipe, end)
             .map_err(|_| Error::Invariant)?;
     }
     Ok(Some(0))
@@ -216,6 +214,16 @@ fn openat_owned(
     flags: u64,
     raw_mode: u64,
 ) -> Result<Option<u64>, Error> {
+    let path = super::super::copy_user_path(user_path)?;
+    openat_owned_bytes(raw_dirfd, path.as_bytes(), flags, raw_mode)
+}
+
+pub(super) fn openat_owned_bytes(
+    raw_dirfd: u64,
+    path: &[u8],
+    flags: u64,
+    raw_mode: u64,
+) -> Result<Option<u64>, Error> {
     let access = flags & O_ACCMODE;
     if access == O_ACCMODE {
         return Err(Error::Linux(Errno::EINVAL));
@@ -227,16 +235,15 @@ fn openat_owned(
         return Err(Error::Linux(Errno::EINVAL));
     }
 
-    let path = super::super::copy_user_path(user_path)?;
     let process = super::super::current_process()?;
     super::super::super::step29_runtime::with_process(process, |runtime| {
-        let base = base_for_path(runtime, raw_dirfd, path.as_bytes())?;
+        let base = base_for_path(runtime, raw_dirfd, path)?;
         let nofollow = flags & O_NOFOLLOW != 0;
 
         let existing = if nofollow {
-            resolve_existing(runtime, base, path.as_bytes(), true)?
+            resolve_existing(runtime, base, path, true)?
         } else {
-            resolve_existing(runtime, base, path.as_bytes(), false)?
+            resolve_existing(runtime, base, path, false)?
         };
 
         if flags & (O_CREAT | O_EXCL) == (O_CREAT | O_EXCL) && existing.is_some() {
@@ -265,11 +272,11 @@ fn openat_owned(
                 .apply_creation_mode(linux_unsigned_int(raw_mode));
             runtime
                 .overlay()
-                .create_regular_from(base, path.as_bytes(), mode, 0, 0, MutableTimestamp::ZERO)
+                .create_regular_from(base, path, mode, 0, 0, MutableTimestamp::ZERO)
                 .map_err(super::map_overlay_error)?;
             runtime
                 .overlay()
-                .resolve_following_from(base, path.as_bytes())
+                .resolve_following_from(base, path)
                 .map_err(super::map_overlay_error)?
         } else {
             return Err(Error::Linux(Errno::ENOENT));
@@ -289,7 +296,7 @@ fn openat_owned(
             }
             let directory = runtime
                 .overlay()
-                .open_and_retain_directory_from(base, path.as_bytes())
+                .open_and_retain_directory_from(base, path)
                 .map_err(super::map_overlay_error)?;
             let token = match runtime.fds().open_retained_directory_linux_with_flags(
                 directory,
@@ -352,7 +359,7 @@ fn openat_owned(
         } else if matches!(access, O_WRONLY | O_RDWR) {
             let retained = runtime
                 .overlay()
-                .prepare_and_retain_writable_regular_from(base, path.as_bytes())
+                .prepare_and_retain_writable_regular_from(base, path)
                 .map_err(super::map_overlay_error)?;
             if flags & O_TRUNC != 0 {
                 if let Err(error) =
@@ -386,7 +393,7 @@ fn openat_owned(
         };
         if access == O_RDONLY {
             if let OverlayNodeHandle::Immutable { entry_id, .. } = logical {
-                super::super::record_proof_open(path.as_bytes(), entry_id, token);
+                super::super::record_proof_open(path, entry_id, token);
             }
         }
         Ok(Some(

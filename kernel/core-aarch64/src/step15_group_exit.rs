@@ -237,9 +237,24 @@ pub(super) unsafe fn finalize_after_resume(serial: &Pl011) -> Result<u32, ()> {
         serial.write_str("KERNAL/ARM64: Step 30 process-runtime guest finalized status=0\n");
     }
 
+    #[cfg(feature = "step31-debian-qemu")]
+    {
+        if status != 0 {
+            serial
+                .write_str("KERNAL/ARM64: Step 31 Debian 13 userspace returned non-zero status\n");
+            return Err(());
+        }
+        if !initial::step28_proof_complete() {
+            serial.write_str("KERNAL/ARM64: Step 31 Debian 13 loader proof-state incomplete\n");
+            return Err(());
+        }
+        serial.write_str("KERNAL/S31: Debian 13 dynamic ARM64 userspace finalized status=0\n");
+    }
+
     #[cfg(all(
         feature = "step29-qemu-proof",
         not(feature = "step30-final-qemu-proof"),
+        not(feature = "step31-debian-qemu"),
         not(feature = "step29-directory-qemu-proof"),
         not(feature = "step29-fd-pipe-qemu-proof"),
         not(feature = "step29-fs-breadth-qemu-proof"),

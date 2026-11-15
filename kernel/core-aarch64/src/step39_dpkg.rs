@@ -2,21 +2,23 @@
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, Ordering};
+use kernal_capability::ObjectId;
+use kernal_exceptions_aarch64::ExceptionFrame;
 use kernal_linux_abi::{
     Errno, SyscallRequest, SyscallReturn, linux_signed_int, linux_unsigned_int,
 };
 use kernal_linux_cgroup::CAP_CHOWN;
 use kernal_linux_dpkg::{
-    AdvisoryLockTable, F_GETLK, F_SETLK, F_SETLKW, PackageMetadataTable, PosixFlock, TargetKey,
-    TimespecPair, XattrTable,
+    AdvisoryLockTable, F_GETLK, F_SETLK, F_SETLKW, F_UNLCK, LOCK_NB, LOCK_UN, PackageMetadataTable,
+    PosixFlock, TargetKey, TimespecPair, XattrTable,
 };
 
 const CAP_FOWNER: u32 = 3;
-const MAX_LOCKS: usize = 32;
+const MAX_LOCKS: usize = 64;
 const MAX_XATTRS: usize = 32;
 const MAX_XATTR_VAL: usize = 128;
 const MAX_META: usize = 32;
-const MAX_PATH_BYTES: usize = 96;
+const MAX_PATH_BYTES: usize = 512;
 const MAX_XATTR_NAME: usize = 64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -43,6 +45,7 @@ const NR_UTIMENSAT: u64 = 88;
 
 struct Step39State {
     locks: AdvisoryLockTable<MAX_LOCKS>,
+    posix_proc_pids: [Option<(ObjectId, u32)>; 32],
     xattrs: XattrTable<MAX_XATTRS, MAX_XATTR_VAL>,
     meta: PackageMetadataTable<MAX_META>,
 }
@@ -51,10 +54,58 @@ impl Step39State {
     const fn new() -> Self {
         Self {
             locks: AdvisoryLockTable::new(),
+            posix_proc_pids: [None; 32],
             xattrs: XattrTable::new(),
             meta: PackageMetadataTable::new(),
         }
     }
+
+    fn record_posix_owner(&mut self, process: ObjectId, pid: u32) {
+        if self
+            .posix_proc_pids
+            .iter()
+            .flatten()
+            .any(|&(p, q)| p == process && q == pid)
+        {
+            return;
+        }
+        if let Some(slot) = self.posix_proc_pids.iter_mut().find(|s| s.is_none()) {
+            *slot = Some((process, pid));
+        }
+    }
+}
+
+const fn ext4_ofd_owner(ofd_id: u64) -> u64 {
+    (1u64 << 63) | ofd_id
+}
+
+pub(super) fn on_retire_ext4_ofd(ofd_id: u64) {
+    let owner = ext4_ofd_owner(ofd_id);
+    let _ = with_step39_state(|state| state.locks.release_flock_owner(owner));
+}
+
+pub(super) fn on_close_ext4_fd(mount_id: u32, ino: u32, retired_ofd: Option<u64>) {
+    let target = TargetKey::from_ext4_inode(mount_id, ino);
+    let pid = current_pid();
+    let _ = with_step39_state(|state| {
+        state.locks.release_posix_target_pid(target, pid);
+        if let Some(ofd_id) = retired_ofd {
+            state.locks.release_flock_owner(ext4_ofd_owner(ofd_id));
+        }
+    });
+}
+
+pub(super) fn on_process_exit(process: ObjectId) {
+    let _ = with_step39_state(|state| {
+        for slot in &mut state.posix_proc_pids {
+            if let Some((proc_id, pid)) = *slot
+                && proc_id == process
+            {
+                state.locks.release_posix_pid(pid);
+                *slot = None;
+            }
+        }
+    });
 }
 
 struct Step39Cell {
@@ -87,7 +138,15 @@ fn with_step39_state<R>(f: impl FnOnce(&mut Step39State) -> R) -> Result<R, ()> 
 
 /// Dispatches Step-39 (`flock`, `fcntl` record locks, `xattr`, `fchmod`/`fchown`/`utimensat`)
 /// syscalls on AArch64.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<SyscallReturn>, ()> {
+    try_handle_syscall_with_frame(request, None)
+}
+
+pub(super) fn try_handle_syscall_with_frame(
+    request: SyscallRequest,
+    frame: Option<&mut ExceptionFrame>,
+) -> Result<Option<SyscallReturn>, ()> {
     match request.number {
         NR_SETXATTR | NR_LSETXATTR => Ok(Some(encode_result(handle_setxattr(
             TargetSource::Path(request.args[0]),
@@ -136,19 +195,17 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
         NR_FCNTL => {
             let cmd = linux_unsigned_int(request.args[1]);
             if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW) {
-                Ok(Some(encode_result(handle_fcntl_lock(
+                Ok(Some(handle_fcntl_lock(
                     request.args[0],
                     cmd,
                     request.args[2],
-                )?)))
+                    frame,
+                )?))
             } else {
                 Ok(None)
             }
         }
-        NR_FLOCK => Ok(Some(encode_result(handle_flock(
-            request.args[0],
-            request.args[1],
-        )?))),
+        NR_FLOCK => Ok(Some(handle_flock(request.args[0], request.args[1], frame)?)),
         NR_FCHMOD => Ok(Some(encode_result(handle_chmod(
             TargetSource::Fd(request.args[0]),
             request.args[1],
@@ -217,46 +274,109 @@ fn encode_result(res: Result<i64, Errno>) -> SyscallReturn {
     }
 }
 
-fn handle_flock(raw_fd: u64, raw_op: u64) -> Result<Result<i64, Errno>, ()> {
+fn resolve_lock_target(raw_fd: u64) -> Result<(TargetKey, u64, i64, i64), Errno> {
     let fd = linux_signed_int(raw_fd);
-    let key = match TargetKey::from_fd(fd) {
-        Ok(k) => k,
-        Err(e) => return Ok(Err(e)),
-    };
-    let op = linux_unsigned_int(raw_op);
-    let owner_ofd = u64::from(current_pid()).wrapping_shl(32) | (u64::from(fd as u32));
-    with_step39_state(|state| state.locks.flock_op(key, owner_ofd, op).map(|()| 0))
+    if fd < 0 {
+        return Err(Errno::EBADF);
+    }
+    if let Some(process) = super::step_fd_util::current_process_object()
+        && let Some((mount_id, ino, ofd_id, offset, file_len)) =
+            super::step33_ext4_vfs::ext4_lock_info_for_fd(process, raw_fd)
+    {
+        return Ok((
+            TargetKey::from_ext4_inode(mount_id, ino),
+            ext4_ofd_owner(ofd_id),
+            offset,
+            file_len,
+        ));
+    }
+    let key = TargetKey::from_fd(fd)?;
+    let owner_ofd = u64::from(current_pid()).wrapping_shl(32) | u64::from(fd as u32);
+    Ok((key, owner_ofd, 0, 0))
 }
 
-fn handle_fcntl_lock(raw_fd: u64, cmd: u32, user_flock: u64) -> Result<Result<i64, Errno>, ()> {
-    let key = match TargetKey::from_fd(linux_signed_int(raw_fd)) {
-        Ok(k) => k,
-        Err(e) => return Ok(Err(e)),
+fn handle_flock(
+    raw_fd: u64,
+    raw_op: u64,
+    mut frame: Option<&mut ExceptionFrame>,
+) -> Result<SyscallReturn, ()> {
+    let (key, owner_ofd, _, _) = match resolve_lock_target(raw_fd) {
+        Ok(v) => v,
+        Err(e) => return Ok(SyscallReturn::error(e)),
+    };
+    let op = linux_unsigned_int(raw_op);
+    let nonblocking = (op & LOCK_NB) != 0 || (op & !LOCK_NB) == LOCK_UN;
+    loop {
+        match with_step39_state(|state| state.locks.flock_op(key, owner_ofd, op).map(|()| 0))? {
+            Err(Errno::EAGAIN) if !nonblocking && frame.is_some() => {
+                if let Some(interrupted) =
+                    super::step35_events_cgroup::blocking_wait_step(frame.as_deref_mut())?
+                {
+                    return Ok(interrupted);
+                }
+            }
+            res => return Ok(encode_result(res)),
+        }
+    }
+}
+
+fn handle_fcntl_lock(
+    raw_fd: u64,
+    cmd: u32,
+    user_flock: u64,
+    mut frame: Option<&mut ExceptionFrame>,
+) -> Result<SyscallReturn, ()> {
+    let (key, _, offset, file_len) = match resolve_lock_target(raw_fd) {
+        Ok(v) => v,
+        Err(e) => return Ok(SyscallReturn::error(e)),
     };
     if user_flock == 0 {
-        return Ok(Err(Errno::EFAULT));
+        return Ok(SyscallReturn::error(Errno::EFAULT));
     }
     let mut raw = [0u8; 32];
     if let Err(e) = copy_from_user(&mut raw, user_flock) {
-        return Ok(Err(e));
+        return Ok(SyscallReturn::error(e));
     }
     let req = match PosixFlock::from_aarch64_bytes(raw) {
         Ok(r) => r,
-        Err(e) => return Ok(Err(e)),
+        Err(e) => return Ok(SyscallReturn::error(e)),
     };
     let pid = current_pid();
     if cmd == F_GETLK {
-        let res = with_step39_state(|state| state.locks.fcntl_getlk(key, pid, req, 0, 0))?;
+        let res =
+            with_step39_state(|state| state.locks.fcntl_getlk(key, pid, req, offset, file_len))?;
         let out = match res {
             Ok(f) => f,
-            Err(e) => return Ok(Err(e)),
+            Err(e) => return Ok(SyscallReturn::error(e)),
         };
         if let Err(e) = copy_to_user(user_flock, &out.to_aarch64_bytes()) {
-            return Ok(Err(e));
+            return Ok(SyscallReturn::error(e));
         }
-        return Ok(Ok(0));
+        return Ok(encode_result(Ok(0)));
     }
-    with_step39_state(|state| state.locks.fcntl_setlk(key, pid, req, 0, 0).map(|()| 0))
+    let process = super::step_fd_util::current_process_object();
+    loop {
+        let res = with_step39_state(|state| {
+            let r = state.locks.fcntl_setlk(key, pid, req, offset, file_len);
+            if r.is_ok()
+                && req.l_type != F_UNLCK
+                && let Some(proc_id) = process
+            {
+                state.record_posix_owner(proc_id, pid);
+            }
+            r.map(|()| 0)
+        })?;
+        match res {
+            Err(Errno::EAGAIN) if cmd == F_SETLKW && frame.is_some() => {
+                if let Some(interrupted) =
+                    super::step35_events_cgroup::blocking_wait_step(frame.as_deref_mut())?
+                {
+                    return Ok(interrupted);
+                }
+            }
+            other => return Ok(encode_result(other)),
+        }
+    }
 }
 
 fn handle_setxattr(

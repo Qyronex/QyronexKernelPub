@@ -4,7 +4,9 @@
 
 use core::num::NonZeroU32;
 use kernal_capability::{CapRights, Capability};
-use kernal_linux_abi::{Errno, KERNEL_TERMIOS_BYTES, WinSize, encode_default_serial_termios};
+use kernal_linux_abi::{
+    Errno, KERNEL_TERMIOS_BYTES, POLLHUP, POLLIN, POLLOUT, WinSize, encode_default_serial_termios,
+};
 
 /// Linux `termios` `c_iflag` bit definitions (`<asm-generic/termbits.h>`).
 pub const IGNCR: u32 = 0x0080;
@@ -472,10 +474,23 @@ impl TtySessionState {
         caller_pgid: NonZeroU32,
         target_pgid: NonZeroU32,
     ) -> Result<JobControlCheck, Error> {
+        self.set_foreground_pgid_checked(caller_sid, caller_pgid, target_pgid, false)
+    }
+
+    /// Implements `TIOCSPGRP` (`0x5410`), allowing background callers to update the foreground
+    /// process group when `SIGTTOU` is ignored or blocked per POSIX.
+    pub fn set_foreground_pgid_checked(
+        &mut self,
+        caller_sid: NonZeroU32,
+        caller_pgid: NonZeroU32,
+        target_pgid: NonZeroU32,
+        sigttou_ignored_or_blocked: bool,
+    ) -> Result<JobControlCheck, Error> {
         if self.controlling_session != Some(caller_sid) {
             return Err(Error::NotControllingTty);
         }
-        if let Some(fg) = self.foreground_pgid
+        if !sigttou_ignored_or_blocked
+            && let Some(fg) = self.foreground_pgid
             && fg != caller_pgid
         {
             return Ok(JobControlCheck::Stop(TtySignal::SigTtou));
@@ -574,6 +589,10 @@ impl<const CAP: usize> LineDiscipline<CAP> {
 
     pub const fn has_readable_data(&self) -> bool {
         self.committed_len > 0 || self.pending_eof
+    }
+
+    pub const fn can_accept_input(&self) -> bool {
+        self.rx_len < CAP
     }
 
     /// Processes one incoming character from the UART RX or PTY master write path.
@@ -1020,6 +1039,19 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
         caller_pgid: NonZeroU32,
         input: &[u8],
     ) -> Result<PtySlaveIoResult, Error> {
+        self.slave_write_checked(slave, caller_sid, caller_pgid, input, false)
+    }
+
+    /// Writes bytes from the PTY slave to the PTY master, bypassing background `SIGTTOU` stop when
+    /// `sigttou_ignored_or_blocked` is `true`.
+    pub fn slave_write_checked(
+        &mut self,
+        slave: PtySlaveEndpoint,
+        caller_sid: NonZeroU32,
+        caller_pgid: NonZeroU32,
+        input: &[u8],
+        sigttou_ignored_or_blocked: bool,
+    ) -> Result<PtySlaveIoResult, Error> {
         let slot = self.slave_slot_mut(slave)?;
         if !slot.master_open {
             return Err(Error::BrokenPipe);
@@ -1027,7 +1059,7 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
         if let JobControlCheck::Stop(sig) = slot.session.check_write_access(
             caller_sid,
             caller_pgid,
-            slot.ldisc.termios().is_tostop(),
+            slot.ldisc.termios().is_tostop() && !sigttou_ignored_or_blocked,
         ) {
             return Ok(PtySlaveIoResult::JobControlStop(sig));
         }
@@ -1060,6 +1092,46 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
         Ok(&mut self.slave_slot_mut(slave)?.ldisc)
     }
 
+    /// Returns a mutable reference to the shared PTY line discipline via a master endpoint.
+    pub fn master_ldisc_mut(
+        &mut self,
+        master: PtyMasterEndpoint,
+    ) -> Result<&mut LineDiscipline<BUF_CAP>, Error> {
+        Ok(&mut self.master_slot_mut(master)?.ldisc)
+    }
+
+    /// Returns the Linux `POLL*` readiness bitmask for a PTY master endpoint.
+    pub fn master_readiness(&self, master: PtyMasterEndpoint) -> Result<u32, Error> {
+        let slot = self.master_slot(master)?;
+        let mut mask = 0u32;
+        if slot.master_rx_len > 0 {
+            mask |= u32::from(POLLIN);
+        }
+        if slot.ldisc.can_accept_input() {
+            mask |= u32::from(POLLOUT);
+        }
+        if slot.slave_ever_opened && slot.slave_open_count == 0 {
+            mask |= u32::from(POLLHUP);
+        }
+        Ok(mask)
+    }
+
+    /// Returns the Linux `POLL*` readiness bitmask for a PTY slave endpoint.
+    pub fn slave_readiness(&self, slave: PtySlaveEndpoint) -> Result<u32, Error> {
+        let slot = self.slave_slot(slave)?;
+        let mut mask = 0u32;
+        if slot.ldisc.has_readable_data() {
+            mask |= u32::from(POLLIN);
+        }
+        if slot.master_open && slot.master_rx_len < BUF_CAP {
+            mask |= u32::from(POLLOUT);
+        }
+        if !slot.master_open {
+            mask |= u32::from(POLLHUP);
+        }
+        Ok(mask)
+    }
+
     fn master_slot(&self, master: PtyMasterEndpoint) -> Result<&PtySlot<BUF_CAP>, Error> {
         let idx = usize::try_from(master.pty.index).map_err(|_| Error::BadEndpoint)?;
         let slot = self.slots.get(idx).ok_or(Error::BadEndpoint)?;
@@ -1076,6 +1148,16 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
         let idx = usize::try_from(master.pty.index).map_err(|_| Error::BadEndpoint)?;
         let slot = self.slots.get_mut(idx).ok_or(Error::BadEndpoint)?;
         if !slot.allocated || !slot.master_open || slot.generation != master.pty.generation {
+            return Err(Error::StaleEndpoint);
+        }
+        Ok(slot)
+    }
+
+    fn slave_slot(&self, slave: PtySlaveEndpoint) -> Result<&PtySlot<BUF_CAP>, Error> {
+        let idx = usize::try_from(slave.pty.index).map_err(|_| Error::BadEndpoint)?;
+        let slot = self.slots.get(idx).ok_or(Error::BadEndpoint)?;
+        if !slot.allocated || slot.slave_open_count == 0 || slot.generation != slave.pty.generation
+        {
             return Err(Error::StaleEndpoint);
         }
         Ok(slot)
@@ -1352,5 +1434,38 @@ mod tests {
             Err(Error::InputOutput)
         );
         ptys.close_master(master).unwrap();
+    }
+
+    #[test]
+    fn pty_readiness_tracks_rx_tx_and_hangup_states() {
+        let mut ptys = PtyTable::<4, 64>::new();
+        let master = ptys.allocate_ptmx().unwrap();
+        let idx = ptys.pts_number(master).unwrap();
+        ptys.set_slave_lock(master, false).unwrap();
+        let slave = ptys.open_slave(idx).unwrap();
+
+        assert_eq!(ptys.master_readiness(master), Ok(u32::from(POLLOUT)));
+        assert_eq!(ptys.slave_readiness(slave), Ok(u32::from(POLLOUT)));
+
+        ptys.master_write(master, b"hi\n").unwrap();
+        assert_eq!(
+            ptys.master_readiness(master),
+            Ok(u32::from(POLLIN | POLLOUT))
+        );
+        assert_eq!(ptys.slave_readiness(slave), Ok(u32::from(POLLIN | POLLOUT)));
+
+        ptys.close_slave(slave).unwrap();
+        assert_eq!(
+            ptys.master_readiness(master),
+            Ok(u32::from(POLLIN | POLLOUT | POLLHUP))
+        );
+
+        let slave2 = ptys.open_slave(idx).unwrap();
+        ptys.close_master(master).unwrap();
+        assert_eq!(
+            ptys.slave_readiness(slave2),
+            Ok(u32::from(POLLIN | POLLHUP))
+        );
+        ptys.close_slave(slave2).unwrap();
     }
 }

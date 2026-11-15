@@ -18,6 +18,9 @@ use kernal_usercopy::{Error as UsercopyError, UserRange};
 /// that remains the responsibility of the existing usercopy/futex/thread-exit integration owners.
 pub const ROBUST_LIST_HEAD_BYTES: usize = 24;
 
+/// Maximum supplementary GIDs tracked per Linux process credential record.
+pub const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Identity(IdentityError),
@@ -30,6 +33,8 @@ pub enum Error {
     ChildMismatch,
     CannotClearNoNewPrivs,
     InvalidRobustListLength,
+    PermissionDenied,
+    InvalidArgument,
 }
 
 impl From<IdentityError> for Error {
@@ -165,6 +170,228 @@ impl LinuxCredentials {
             || self.euid == target.ruid
             || self.euid == target.suid
     }
+
+    pub fn set_uid(&mut self, uid: u32) -> Result<(), Error> {
+        let priv_root = self.euid == 0;
+        apply_setid(
+            priv_root,
+            &mut self.ruid,
+            &mut self.euid,
+            &mut self.suid,
+            &mut self.fsuid,
+            uid,
+        )
+    }
+
+    pub fn set_reuid(&mut self, ruid: Option<u32>, euid: Option<u32>) -> Result<(), Error> {
+        let priv_root = self.euid == 0;
+        apply_setreid(
+            priv_root,
+            &mut self.ruid,
+            &mut self.euid,
+            &mut self.suid,
+            &mut self.fsuid,
+            ruid,
+            euid,
+        )
+    }
+
+    pub fn set_resuid(
+        &mut self,
+        ruid: Option<u32>,
+        euid: Option<u32>,
+        suid: Option<u32>,
+    ) -> Result<(), Error> {
+        let priv_root = self.euid == 0;
+        apply_setresid(
+            priv_root,
+            &mut self.ruid,
+            &mut self.euid,
+            &mut self.suid,
+            &mut self.fsuid,
+            ruid,
+            euid,
+            suid,
+        )
+    }
+
+    pub fn set_fsuid(&mut self, fsuid: Option<u32>) -> u32 {
+        let priv_root = self.euid == 0;
+        apply_setfsid(
+            priv_root,
+            self.ruid,
+            self.euid,
+            self.suid,
+            &mut self.fsuid,
+            fsuid,
+        )
+    }
+
+    pub fn set_gid(&mut self, gid: u32) -> Result<(), Error> {
+        let priv_root = self.euid == 0;
+        apply_setid(
+            priv_root,
+            &mut self.rgid,
+            &mut self.egid,
+            &mut self.sgid,
+            &mut self.fsgid,
+            gid,
+        )
+    }
+
+    pub fn set_regid(&mut self, rgid: Option<u32>, egid: Option<u32>) -> Result<(), Error> {
+        let priv_root = self.euid == 0;
+        apply_setreid(
+            priv_root,
+            &mut self.rgid,
+            &mut self.egid,
+            &mut self.sgid,
+            &mut self.fsgid,
+            rgid,
+            egid,
+        )
+    }
+
+    pub fn set_resgid(
+        &mut self,
+        rgid: Option<u32>,
+        egid: Option<u32>,
+        sgid: Option<u32>,
+    ) -> Result<(), Error> {
+        let priv_root = self.euid == 0;
+        apply_setresid(
+            priv_root,
+            &mut self.rgid,
+            &mut self.egid,
+            &mut self.sgid,
+            &mut self.fsgid,
+            rgid,
+            egid,
+            sgid,
+        )
+    }
+
+    pub fn set_fsgid(&mut self, fsgid: Option<u32>) -> u32 {
+        let priv_root = self.euid == 0;
+        apply_setfsid(
+            priv_root,
+            self.rgid,
+            self.egid,
+            self.sgid,
+            &mut self.fsgid,
+            fsgid,
+        )
+    }
+}
+
+fn apply_setid(
+    priv_root: bool,
+    real: &mut u32,
+    eff: &mut u32,
+    saved: &mut u32,
+    fs: &mut u32,
+    id: u32,
+) -> Result<(), Error> {
+    if priv_root {
+        *real = id;
+        *eff = id;
+        *saved = id;
+        *fs = id;
+        Ok(())
+    } else if id == *real || id == *saved {
+        *eff = id;
+        *fs = id;
+        Ok(())
+    } else {
+        Err(Error::PermissionDenied)
+    }
+}
+
+fn apply_setreid(
+    priv_root: bool,
+    real: &mut u32,
+    eff: &mut u32,
+    saved: &mut u32,
+    fs: &mut u32,
+    new_real: Option<u32>,
+    new_eff: Option<u32>,
+) -> Result<(), Error> {
+    let (old_r, old_e, old_s) = (*real, *eff, *saved);
+    if let Some(r) = new_real
+        && !priv_root
+        && r != old_r
+        && r != old_e
+    {
+        return Err(Error::PermissionDenied);
+    }
+    if let Some(e) = new_eff
+        && !priv_root
+        && e != old_r
+        && e != old_e
+        && e != old_s
+    {
+        return Err(Error::PermissionDenied);
+    }
+    if let Some(r) = new_real {
+        *real = r;
+    }
+    if let Some(e) = new_eff {
+        *eff = e;
+    }
+    if new_real.is_some() || new_eff.is_some_and(|e| e != old_r) {
+        *saved = *eff;
+    }
+    *fs = *eff;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_setresid(
+    priv_root: bool,
+    real: &mut u32,
+    eff: &mut u32,
+    saved: &mut u32,
+    fs: &mut u32,
+    new_real: Option<u32>,
+    new_eff: Option<u32>,
+    new_saved: Option<u32>,
+) -> Result<(), Error> {
+    let (old_r, old_e, old_s) = (*real, *eff, *saved);
+    let allowed = |v: u32| priv_root || v == old_r || v == old_e || v == old_s;
+    if new_real.is_some_and(|v| !allowed(v))
+        || new_eff.is_some_and(|v| !allowed(v))
+        || new_saved.is_some_and(|v| !allowed(v))
+    {
+        return Err(Error::PermissionDenied);
+    }
+    if let Some(r) = new_real {
+        *real = r;
+    }
+    if let Some(e) = new_eff {
+        *eff = e;
+    }
+    if let Some(s) = new_saved {
+        *saved = s;
+    }
+    *fs = *eff;
+    Ok(())
+}
+
+fn apply_setfsid(
+    priv_root: bool,
+    real: u32,
+    eff: u32,
+    saved: u32,
+    fs: &mut u32,
+    new_fs: Option<u32>,
+) -> u32 {
+    let old_fs = *fs;
+    if let Some(v) = new_fs
+        && (priv_root || v == real || v == eff || v == saved || v == old_fs)
+    {
+        *fs = v;
+    }
+    old_fs
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +399,8 @@ struct CredentialRecord {
     process: ObjectId,
     credentials: LinuxCredentials,
     no_new_privs: bool,
+    groups: [u32; MAX_SUPPLEMENTARY_GROUPS],
+    groups_len: usize,
 }
 
 /// Bounded Linux credential policy keyed by exact Process generation.
@@ -216,6 +445,8 @@ impl<const N: usize> CredentialTable<N> {
             process: process.id(),
             credentials,
             no_new_privs: false,
+            groups: [0; MAX_SUPPLEMENTARY_GROUPS],
+            groups_len: 0,
         });
         Ok(())
     }
@@ -243,6 +474,9 @@ impl<const N: usize> CredentialTable<N> {
         if let Some(existing) = self.record(child.id()) {
             return if existing.credentials == parent_record.credentials
                 && existing.no_new_privs == parent_record.no_new_privs
+                && existing.groups_len == parent_record.groups_len
+                && existing.groups[..existing.groups_len]
+                    == parent_record.groups[..parent_record.groups_len]
             {
                 Ok(())
             } else {
@@ -259,6 +493,8 @@ impl<const N: usize> CredentialTable<N> {
             process: child.id(),
             credentials: parent_record.credentials,
             no_new_privs: parent_record.no_new_privs,
+            groups: parent_record.groups,
+            groups_len: parent_record.groups_len,
         });
         Ok(())
     }
@@ -271,6 +507,54 @@ impl<const N: usize> CredentialTable<N> {
         self.record(process.id())
             .map(|record| record.credentials)
             .ok_or(Error::ProcessNotBound)
+    }
+
+    /// Updates Linux credentials for one live Linux process using POSIX rule checks.
+    pub fn update_credentials<const CAPS: usize, R>(
+        &mut self,
+        process: &Process<CAPS>,
+        f: impl FnOnce(&mut LinuxCredentials) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        validate_live_linux(process)?;
+        let index = self
+            .record_index(process.id())
+            .ok_or(Error::ProcessNotBound)?;
+        let mut record = self.records[index].ok_or(Error::ProcessNotBound)?;
+        let res = f(&mut record.credentials)?;
+        self.records[index] = Some(record);
+        Ok(res)
+    }
+
+    pub fn groups<const CAPS: usize>(&self, process: &Process<CAPS>) -> Result<&[u32], Error> {
+        validate_live_linux(process)?;
+        let index = self
+            .record_index(process.id())
+            .ok_or(Error::ProcessNotBound)?;
+        let record = self.records[index].as_ref().ok_or(Error::ProcessNotBound)?;
+        Ok(&record.groups[..record.groups_len])
+    }
+
+    pub fn set_groups<const CAPS: usize>(
+        &mut self,
+        process: &Process<CAPS>,
+        groups: &[u32],
+    ) -> Result<(), Error> {
+        validate_live_linux(process)?;
+        let index = self
+            .record_index(process.id())
+            .ok_or(Error::ProcessNotBound)?;
+        let mut record = self.records[index].ok_or(Error::ProcessNotBound)?;
+        if record.credentials.euid != 0 {
+            return Err(Error::PermissionDenied);
+        }
+        if groups.len() > MAX_SUPPLEMENTARY_GROUPS {
+            return Err(Error::InvalidArgument);
+        }
+        record.groups = [0; MAX_SUPPLEMENTARY_GROUPS];
+        record.groups[..groups.len()].copy_from_slice(groups);
+        record.groups_len = groups.len();
+        self.records[index] = Some(record);
+        Ok(())
     }
 
     /// Implements the irreversible policy core behind `PR_SET_NO_NEW_PRIVS` / `PR_GET_NO_NEW_PRIVS`.
@@ -480,5 +764,58 @@ mod tests {
             .bind_process(&replacement, LinuxCredentials::root())
             .unwrap();
         assert_eq!(table.credentials(&replacement).unwrap().euid(), 0);
+    }
+
+    #[test]
+    fn root_can_drop_privileges_and_unprivileged_cannot_escalate() {
+        let mut objects = ObjectTable::<8>::new();
+        let root_proc = Process::<4>::create(&mut objects, Personality::Linux).unwrap();
+        let child_proc = Process::<4>::create_fork_child(&root_proc, &mut objects).unwrap();
+        let mut identities = LinuxIdentityTable::<4, 0>::new();
+        identities.bind_child(&root_proc, &child_proc).unwrap();
+
+        let mut table = CredentialTable::<4>::new();
+        table
+            .bind_process(&root_proc, LinuxCredentials::root())
+            .unwrap();
+        table.set_groups(&root_proc, &[42, 100]).unwrap();
+        assert_eq!(table.groups(&root_proc).unwrap(), &[42, 100]);
+
+        table
+            .update_credentials(&root_proc, |c| c.set_resuid(None, Some(100), None))
+            .unwrap();
+        let tmp = table.credentials(&root_proc).unwrap();
+        assert_eq!(tmp.ruid(), 0);
+        assert_eq!(tmp.euid(), 100);
+        assert_eq!(tmp.suid(), 0);
+        assert_eq!(tmp.fsuid(), 100);
+        // Temporary drop cannot call set_groups while euid != 0, but can restore euid=0 via suid.
+        assert_eq!(
+            table.set_groups(&root_proc, &[1]),
+            Err(Error::PermissionDenied)
+        );
+        table
+            .update_credentials(&root_proc, |c| c.set_uid(0))
+            .unwrap();
+        assert_eq!(table.credentials(&root_proc).unwrap().euid(), 0);
+
+        table
+            .inherit_child(&identities, &root_proc, &child_proc)
+            .unwrap();
+        assert_eq!(table.groups(&child_proc).unwrap(), &[42, 100]);
+        table
+            .update_credentials(&child_proc, |c| {
+                c.set_gid(65534)?;
+                c.set_uid(100)
+            })
+            .unwrap();
+        assert_eq!(
+            table.update_credentials(&child_proc, |c| c.set_uid(0)),
+            Err(Error::PermissionDenied)
+        );
+        assert_eq!(
+            table.update_credentials(&child_proc, |c| c.set_resuid(None, Some(0), None)),
+            Err(Error::PermissionDenied)
+        );
     }
 }

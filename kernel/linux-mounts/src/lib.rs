@@ -6,6 +6,19 @@
 //! and persistent `ext4` read/write root filesystem with `fsync`/`fdatasync`/`sync`/`rename`
 //! package-manager durability semantics.
 
+extern crate alloc;
+
+pub mod block_cache;
+pub mod ext4;
+pub mod partition;
+
+pub use block_cache::{
+    BLOCK_SECTOR_SIZE, BlockDevice, CACHE_BLOCK_SIZE, CachedBlockDevice, DEFAULT_CACHE_BLOCKS,
+    PartitionSlice,
+};
+pub use ext4::{Ext4CreateAttr, Ext4DirEntry, Ext4InodeStat, Ext4StatFsInfo, Ext4Volume};
+pub use partition::{MAX_PARTITIONS, PartitionEntry, PartitionTable, crc32_ieee, parse_partitions};
+
 use kernal_linux_abi::Errno;
 
 /// Linux `mount(2)` flag constants (`<sys/mount.h>`).
@@ -535,6 +548,191 @@ pub struct ProcSysSnapshot<'a> {
     pub boot_id_seed: [u8; 16],
 }
 
+/// Per-process `/proc/<pid>/*` formatting input without hardcoding PID 1.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcProcessInfo<'a> {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub state_char: u8,
+    pub comm: &'a [u8],
+    pub cmdline: &'a [u8],
+    pub vm_size_kb: u64,
+    pub vm_rss_kb: u64,
+}
+
+/// Target selector parsed from a `/proc/<pid>[/<subpath>]` relative path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcPidSelector {
+    Current,
+    Pid(u32),
+}
+
+/// Parses `rel` (relative to `/proc/`) into a PID selector and optional subpath after `<pid>/`.
+pub fn parse_proc_pid_subpath(rel: &[u8]) -> Option<(ProcPidSelector, &[u8])> {
+    if rel.is_empty() {
+        return None;
+    }
+    let (head, tail) = match rel.iter().position(|&b| b == b'/') {
+        Some(idx) => (&rel[..idx], &rel[idx + 1..]),
+        None => (rel, &b""[..]),
+    };
+    let selector = if head == b"self" || head == b"thread-self" {
+        ProcPidSelector::Current
+    } else if !head.is_empty() && head.iter().all(|b| b.is_ascii_digit()) {
+        let parsed = core::str::from_utf8(head).ok()?.parse::<u32>().ok()?;
+        if parsed == 0 {
+            return None;
+        }
+        ProcPidSelector::Pid(parsed)
+    } else {
+        return None;
+    };
+    Some((selector, tail))
+}
+
+fn state_label(state_char: u8) -> &'static [u8] {
+    match state_char {
+        b'Z' => b"Z (zombie)",
+        b'S' => b"S (sleeping)",
+        b'T' => b"T (stopped)",
+        _ => b"R (running)",
+    }
+}
+
+fn format_pid_status(info: &ProcProcessInfo<'_>, out: &mut [u8]) -> usize {
+    let mut c = copy_slice(out, b"Name:\t");
+    c += copy_slice(&mut out[c..], info.comm);
+    c += copy_slice(&mut out[c..], b"\nState:\t");
+    c += copy_slice(&mut out[c..], state_label(info.state_char));
+    c += copy_slice(&mut out[c..], b"\nTgid:\t");
+    c += write_u64_ascii(u64::from(info.pid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\nPid:\t");
+    c += write_u64_ascii(u64::from(info.pid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\nPPid:\t");
+    c += write_u64_ascii(u64::from(info.ppid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\nUid:\t");
+    c += write_u64_ascii(u64::from(info.uid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\t");
+    c += write_u64_ascii(u64::from(info.uid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\nGid:\t");
+    c += write_u64_ascii(u64::from(info.gid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\t");
+    c += write_u64_ascii(u64::from(info.gid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\nVmSize:\t");
+    c += write_u64_ascii(info.vm_size_kb, &mut out[c..]);
+    c += copy_slice(&mut out[c..], b" kB\nVmRSS:\t");
+    c += write_u64_ascii(info.vm_rss_kb, &mut out[c..]);
+    c += copy_slice(&mut out[c..], b" kB\n");
+    c
+}
+
+fn format_pid_stat(info: &ProcProcessInfo<'_>, out: &mut [u8]) -> usize {
+    let state = match info.state_char {
+        b'Z' | b'S' | b'T' => info.state_char,
+        _ => b'R',
+    };
+    let mut c = write_u64_ascii(u64::from(info.pid), out);
+    c += copy_slice(&mut out[c..], b" (");
+    c += copy_slice(&mut out[c..], info.comm);
+    c += copy_slice(&mut out[c..], b") ");
+    c += copy_slice(&mut out[c..], &[state]);
+    c += copy_slice(&mut out[c..], b" ");
+    c += write_u64_ascii(u64::from(info.ppid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b" ");
+    c += write_u64_ascii(u64::from(info.pgid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b" ");
+    c += write_u64_ascii(u64::from(info.sid), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b" 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 ");
+    c += write_u64_ascii(info.vm_size_kb.saturating_mul(1024), &mut out[c..]);
+    c += copy_slice(&mut out[c..], b" ");
+    c += write_u64_ascii(info.vm_rss_kb / 4, &mut out[c..]);
+    c += copy_slice(&mut out[c..], b"\n");
+    c
+}
+
+fn format_pid_cmdline(info: &ProcProcessInfo<'_>, out: &mut [u8]) -> usize {
+    if !info.cmdline.is_empty() {
+        return copy_slice(out, info.cmdline);
+    }
+    let mut c = copy_slice(out, info.comm);
+    if c < out.len() {
+        out[c] = 0;
+        c += 1;
+    }
+    c
+}
+
+/// Synthesizes `/proc/<pid>/<subpath>` for any active or zombie process.
+pub fn read_procfs_process_node<const MAX_MOUNTS: usize>(
+    subpath: &[u8],
+    mounts: &MountTable<MAX_MOUNTS>,
+    info: &ProcProcessInfo<'_>,
+    out: &mut [u8],
+) -> Option<usize> {
+    match subpath {
+        b"mounts" | b"mountinfo" => Some(mounts.format_proc_mounts(out)),
+        b"status" => Some(format_pid_status(info, out)),
+        b"stat" => Some(format_pid_stat(info, out)),
+        b"cmdline" => Some(format_pid_cmdline(info, out)),
+        b"comm" => {
+            let mut c = copy_slice(out, info.comm);
+            c += copy_slice(&mut out[c..], b"\n");
+            Some(c)
+        }
+        b"cgroup" => Some(copy_slice(out, b"0::/\n")),
+        b"oom_score_adj" => Some(copy_slice(out, b"0\n")),
+        _ => None,
+    }
+}
+
+/// Lists deterministic directory children `(name, is_dir)` for a known `/sys/<rel_dir>` directory.
+fn emit_sysfs_spec(spec: &[u8], mut emit: impl FnMut(&[u8], bool)) -> bool {
+    for item in spec.split(|&b| b == b'|') {
+        if item.len() < 3 || item[item.len() - 2] != b':' {
+            continue;
+        }
+        emit(&item[..item.len() - 2], item[item.len() - 1] == b'D');
+    }
+    true
+}
+
+/// Returns `false` if `rel_dir` is not a sysfs directory.
+pub fn enumerate_sysfs_dir(rel_dir: &[u8], emit: impl FnMut(&[u8], bool)) -> bool {
+    let spec: &[u8] = match rel_dir {
+        b"" => b"kernel:D|devices:D|class:D|fs:D",
+        b"kernel" => b"uevent_seqnum:R",
+        b"fs" => b"cgroup:D",
+        b"devices" => b"system:D|virtio0:D|virtio1:D|platform:D",
+        b"devices/system" => b"cpu:D",
+        b"devices/system/cpu" => b"online:R|present:R",
+        b"devices/virtio0" => b"block:D",
+        b"devices/virtio0/block" => b"vda:D",
+        b"devices/virtio0/block/vda" => b"dev:R|size:R|uevent:R",
+        b"devices/virtio1" => b"net:D",
+        b"devices/virtio1/net" => b"eth0:D",
+        b"devices/virtio1/net/eth0" => b"ifindex:R|address:R|operstate:R|uevent:R",
+        b"devices/platform" => b"pl011:D",
+        b"devices/platform/pl011" => b"tty:D",
+        b"devices/platform/pl011/tty" => b"ttyAMA0:D",
+        b"devices/platform/pl011/tty/ttyAMA0" => b"dev:R",
+        b"class" => b"tty:D|net:D|block:D",
+        b"class/tty" => b"console:D|ttyAMA0:D",
+        b"class/tty/console" => b"active:R",
+        b"class/tty/ttyAMA0" => b"dev:R",
+        b"class/net" => b"lo:D|eth0:D",
+        b"class/net/lo" => b"operstate:R|mtu:R|ifindex:R",
+        b"class/net/eth0" => b"ifindex:R|address:R|operstate:R",
+        b"class/block" => b"vda:D",
+        b"class/block/vda" => b"dev:R|size:R|ro:R|uevent:R",
+        _ => return false,
+    };
+    emit_sysfs_spec(spec, emit)
+}
+
 /// Synthesizes `/proc/<rel_path>` content into `out`, returning `Some(bytes_written)` if the path
 /// names a supported `procfs` node.
 pub fn read_procfs_node<const MAX_MOUNTS: usize>(
@@ -544,7 +742,7 @@ pub fn read_procfs_node<const MAX_MOUNTS: usize>(
     out: &mut [u8],
 ) -> Option<usize> {
     match rel_path {
-        b"mounts" | b"self/mounts" | b"self/mountinfo" => Some(mounts.format_proc_mounts(out)),
+        b"mounts" => Some(mounts.format_proc_mounts(out)),
         b"cmdline" => Some(copy_slice(
             out,
             b"console=ttyAMA0,115200 root=/dev/vda rw init=/sbin/init\n",
@@ -569,6 +767,23 @@ pub fn read_procfs_node<const MAX_MOUNTS: usize>(
             cursor += copy_slice(&mut out[cursor..], b".00 0.00\n");
             Some(cursor)
         }
+        b"loadavg" => Some(copy_slice(out, b"0.00 0.00 0.00 1/1 1\n")),
+        b"stat" => Some(copy_slice(
+            out,
+            b"cpu  0 0 0 0 0 0 0 0 0 0\nintr 0\nctxt 0\nbtime 1700000000\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n",
+        )),
+        b"cpuinfo" => {
+            let mut c = 0usize;
+            for cpu in 0..snap.online_cpus.max(1) {
+                c += copy_slice(&mut out[c..], b"processor\t: ");
+                c += write_u64_ascii(u64::from(cpu), &mut out[c..]);
+                c += copy_slice(
+                    &mut out[c..],
+                    b"\nBogoMIPS\t: 125.00\nFeatures\t: fp asimd\nCPU architecture: 8\n\n",
+                );
+            }
+            Some(c)
+        }
         b"meminfo" => {
             let total_kb = snap.total_pages.saturating_mul(4);
             let free_kb = snap.free_pages.saturating_mul(4);
@@ -581,44 +796,26 @@ pub fn read_procfs_node<const MAX_MOUNTS: usize>(
             c += copy_slice(&mut out[c..], b" kB\n");
             Some(c)
         }
-        b"self/status" | b"1/status" => {
-            let mut c = copy_slice(out, b"Name:\t");
-            c += copy_slice(&mut out[c..], snap.comm);
-            c += copy_slice(&mut out[c..], b"\nState:\tR (running)\nPid:\t");
-            c += write_u64_ascii(u64::from(snap.pid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b"\nPPid:\t");
-            c += write_u64_ascii(u64::from(snap.ppid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b"\nUid:\t");
-            c += write_u64_ascii(u64::from(snap.uid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b"\t");
-            c += write_u64_ascii(u64::from(snap.uid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b"\nGid:\t");
-            c += write_u64_ascii(u64::from(snap.gid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b"\t");
-            c += write_u64_ascii(u64::from(snap.gid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b"\n");
-            Some(c)
-        }
-        b"self/stat" | b"1/stat" => {
-            let mut c = write_u64_ascii(u64::from(snap.pid), out);
-            c += copy_slice(&mut out[c..], b" (");
-            c += copy_slice(&mut out[c..], snap.comm);
-            c += copy_slice(&mut out[c..], b") R ");
-            c += write_u64_ascii(u64::from(snap.ppid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b" ");
-            c += write_u64_ascii(u64::from(snap.pgid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b" ");
-            c += write_u64_ascii(u64::from(snap.sid), &mut out[c..]);
-            c += copy_slice(&mut out[c..], b" 0 -1 0 0 0 0 0 0 0 0 20 0 1 0 0\n");
-            Some(c)
-        }
-        b"self/cmdline" | b"1/cmdline" => {
-            let mut c = copy_slice(out, snap.comm);
-            if c < out.len() {
-                out[c] = 0;
-                c += 1;
-            }
-            Some(c)
+        b"self/mounts" | b"self/mountinfo" | b"self/status" | b"1/status" | b"self/stat"
+        | b"1/stat" | b"self/cmdline" | b"1/cmdline" => {
+            let subpath = rel_path
+                .iter()
+                .position(|&b| b == b'/')
+                .map_or(&b""[..], |idx| &rel_path[idx + 1..]);
+            let info = ProcProcessInfo {
+                pid: snap.pid,
+                ppid: snap.ppid,
+                pgid: snap.pgid,
+                sid: snap.sid,
+                uid: snap.uid,
+                gid: snap.gid,
+                state_char: b'R',
+                comm: snap.comm,
+                cmdline: snap.comm,
+                vm_size_kb: 4096,
+                vm_rss_kb: 1024,
+            };
+            read_procfs_process_node(subpath, mounts, &info, out)
         }
         _ => None,
     }
@@ -1150,5 +1347,64 @@ mod tests {
             .resolve(b"/var/lib/oci/rootfs/etc/os-release")
             .unwrap();
         assert_eq!(ov.fstype(), FilesystemType::Overlay);
+    }
+
+    #[test]
+    fn proc_pid_enumeration_and_sysfs_dir_listing_work_for_arbitrary_pid() {
+        let mut tbl = MountTable::<12>::new();
+        tbl.seed_default_hierarchy().unwrap();
+
+        assert_eq!(
+            parse_proc_pid_subpath(b"self/status"),
+            Some((ProcPidSelector::Current, &b"status"[..]))
+        );
+        assert_eq!(
+            parse_proc_pid_subpath(b"42/stat"),
+            Some((ProcPidSelector::Pid(42), &b"stat"[..]))
+        );
+        assert_eq!(
+            parse_proc_pid_subpath(b"42"),
+            Some((ProcPidSelector::Pid(42), &b""[..]))
+        );
+        assert_eq!(parse_proc_pid_subpath(b"0/stat"), None);
+        assert_eq!(parse_proc_pid_subpath(b"meminfo"), None);
+
+        let info = ProcProcessInfo {
+            pid: 42,
+            ppid: 1,
+            pgid: 42,
+            sid: 1,
+            uid: 0,
+            gid: 0,
+            state_char: b'Z',
+            comm: b"ps",
+            cmdline: b"/bin/ps\0aux\0",
+            vm_size_kb: 2048,
+            vm_rss_kb: 512,
+        };
+        let mut buf = [0u8; 512];
+        let st_len = read_procfs_process_node(b"status", &tbl, &info, &mut buf).unwrap();
+        let st = core::str::from_utf8(&buf[..st_len]).unwrap();
+        assert!(st.contains("Name:\tps\n"));
+        assert!(st.contains("State:\tZ (zombie)\n"));
+        assert!(st.contains("Pid:\t42\nPPid:\t1\n"));
+
+        let stat_len = read_procfs_process_node(b"stat", &tbl, &info, &mut buf).unwrap();
+        assert_eq!(
+            core::str::from_utf8(&buf[..stat_len]).unwrap(),
+            "42 (ps) Z 1 42 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 2097152 128\n"
+        );
+
+        let cmd_len = read_procfs_process_node(b"cmdline", &tbl, &info, &mut buf).unwrap();
+        assert_eq!(&buf[..cmd_len], b"/bin/ps\0aux\0");
+
+        let mut dirs = 0usize;
+        assert!(enumerate_sysfs_dir(b"", |_, is_dir| {
+            if is_dir {
+                dirs += 1;
+            }
+        }));
+        assert_eq!(dirs, 4);
+        assert!(!enumerate_sysfs_dir(b"does/not/exist", |_, _| {}));
     }
 }

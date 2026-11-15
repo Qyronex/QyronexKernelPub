@@ -11,7 +11,7 @@ use kernal_qemu_initrd_aarch64::{QEMU_VIRT_RAM_BASE, QEMU_VIRT_RAM_BYTES};
 use kernal_protected_boot_aarch64::ProtectedInitrd;
 
 pub const STEP15_RESERVED_RANGES: usize = 2;
-pub const STEP15_FRAME_EXTENTS: usize = 8;
+pub const STEP15_FRAME_EXTENTS: usize = 1024;
 pub type Step15FrameAllocator = ExtentAllocator<STEP15_FRAME_EXTENTS>;
 
 const RES_EMPTY: u8 = 0;

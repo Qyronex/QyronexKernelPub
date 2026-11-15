@@ -24,9 +24,7 @@ const RT_SIGRETURN_TRAMPOLINE_BYTES: [u8; 12] = [
 ];
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-use super::{
-    Error as LoaderError, LoadedImage, load_aarch64_dynamic_elf_prepared, load_aarch64_elf_prepared,
-};
+use super::{LoadedImage, load_aarch64_dynamic_elf_prepared, load_aarch64_elf_prepared};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_memory::{PhysFrame, ReservationSet};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]

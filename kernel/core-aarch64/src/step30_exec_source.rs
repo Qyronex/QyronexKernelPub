@@ -31,10 +31,18 @@ pub(super) enum ExecSourceError {
 /// identities to match before the canonical VFS exposes bytes.
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ExecImageSource {
-    initrd: ProtectedInitrd,
-    root_id: RootId,
-    file: ReadOnlyFile,
+pub(super) enum ExecImageSource {
+    Initramfs {
+        initrd: ProtectedInitrd,
+        root_id: RootId,
+        file: ReadOnlyFile,
+    },
+    Ext4 {
+        mount_id: u32,
+        ino: u32,
+        mode: u16,
+        size: u64,
+    },
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
@@ -43,23 +51,42 @@ impl ExecImageSource {
         self,
         operation: impl for<'a> FnOnce(&'a [u8]) -> R,
     ) -> Result<R, ExecSourceError> {
-        if self.file.root_id() != self.root_id {
-            return Err(ExecSourceError::Invariant);
-        }
-        self.initrd.with_bytes(|archive_bytes| {
-            let archive = kernal_cpio::Archive::parse(archive_bytes)
-                .map_err(|_| ExecSourceError::Invariant)?;
-            let root = InitramfsRoot::new(archive, self.root_id);
-            let image = root
-                .read_at(self.file, 0, usize::MAX)
-                .map_err(map_vfs_error)?;
-            if image.len()
-                != usize::try_from(self.file.size()).map_err(|_| ExecSourceError::Invariant)?
-            {
-                return Err(ExecSourceError::Invariant);
+        match self {
+            Self::Initramfs {
+                initrd,
+                root_id,
+                file,
+            } => {
+                if file.root_id() != root_id {
+                    return Err(ExecSourceError::Invariant);
+                }
+                initrd.with_bytes(|archive_bytes| {
+                    let archive = kernal_cpio::Archive::parse(archive_bytes)
+                        .map_err(|_| ExecSourceError::Invariant)?;
+                    let root = InitramfsRoot::new(archive, root_id);
+                    let image = root.read_at(file, 0, usize::MAX).map_err(map_vfs_error)?;
+                    if image.len()
+                        != usize::try_from(file.size()).map_err(|_| ExecSourceError::Invariant)?
+                    {
+                        return Err(ExecSourceError::Invariant);
+                    }
+                    Ok(operation(image))
+                })
             }
-            Ok(operation(image))
-        })
+            Self::Ext4 {
+                mount_id,
+                ino,
+                mode,
+                size,
+            } => {
+                if mode & 0o111 == 0 {
+                    return Err(ExecSourceError::Linux(Errno::EACCES));
+                }
+                let image = super::step33_ext4_vfs::read_ext4_file_all(mount_id, ino, size)
+                    .map_err(ExecSourceError::Linux)?;
+                Ok(operation(&image))
+            }
+        }
     }
 }
 
@@ -103,6 +130,27 @@ pub(super) fn select_exec_image_source(
     plan: ExecLookupPlan,
     path: &[u8],
 ) -> Result<ExecImageSource, ExecSourceError> {
+    match super::step33_ext4_vfs::try_select_ext4_exec(
+        process,
+        plan.dirfd(),
+        path,
+        plan.path_is_empty(),
+        plan.follows_final_symlink(),
+    ) {
+        Ok(Some(ext4_file)) => {
+            if ext4_file.mode & 0o111 == 0 {
+                return Err(ExecSourceError::Linux(Errno::EACCES));
+            }
+            return Ok(ExecImageSource::Ext4 {
+                mount_id: ext4_file.mount_id,
+                ino: ext4_file.ino,
+                mode: ext4_file.mode,
+                size: ext4_file.size,
+            });
+        }
+        Ok(None) => {}
+        Err(errno) => return Err(ExecSourceError::Linux(errno)),
+    }
     super::step29_runtime::with_process(process, |runtime| {
         // Copy only immutable provenance values out of the broad legacy parts tuple, then end those
         // descriptor borrows before entering the Overlay/FsContext selection below.
@@ -193,7 +241,7 @@ pub(super) fn select_exec_image_source(
             .read_regular(handle, 0, &mut empty)
             .map_err(map_overlay_error)?;
 
-        Ok(ExecImageSource {
+        Ok(ExecImageSource::Initramfs {
             initrd,
             root_id,
             file,

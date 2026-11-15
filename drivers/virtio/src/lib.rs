@@ -6,14 +6,19 @@
 //! capability/IOMMU-mediated `virtio-blk`, `virtio-net`, and `virtio-rng` drivers.
 
 pub mod blk;
+pub mod blk_mmio;
 pub mod mmio;
 pub mod net;
+pub mod net_mmio;
 pub mod queue;
 pub mod rng;
 
 pub use blk::{
     SECTOR_SIZE, VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SIZE_MAX,
     VirtioBlkDevice, VirtioBlkOp, VirtioBlkReqHeader,
+};
+pub use blk_mmio::{
+    DEFAULT_BLK_MMIO_DMA_BYTES, DEFAULT_BLK_MMIO_QUEUE_SIZE, VirtioBlkDmaBlock, VirtioBlkMmio,
 };
 pub use mmio::{
     MmioBus, VIRTIO_F_VERSION_1, VIRTIO_MMIO_MAGIC, VirtioDeviceId, VirtioMmioTransport,
@@ -23,6 +28,10 @@ pub use net::{
     NET_DEFAULT_MTU, VIRTIO_NET_F_CSUM, VIRTIO_NET_F_GUEST_CSUM, VIRTIO_NET_F_MAC,
     VIRTIO_NET_F_MTU, VIRTIO_NET_F_STATUS, VirtioNetDevice, VirtioNetHdr, VirtioNetL3, VirtioNetL4,
     VirtioNetValidation,
+};
+pub use net_mmio::{
+    DEFAULT_NET_MMIO_BUF_BYTES, DEFAULT_NET_MMIO_QUEUE_SIZE, HARDWARE_NET_FEATURES,
+    VirtioNetDmaBlock, VirtioNetMmio,
 };
 pub use queue::{
     DmaBufferGrant, MAX_VIRTQ_SIZE, SplitVirtqueue, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE,

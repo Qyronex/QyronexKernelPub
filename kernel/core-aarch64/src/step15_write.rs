@@ -42,6 +42,39 @@ impl BootstrapContext for LiveBootstrapContext {
     }
 }
 
+fn with_live_writer<R>(
+    operation: impl FnOnce(
+        &kernal_process_aarch64::ActiveProcess<
+            '_,
+            { super::runtime::STEP15_RUNTIME_CAPS },
+            { super::runtime::STEP15_RUNTIME_VMAS },
+        >,
+        &mut LiveBootstrapContext,
+    ) -> Result<R, ()>,
+) -> Result<R, ()> {
+    let current_cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
+    // SAFETY: this lower-EL synchronous SVC owns the current PE's IRQ-masked scheduler window.
+    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
+    let serial = super::step15_svc_serial().ok_or(())?;
+
+    super::runtime::with_linux_runtime(|state| {
+        let pid = state
+            .with_current_process_identity(current, |process, identities| {
+                identities.bound_pid(process)
+            })
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let (process, address_space, tid) = state
+            .process_parts_for_scheduler_thread(current)
+            .map_err(|_| ())?;
+        let active = address_space.current_owner(process).map_err(|_| ())?;
+        let mut context = LiveBootstrapContext { serial, pid, tid };
+        operation(&active, &mut context)
+    })
+    .map_err(|_| ())?
+}
+
 /// Executes live AArch64 `write(2)` through the accepted Step-14 trap/return boundary.
 ///
 /// The exact current scheduler generation, Linux PID/TID and opaque `ActiveProcess` witness are
@@ -49,32 +82,10 @@ impl BootstrapContext for LiveBootstrapContext {
 /// bounded and non-scheduling, so the witness remains valid through `dispatch_linux_syscall`, which
 /// alone commits the validated Linux return to the exception frame.
 pub(super) fn handle(frame: &mut ExceptionFrame) -> bool {
-    let current_cpu = super::super::current_cpu_index();
-    let Some(scheduler) = super::super::CPU_SCHEDULERS.get(current_cpu) else {
-        return false;
-    };
-    // SAFETY: this lower-EL synchronous SVC owns the current PE's IRQ-masked scheduler window.
-    let current = match unsafe { scheduler.bootstrap_current_global_thread() } {
-        Ok(current) => current,
-        Err(_) => return false,
-    };
-    let Some(serial) = super::step15_svc_serial() else {
-        return false;
-    };
-
-    let dispatched = super::runtime::with_linux_runtime(|state| {
-        let (process, address_space, _, _, identities, _) = state.initial_leader_parts();
-        let pid = identities.bound_pid(&*process).map_err(|_| ())?;
-        let tid = identities
-            .bound_tid_for_scheduler_thread(&*process, current)
-            .map_err(|_| ())?;
-        let active = address_space.current_owner(&*process).map_err(|_| ())?;
-        let mut context = LiveBootstrapContext { serial, pid, tid };
-
-        dispatch_linux_syscall(&active, frame, &mut context).map_err(|_| ())
+    let dispatched = with_live_writer(|active, context| {
+        dispatch_linux_syscall(active, frame, context).map_err(|_| ())
     });
-
-    matches!(dispatched, Ok(Ok(TrapOutcome::Returned)))
+    matches!(dispatched, Ok(TrapOutcome::Returned))
 }
 
 /// Executes a live serial write for an already-authorized External stdout/stderr object.
@@ -93,33 +104,16 @@ pub(super) fn handle_bound_output(frame: &mut ExceptionFrame, output: OutputFd) 
         return Err(());
     }
 
-    let current_cpu = super::super::current_cpu_index();
-    let scheduler = super::super::CPU_SCHEDULERS.get(current_cpu).ok_or(())?;
-    // SAFETY: this lower-EL synchronous SVC owns the current PE's IRQ-masked scheduler window.
-    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
-    let serial = super::step15_svc_serial().ok_or(())?;
-
-    let result = super::runtime::with_linux_runtime(|state| {
-        let (process, address_space, _, _, identities, _) = state.initial_leader_parts();
-        let pid = identities.bound_pid(&*process).map_err(|_| ())?;
-        let tid = identities
-            .bound_tid_for_scheduler_thread(&*process, current)
-            .map_err(|_| ())?;
-        // Preserve the accepted live address-space ownership check even though the descriptor
-        // authority was already resolved by the Step-29 FD owner. Keep the witness live across the
-        // synchronous output transaction.
-        let _active = address_space.current_owner(&*process).map_err(|_| ())?;
-        let mut context = LiveBootstrapContext { serial, pid, tid };
-
-        match context.write(output, frame.x[1], frame.x[2]) {
-            Ok(written) => {
-                let written = i64::try_from(written).map_err(|_| ())?;
-                SyscallReturn::success(written).ok_or(())
-            }
-            Err(errno) => Ok(SyscallReturn::error(errno)),
-        }
-    })
-    .map_err(|_| ())??;
+    let result =
+        with_live_writer(
+            |_active, context| match context.write(output, frame.x[1], frame.x[2]) {
+                Ok(written) => {
+                    let written = i64::try_from(written).map_err(|_| ())?;
+                    SyscallReturn::success(written).ok_or(())
+                }
+                Err(errno) => Ok(SyscallReturn::error(errno)),
+            },
+        )?;
 
     frame.x[0] = result.as_u64_bits();
     Ok(())

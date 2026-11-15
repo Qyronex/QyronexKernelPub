@@ -59,7 +59,7 @@ fn encode_parts(
     encode_parts_with_inode(ino, name, kind, next_cursor)
 }
 
-fn encode_parts_with_inode(
+pub(super) fn encode_parts_with_inode(
     ino: u64,
     name: &[u8],
     kind: NodeKind,

@@ -324,6 +324,7 @@ fn prepare_handler_frame(
     current: GlobalThreadId,
     switch_generation: u64,
     prepared: &PreparedSignalDelivery,
+    restore_mask: Option<kernal_linux_signal::SignalSet>,
 ) -> Result<Option<HandlerFramePreparation>, ()> {
     let Delivery::Handler {
         signal,
@@ -344,13 +345,15 @@ fn prepare_handler_frame(
         )));
     }
 
-    let entry_points_executable = super::runtime::with_linux_runtime(|state| {
+    let resolved = super::runtime::with_linux_runtime(|state| {
         state.with_current_signal_delivery(
             current,
             switch_generation,
             |process, address_space, objects, _identities, _signals| {
+                let step15_trampoline = super::loader_frames::STEP15_LINUX_RT_SIGRETURN_TRAMPOLINE;
                 let mut handler_executable = false;
                 let mut restorer_executable = false;
+                let mut step15_trampoline_executable = false;
                 for index in 0..super::runtime::STEP15_RUNTIME_VMAS {
                     let Some(vma) = address_space
                         .user_vma_at(process, objects, process.address_space_handle(), index)
@@ -365,18 +368,31 @@ fn prepare_handler_frame(
                     if vma.start <= restorer && restorer < end {
                         restorer_executable = vma.perms.executable();
                     }
+                    if handler.restorer().is_none()
+                        && vma.start <= step15_trampoline
+                        && step15_trampoline < end
+                        && vma.perms.executable()
+                    {
+                        step15_trampoline_executable = true;
+                    }
                     if handler_executable && restorer_executable {
                         break;
                     }
                 }
-                Ok::<bool, ()>(handler_executable && restorer_executable)
+                if !restorer_executable && step15_trampoline_executable {
+                    Ok::<(bool, u64), ()>((handler_executable, step15_trampoline))
+                } else {
+                    Ok::<(bool, u64), ()>((handler_executable && restorer_executable, restorer))
+                }
             },
         )
     })
     .map_err(|_| ())?
     .map_err(|_| ())?
     .map_err(|_| ())?;
-    if !entry_points_executable {
+    let entry_points_executable = resolved.0;
+    let restorer = resolved.1;
+    if !entry_points_executable || restorer & 3 != 0 {
         return Ok(Some(HandlerFramePreparation::BadUserState(
             "handler/restorer mapping is not executable",
         )));
@@ -499,7 +515,7 @@ fn prepare_handler_frame(
         0,
         0,
         Aarch64SignalStack::new(0, SS_DISABLE, 0),
-        previous_mask.bits(),
+        restore_mask.unwrap_or(previous_mask).bits(),
         integer,
     );
     // SAFETY: this path is the exact current EL0 generation's synchronous return path. It captures
@@ -634,8 +650,13 @@ pub(super) fn deliver_interrupted_wait(
                 InterruptedWaitContext::ReturnEintr
             };
             let snapshot = interrupted_wait_snapshot(frame, context)?;
-            let Some(frame_preparation) =
-                prepare_handler_frame(&snapshot, current, resumed_switch_generation, &prepared)?
+            let Some(frame_preparation) = prepare_handler_frame(
+                &snapshot,
+                current,
+                resumed_switch_generation,
+                &prepared,
+                None,
+            )?
             else {
                 return Err(());
             };
@@ -861,8 +882,13 @@ pub(super) fn deliver_interrupted_futex(
                 InterruptedWaitContext::ReturnEintr
             };
             let snapshot = interrupted_wait_snapshot(frame, context)?;
-            let Some(frame_preparation) =
-                prepare_handler_frame(&snapshot, current, resumed_switch_generation, &prepared)?
+            let Some(frame_preparation) = prepare_handler_frame(
+                &snapshot,
+                current,
+                resumed_switch_generation,
+                &prepared,
+                None,
+            )?
             else {
                 return Err(());
             };
@@ -929,6 +955,62 @@ fn fail_closed_after_signal_commit(message: &str) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+struct SavedRestoreMasksCell {
+    lock: core::sync::atomic::AtomicU8,
+    masks:
+        core::cell::UnsafeCell<alloc::vec::Vec<(GlobalThreadId, kernal_linux_signal::SignalSet)>>,
+}
+
+// SAFETY: `with_saved_restore_masks` serializes all access via an acquire/release atomic lock.
+unsafe impl Sync for SavedRestoreMasksCell {}
+
+static SAVED_RESTORE_MASKS: SavedRestoreMasksCell = SavedRestoreMasksCell {
+    lock: core::sync::atomic::AtomicU8::new(0),
+    masks: core::cell::UnsafeCell::new(alloc::vec::Vec::new()),
+};
+
+fn with_saved_restore_masks<R>(
+    f: impl FnOnce(&mut alloc::vec::Vec<(GlobalThreadId, kernal_linux_signal::SignalSet)>) -> R,
+) -> R {
+    while SAVED_RESTORE_MASKS
+        .lock
+        .compare_exchange_weak(
+            0,
+            1,
+            core::sync::atomic::Ordering::Acquire,
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    // SAFETY: `lock == 1` grants exclusive mutable access for this short critical section.
+    let res = f(unsafe { &mut *SAVED_RESTORE_MASKS.masks.get() });
+    SAVED_RESTORE_MASKS
+        .lock
+        .store(0, core::sync::atomic::Ordering::Release);
+    res
+}
+
+struct SavedRestoreMaskGuard(GlobalThreadId);
+
+impl Drop for SavedRestoreMaskGuard {
+    fn drop(&mut self) {
+        with_saved_restore_masks(|masks| {
+            if let Some(pos) = masks.iter().rposition(|(tid, _)| *tid == self.0) {
+                masks.swap_remove(pos);
+            }
+        });
+    }
+}
+
+fn take_saved_restore_mask(tid: GlobalThreadId) -> Option<kernal_linux_signal::SignalSet> {
+    with_saved_restore_masks(|masks| {
+        let pos = masks.iter().rposition(|(entry_tid, _)| *entry_tid == tid)?;
+        Some(masks.swap_remove(pos).1)
+    })
 }
 
 /// Attempts one pending signal delivery after an already-successful SVC dispatch and before `eret`.
@@ -1152,11 +1234,13 @@ pub(super) fn deliver_on_return(frame: &mut ExceptionFrame) -> Result<(), ()> {
         Delivery::Handler { .. } => {
             let expected = prepared.delivery();
             let snapshot = *frame;
+            let restore_mask = take_saved_restore_mask(current);
             let Some(frame_preparation) = prepare_handler_frame(
                 &snapshot,
                 current,
                 frame.entry_switch_generation(),
                 &prepared,
+                restore_mask,
             )?
             else {
                 return Err(());
@@ -1223,4 +1307,25 @@ pub(super) fn deliver_on_return(frame: &mut ExceptionFrame) -> Result<(), ()> {
             }
         }
     }
+}
+
+/// Delivers a pending signal on return from a syscall that installed a temporary sigmask
+/// (`ppoll`/`pselect6`/`epoll_pwait`), preserving `saved_mask` in the `ucontext_t` for `rt_sigreturn`.
+pub(super) fn deliver_on_return_with_saved_mask(
+    frame: &mut ExceptionFrame,
+    saved_mask: kernal_linux_signal::SignalSet,
+) -> Result<(), ()> {
+    let cpu = super::super::current_cpu_index();
+    let scheduler = super::super::CPU_SCHEDULERS.get(cpu).ok_or(())?;
+    // SAFETY: synchronous return boundary on the active CPU owning `frame`.
+    let current = unsafe { scheduler.bootstrap_current_global_thread() }.map_err(|_| ())?;
+    with_saved_restore_masks(|masks| {
+        if let Some(entry) = masks.iter_mut().find(|(tid, _)| *tid == current) {
+            entry.1 = saved_mask;
+        } else {
+            masks.push((current, saved_mask));
+        }
+    });
+    let _guard = SavedRestoreMaskGuard(current);
+    deliver_on_return(frame)
 }

@@ -21,27 +21,27 @@ STACK_GUARD_SIZE = 0x1000;
  * comfortably above that bounded object size instead of reducing filesystem capacity or introducing
  * a second heap/namespace owner in Core.
  */
-BOOT_STACK_SIZE = 0x40000;
+BOOT_STACK_SIZE = 0x80000;
 /*
  * The final Step-29 Overlay path resolver keeps several PATH_MAX-sized bounded work buffers live in
- * one syscall frame. Clone/user-thread stacks share this guarded linker arena with firmware
- * secondary stacks, so use one 256 KiB payload stride for the complete protected arena. The separate
+ * one syscall frame, and Step-31/33 live Debian execve nests 256-VMA address-space builders. Clone/user-thread stacks share this guarded linker arena with firmware
+ * secondary stacks, so use one 512 KiB payload stride for the complete protected arena. The separate
  * scheduler smoke-worker stack remains 64 KiB below.
  */
-SECONDARY_STACK_SIZE = 0x40000;
+SECONDARY_STACK_SIZE = 0x80000;
 SECONDARY_STACK_COUNT = 4;
 CLONE_STACK_COUNT = 16;
 SECONDARY_STACK_STRIDE = STACK_GUARD_SIZE + SECONDARY_STACK_SIZE;
 SCHEDULER_WORKER_STACK_SIZE = 0x10000;
 /*
- * The post-bootstrap verifier and Step-15 live VM share one monotonic page-table pool. Steps 7-14
- * already consume most of the former 96-page reserve; the first live KMap zero may then allocate
- * TTBR1 intermediate tables before a large pthread mmap needs several additional TTBR0 leaf-table
- * pages. Keep bounded headroom for that accepted live owner path rather than treating linker-pool
- * exhaustion as a VM invariant failure. The pool remains fixed-size and fail-closed on exhaustion.
+ * The post-bootstrap verifier, Step-15 live VM and dynamically linked multi-process workloads
+ * share one monotonic page-table pool (with recycling of detached empty tables on process exit).
+ * Keep bounded headroom for dynamic ELFs whose sparse low/high VA mappings span multiple TTBR0
+ * subtrees across concurrent forked processes. The pool remains fixed-size and fail-closed.
  */
-BOOT_PAGE_TABLE_COUNT = 128;
+BOOT_PAGE_TABLE_COUNT = 512;
 BOOT_PAGE_TABLE_BYTES = BOOT_PAGE_TABLE_COUNT * 0x1000;
+KERNEL_HEAP_SIZE = 0x1000000;
 
 PHDRS
 {
@@ -74,6 +74,13 @@ SECTIONS
     *(.rodata .rodata.*)
     . = ALIGN(0x1000);
     __rodata_end = .;
+  } :rodata
+
+  .rela.dyn : ALIGN(8)
+  {
+    __rela_dyn_start = .;
+    *(.rela.dyn .rela.dyn.*)
+    __rela_dyn_end = .;
   } :rodata
 
   .data : ALIGN(0x1000)
@@ -122,6 +129,11 @@ SECTIONS
     __scheduler_worker_stack_bottom = .;
     . += SCHEDULER_WORKER_STACK_SIZE;
     __scheduler_worker_stack_top = .;
+
+    . = ALIGN(0x1000);
+    __kernel_heap_start = .;
+    . += KERNEL_HEAP_SIZE;
+    __kernel_heap_end = .;
 
     . = ALIGN(0x1000);
     __boot_page_tables_start = .;

@@ -74,6 +74,19 @@ impl RetiredThreadIdentity {
     }
 }
 
+/// Read-only generation-qualified view of one published process for `/proc` enumeration.
+///
+/// Carrying the `ObjectId` lets runtime observers join identity metadata with the exact
+/// live/exited `Process` and `CredentialTable` owners without elevating scalar PIDs into authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessIdentityView {
+    pub process: ObjectId,
+    pub pid: NonZeroU32,
+    pub ppid: u32,
+    pub pgid: NonZeroU32,
+    pub sid: NonZeroU32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ThreadKey {
     object: ObjectId,
@@ -864,6 +877,41 @@ impl<const PROCESSES: usize, const THREADS: usize> LinuxIdentityTable<PROCESSES,
         Ok(())
     }
 
+    /// Collects read-only views of all published (leader-bound) processes in table order into `out`.
+    pub fn collect_process_views(&self, out: &mut [Option<ProcessIdentityView>]) -> usize {
+        let mut count = 0usize;
+        for record in self.processes.iter().flatten() {
+            if let Some(view) = Self::record_to_view(record) {
+                if count >= out.len() {
+                    break;
+                }
+                out[count] = Some(view);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Looks up one published process view by its Linux PID for `/proc/<pid>` inspection.
+    pub fn lookup_process_view_by_pid(&self, pid: NonZeroU32) -> Option<ProcessIdentityView> {
+        self.processes
+            .iter()
+            .flatten()
+            .filter_map(Self::record_to_view)
+            .find(|view| view.pid == pid)
+    }
+
+    fn record_to_view(record: &ProcessRecord) -> Option<ProcessIdentityView> {
+        record.leader?;
+        Some(ProcessIdentityView {
+            process: record.process,
+            pid: record.pid,
+            ppid: record.parent.map_or(0, |p| p.pid.get()),
+            pgid: record.process_group,
+            sid: record.session,
+        })
+    }
+
     fn process_group_exists(&self, session: NonZeroU32, process_group: NonZeroU32) -> bool {
         self.processes
             .iter()
@@ -1509,5 +1557,28 @@ mod tests {
         let mut another = LinuxIdentityTable::<2, 1>::new();
         another.allocator.next = 0;
         assert_eq!(another.pid_for(&second), Err(Error::Exhausted));
+    }
+
+    #[test]
+    fn collect_and_lookup_process_views_return_only_published_leaders() {
+        let mut objects = ObjectTable::<16>::new();
+        let mut bindings = ThreadObjectBindings::<4>::new();
+        let mut scheduler = RunQueue::<4>::new();
+
+        let mut proc1 = Process::<8>::create(&mut objects, Personality::Linux).unwrap();
+        let mut ident = LinuxIdentityTable::<4, 8>::new();
+        let (_th1, handle1) = attach(&mut proc1, &mut objects, &mut bindings, &mut scheduler);
+        let pid1 = ident
+            .bind_leader(&proc1, &objects, &bindings, &scheduler, CPU0, handle1)
+            .unwrap();
+
+        let child = Process::<8>::create_fork_child(&proc1, &mut objects).unwrap();
+        ident.bind_child(&proc1, &child).unwrap();
+
+        let mut out = [None; 4];
+        assert_eq!(ident.collect_process_views(&mut out), 1);
+        assert_eq!(out[0].unwrap().pid, pid1);
+        assert_eq!(out[0].unwrap().ppid, 0);
+        assert_eq!(ident.lookup_process_view_by_pid(pid1), out[0]);
     }
 }

@@ -45,6 +45,7 @@ members = [
     "kernel/exceptions-aarch64",
     "kernel/exceptions-x86_64",
     "kernel/frame-allocator",
+  "kernel/heap",
     "kernel/futex",
     "kernel/gicv3-aarch64",
     "kernel/idle-x86_64",

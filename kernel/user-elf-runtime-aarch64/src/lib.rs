@@ -4,6 +4,7 @@
 
 mod linux;
 pub use kernal_user_elf::linux_stack::{MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_STRING_BYTES};
+pub use kernal_user_elf::{DynamicLoadPolicy, LoadPolicy};
 pub use linux::{
     AARCH64_LINUX_RT_SIGRETURN_TRAMPOLINE, LinuxInitialStackLayout, LinuxProcessStart,
     plan_aarch64_dynamic_linux_initial_stack, plan_aarch64_linux_initial_stack,
@@ -14,7 +15,7 @@ pub use linux::{load_aarch64_dynamic_linux_elf, load_aarch64_linux_elf};
 use kernal_elf::{Error as ElfError, Image, Machine};
 use kernal_memory::{PhysFrame, ReservationSet};
 use kernal_user_elf::{
-    DynamicLoadPolicy, DynamicUserLoadPlan, Error as UserElfError, LoadPolicy, UserLoadPlan,
+    DynamicUserLoadPlan, Error as UserElfError, UserLoadPlan,
     initialization::{InitializationError, initialize_segment_page, initialize_stack_page},
 };
 use kernal_user_elf_aarch64::{

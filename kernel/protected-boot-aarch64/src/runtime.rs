@@ -57,6 +57,26 @@ pub fn runtime_mmio_region(region: MmioRegion) -> MmioRegion {
     region
 }
 
+/// Resolves a canonical high-half kernel static image address (`.text`/`.rodata`/`.data`/`.bss`)
+/// back to its underlying physical address while the protected bootstrap runtime is active.
+pub fn runtime_kernel_alias_physical(virtual_address: u64) -> Option<u64> {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    {
+        if super::is_active() {
+            return super::boot_state()
+                .layout
+                .physical_from_high_kernel_alias(virtual_address)
+                .ok();
+        }
+        return None;
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
+    {
+        let _ = virtual_address;
+        None
+    }
+}
+
 /// Returns whether the BSP may claim the post-bootstrap page-table pool while secondary PEs remain
 /// held at the final runtime-release barrier.
 ///

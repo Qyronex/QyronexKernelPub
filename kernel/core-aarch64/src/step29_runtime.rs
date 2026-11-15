@@ -6,18 +6,18 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kernal_capability::ObjectId;
 use kernal_cpio::Archive;
 use kernal_linux_fd::{Error as FdError, FdTable, FdTableSet, FdViewId, ReleasedObject};
-use kernal_linux_pipe::{PIPE_BUF, PipeTable};
+use kernal_linux_pipe::{End as PipeEnd, PIPE_BUF, PipeId, PipeTable};
 use kernal_linux_vfs::{
     FsContext, InitramfsRoot, OverlayDirectoryHandle, OverlayNamespace, RootId,
 };
 use kernal_protected_boot_aarch64::ProtectedInitrd;
 
-pub const STEP29_RUNTIME_FDS: usize = 32;
+pub const STEP29_RUNTIME_FDS: usize = 64;
 pub const STEP29_RUNTIME_PIPES: usize = STEP29_RUNTIME_FDS / 2;
 pub const STEP29_RUNTIME_PIPE_CAPACITY: usize = PIPE_BUF;
-/// Step 30 admits four simultaneous Linux Process generations. Each Process receives one exact
-/// generation-bound descriptor view while every view shares this runtime's single canonical OFD pool.
-pub const STEP29_RUNTIME_PROCESS_VIEWS: usize = 4;
+/// Step 30+/Debian runtime admits sixteen simultaneous Linux Process generations, partitioned cleanly
+/// below `DEV_FD_BASE` (`64..96`).
+pub const STEP29_RUNTIME_PROCESS_VIEWS: usize = 16;
 
 // Final Step-29 filesystem integration owns one bounded mutable Overlay namespace. These capacities
 // are deliberately process-local and finite: the VFS remains the sole namespace/data/lifetime owner
@@ -196,6 +196,7 @@ impl Step29PathRuntime<'_> {
 struct RuntimeCell {
     state: AtomicU8,
     processes: UnsafeCell<[Option<ProcessFdBinding>; STEP29_RUNTIME_PROCESS_VIEWS]>,
+    exited_retired: UnsafeCell<[Option<ObjectId>; STEP29_RUNTIME_PROCESS_VIEWS]>,
     initrd: UnsafeCell<MaybeUninit<ProtectedInitrd>>,
     fds: UnsafeCell<FdTableSet<STEP29_RUNTIME_PROCESS_VIEWS, STEP29_RUNTIME_FDS>>,
     pipes: UnsafeCell<PipeTable<STEP29_RUNTIME_PIPES, STEP29_RUNTIME_PIPE_CAPACITY>>,
@@ -217,6 +218,7 @@ impl RuntimeCell {
         Self {
             state: AtomicU8::new(EMPTY),
             processes: UnsafeCell::new([None; STEP29_RUNTIME_PROCESS_VIEWS]),
+            exited_retired: UnsafeCell::new([None; STEP29_RUNTIME_PROCESS_VIEWS]),
             initrd: UnsafeCell::new(MaybeUninit::uninit()),
             fds: UnsafeCell::new(FdTableSet::new()),
             pipes: UnsafeCell::new(PipeTable::new()),
@@ -422,6 +424,7 @@ impl RuntimeCell {
             view: child_view,
         });
         self.state.store(READY, Ordering::Release);
+        super::step_fd_util::on_subsystem_process_fork(parent, child);
         Ok(())
     }
 
@@ -437,10 +440,19 @@ impl RuntimeCell {
         // SAFETY: BORROWED grants exclusive access to bindings, contexts, FD/OFD state, PipeTable and
         // the sole Overlay namespace for this complete teardown transaction.
         let processes = unsafe { &mut *self.processes.get() };
+        let exited_retired = unsafe { &mut *self.exited_retired.get() };
         let Some(binding_index) = processes
             .iter()
             .position(|binding| binding.is_some_and(|binding| binding.process == process))
         else {
+            if let Some(slot) = exited_retired
+                .iter_mut()
+                .find(|slot| **slot == Some(process))
+            {
+                *slot = None;
+                self.state.store(READY, Ordering::Release);
+                return Ok(());
+            }
             self.state.store(READY, Ordering::Release);
             return Err(Error::WrongProcess);
         };
@@ -467,16 +479,40 @@ impl RuntimeCell {
             return Err(Error::ResourceRelease);
         }
 
+        let mut closed_pipes = [None::<(PipeId, PipeEnd)>; STEP29_RUNTIME_FDS];
+        let mut closed_pipe_count = 0usize;
+        let mut released_subsystems =
+            [None::<kernal_linux_fd::SubsystemHandle>; STEP29_RUNTIME_FDS];
+        let mut released_subsys_count = 0usize;
         let pipes = unsafe { &mut *self.pipes.get() };
         for object in released.into_iter().flatten() {
             let release_ok = match object {
-                ReleasedObject::Pipe(endpoint) => pipes.close(endpoint).is_ok(),
+                ReleasedObject::Pipe(endpoint) => {
+                    let close_ok = pipes.close(endpoint).is_ok();
+                    if close_ok {
+                        let key = (endpoint.pipe(), endpoint.end());
+                        if !closed_pipes[..closed_pipe_count].contains(&Some(key))
+                            && closed_pipe_count < closed_pipes.len()
+                        {
+                            closed_pipes[closed_pipe_count] = Some(key);
+                            closed_pipe_count += 1;
+                        }
+                    }
+                    close_ok
+                }
                 ReleasedObject::RetainedDirectory(directory) => {
                     overlay.release_directory(directory).is_ok()
                 }
                 ReleasedObject::RetainedReadOnly(logical) => overlay.release_open(logical).is_ok(),
                 ReleasedObject::WritableRegular(retained) => {
                     overlay.release_retained_regular(retained).is_ok()
+                }
+                ReleasedObject::Subsystem(handle) => {
+                    if released_subsys_count < released_subsystems.len() {
+                        released_subsystems[released_subsys_count] = Some(handle);
+                        released_subsys_count += 1;
+                    }
+                    true
                 }
             };
             if !release_ok {
@@ -488,6 +524,14 @@ impl RuntimeCell {
         fs_contexts[binding_index] = FsContext::new(INITRAMFS_ROOT_ID);
         processes[binding_index] = None;
         self.state.store(READY, Ordering::Release);
+        super::step_fd_util::release_subsystem_handles(
+            &released_subsystems[..released_subsys_count],
+        );
+        super::step_fd_util::on_subsystem_process_exit(process);
+        for (pipe, end) in closed_pipes[..closed_pipe_count].iter().flatten() {
+            super::futex::pipe_blocking::notify_after_endpoint_close(*pipe, *end)
+                .map_err(|_| Error::ResourceRelease)?;
+        }
         Ok(())
     }
 
@@ -502,6 +546,39 @@ impl RuntimeCell {
             Err(POISONED) => Err(Error::Poisoned),
             Err(_) => Err(Error::InvalidState),
         }
+    }
+
+    fn retire_on_process_exit(&self, process: ObjectId) -> Result<(), Error> {
+        self.begin_borrow()?;
+        // SAFETY: BORROWED grants exclusive access to the process bindings and exit receipts.
+        let processes = unsafe { &mut *self.processes.get() };
+        let exited_retired = unsafe { &mut *self.exited_retired.get() };
+        if exited_retired.contains(&Some(process))
+            || !processes
+                .iter()
+                .any(|binding| binding.is_some_and(|binding| binding.process == process))
+        {
+            self.state.store(READY, Ordering::Release);
+            return Ok(());
+        }
+        if !exited_retired.iter().any(|slot| slot.is_none()) {
+            self.state.store(READY, Ordering::Release);
+            return Err(Error::ProcessSlotsFull);
+        }
+        self.state.store(READY, Ordering::Release);
+
+        self.retire_process(process)?;
+
+        self.begin_borrow()?;
+        // SAFETY: synchronous exit cleanup preserves a free receipt slot checked above.
+        let exited_retired = unsafe { &mut *self.exited_retired.get() };
+        let Some(slot) = exited_retired.iter_mut().find(|slot| slot.is_none()) else {
+            self.state.store(POISONED, Ordering::Release);
+            return Err(Error::ProcessSlotsFull);
+        };
+        *slot = Some(process);
+        self.state.store(READY, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -539,4 +616,10 @@ pub fn fork_process(parent: ObjectId, child: ObjectId) -> Result<(), Error> {
 /// Removes one exact Process descriptor/filesystem view after process lifecycle ownership has ended.
 pub fn retire_process(process: ObjectId) -> Result<(), Error> {
     STEP29_PATH_RUNTIME.retire_process(process)
+}
+
+/// Retires one exited Process descriptor/filesystem view immediately on process exit (before
+/// `wait4` reaps a zombie), closing pipe write endpoints so readers observe EOF cleanly.
+pub fn retire_on_process_exit(process: ObjectId) -> Result<(), Error> {
+    STEP29_PATH_RUNTIME.retire_on_process_exit(process)
 }

@@ -21,8 +21,8 @@ include!(concat!(env!("OUT_DIR"), "/implementation.rs"));
 
 mod runtime;
 pub use runtime::{
-    cpu_on_bootstrap_available, enter_runtime_protected_regime, runtime_mmio_region,
-    runtime_protected_regime_ready, wait_for_runtime_protected_regime,
+    cpu_on_bootstrap_available, enter_runtime_protected_regime, runtime_kernel_alias_physical,
+    runtime_mmio_region, runtime_protected_regime_ready, wait_for_runtime_protected_regime,
 };
 
 mod runtime_memory;
@@ -36,6 +36,13 @@ pub use runtime_metadata::runtime_ttbr1_root;
 mod runtime_initrd;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 pub use runtime_initrd::{ProtectedInitrd, ProtectedInitrdError, map_qemu_initrd_high_alias};
+
+mod runtime_virtio;
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub use runtime_virtio::map_qemu_virtio_mmio_high_aliases;
+pub use runtime_virtio::{
+    MAX_PROTECTED_VIRTIO_MMIO, ProtectedVirtioMmioEntry, ProtectedVirtioMmioMap,
+};
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 mod runtime_table;

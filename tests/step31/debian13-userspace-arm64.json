@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "target_id": "debian-13-trixie-arm64-20260712-dynamic",
+  "snapshot_timestamp": "20260712T000000Z",
+  "suite": "trixie",
+  "architecture": "arm64",
+  "packages": {
+    "libc6": {
+      "version": "2.41-12+deb13u3",
+      "artifact": "libc6_2.41-12+deb13u3_arm64.deb",
+      "immutable_url": "https://snapshot.debian.org/archive/debian/20260712T000000Z/pool/main/g/glibc/libc6_2.41-12+deb13u3_arm64.deb",
+      "size_bytes": 2489480,
+      "sha256": "ff529924782d3286181188fc265a6a92e7fe28975fb3a925dc0e05c0ca66e52f"
+    },
+    "dash": {
+      "version": "0.5.12-12",
+      "artifact": "dash_0.5.12-12_arm64.deb",
+      "immutable_url": "https://snapshot.debian.org/archive/debian/20260712T000000Z/pool/main/d/dash/dash_0.5.12-12_arm64.deb",
+      "size_bytes": 95648,
+      "sha256": "ce4c8688a1a3ea510186ba95aba74d4c49863094e47e1effc0b602839e840c04"
+    },
+    "busybox": {
+      "version": "1:1.37.0-6+b8",
+      "artifact": "busybox_1.37.0-6+b8_arm64.deb",
+      "immutable_url": "https://snapshot.debian.org/archive/debian/20260712T000000Z/pool/main/b/busybox/busybox_1.37.0-6+b8_arm64.deb",
+      "size_bytes": 453776,
+      "sha256": "962273fe42b118ef23c8aea045e5868da707eca5ca312932a3f68f5fba2e9f48"
+    }
+  }
+}

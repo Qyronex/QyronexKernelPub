@@ -3,6 +3,8 @@
 #![no_main]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+extern crate alloc;
+
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 use core::ptr::{read_volatile, write_volatile};
@@ -45,7 +47,10 @@ const PL011_LCR_H: u64 = 0x02c;
 const PL011_CR: u64 = 0x030;
 const PL011_IMSC: u64 = 0x038;
 const PL011_ICR: u64 = 0x044;
+#[cfg(feature = "step31-debian-shell")]
+const PL011_FR_RXFE: u32 = 1 << 4;
 const PL011_FR_TXFF: u32 = 1 << 5;
+const PL011_LCR_H_FEN: u32 = 1 << 4;
 const PL011_LCR_H_WLEN_8: u32 = 0b11 << 5;
 const PL011_CR_UARTEN: u32 = 1 << 0;
 const PL011_CR_TXE: u32 = 1 << 8;
@@ -63,8 +68,8 @@ const CPU_ONLINE: u32 = 2;
 const CPU_FAILED: u32 = 3;
 
 const STACK_GUARD_BYTES: u64 = 0x1000;
-const BOOT_STACK_BYTES: u64 = 0x4_0000;
-const SECONDARY_STACK_BYTES: u64 = 0x4_0000;
+const BOOT_STACK_BYTES: u64 = 0x8_0000;
+const SECONDARY_STACK_BYTES: u64 = 0x8_0000;
 const SCHEDULER_WORKER_STACK_BYTES: u64 = 0x1_0000;
 const SECONDARY_STACK_STRIDE: u64 = STACK_GUARD_BYTES + SECONDARY_STACK_BYTES;
 const SCHEDULER_THREADS_PER_CPU: usize = 16;
@@ -232,7 +237,7 @@ impl Pl011 {
             serial.write_register(PL011_CR, 0);
             serial.write_register(PL011_IMSC, 0);
             serial.write_register(PL011_ICR, u32::MAX);
-            serial.write_register(PL011_LCR_H, PL011_LCR_H_WLEN_8);
+            serial.write_register(PL011_LCR_H, PL011_LCR_H_WLEN_8 | PL011_LCR_H_FEN);
             serial.write_register(PL011_CR, PL011_CR_UARTEN | PL011_CR_TXE | PL011_CR_RXE);
         }
         serial
@@ -278,6 +283,16 @@ impl Pl011 {
             core::hint::spin_loop();
         }
         unsafe { self.write_register(PL011_DR, byte as u32) };
+    }
+
+    #[cfg(feature = "step31-debian-shell")]
+    pub(crate) fn try_read_byte(&self) -> Option<u8> {
+        // SAFETY: constructor contract and checked aperture guarantee a valid PL011 register read.
+        if unsafe { self.read_register(PL011_FR) } & PL011_FR_RXFE != 0 {
+            return None;
+        }
+        // SAFETY: RXFE clear guarantees DR contains a pending UART RX byte.
+        Some(unsafe { self.read_register(PL011_DR) } as u8)
     }
 
     unsafe fn read_register(&self, offset: u64) -> u32 {
@@ -345,6 +360,23 @@ pub extern "C" fn kernal_aarch64_main(dtb_physical: u64) -> ! {
 
     serial.write_str("KERNAL/ARM64: physical entry reached\n");
     serial.write_str("KERNAL/ARM64: DTB accepted\n");
+
+    unsafe extern "C" {
+        static mut __kernel_heap_start: u8;
+        static mut __kernel_heap_end: u8;
+    }
+    // SAFETY: `[__kernel_heap_start, __kernel_heap_end)` is linker-reserved inside zeroed `.bss`,
+    // mapped RW-NX in TTBR1 by protected boot, and initialized once before allocations run.
+    let heap_stats = unsafe {
+        kernal_core_aarch64::init_kernel_heap(
+            &raw mut __kernel_heap_start,
+            &raw mut __kernel_heap_end,
+        )
+    }
+    .unwrap_or_else(|_| fatal_with_serial(&serial, "KERNAL/ARM64: kernel heap init failed\n"));
+    serial.write_str("KERNAL/ARM64: kernel heap ready bytes=");
+    serial.write_u64(heap_stats.total_bytes as u64);
+    serial.write_str("\n");
 
     let exception_level = kernal_arch_aarch64::current_exception_level();
     serial.write_str("KERNAL/ARM64: CurrentEL=");
@@ -1083,7 +1115,9 @@ fn service_step30_job_control_safe_point() {
 extern "C" fn aarch64_exception_handler(frame: &mut ExceptionFrame) {
     if frame.kind() != ExceptionKind::Irq {
         #[cfg(feature = "qemu-proof")]
-        if step15_qemu::step30_post_fork_reschedule_trace_pending() {
+        if step15_qemu::step30_post_fork_reschedule_trace_pending()
+            || cfg!(feature = "step31-debian-qemu")
+        {
             step15_qemu::trace_step30_post_fork_non_irq_fatal(
                 frame.vector_index() as u64,
                 frame.esr_el1,

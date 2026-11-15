@@ -11,13 +11,17 @@ pub enum ReleasedObject {
     RetainedDirectory(OverlayDirectoryHandle),
     RetainedReadOnly(OverlayNodeHandle),
     WritableRegular(RetainedRegularHandle),
+    Subsystem(SubsystemHandle),
 }
 
 impl ReleasedObject {
     pub const fn pipe_endpoint(self) -> Endpoint {
         match self {
             Self::Pipe(endpoint) => endpoint,
-            Self::RetainedDirectory(_) | Self::RetainedReadOnly(_) | Self::WritableRegular(_) => {
+            Self::RetainedDirectory(_)
+            | Self::RetainedReadOnly(_)
+            | Self::WritableRegular(_)
+            | Self::Subsystem(_) => {
                 panic!("released object is not a pipe")
             }
         }
@@ -26,21 +30,40 @@ impl ReleasedObject {
     pub const fn retained_directory(self) -> Option<OverlayDirectoryHandle> {
         match self {
             Self::RetainedDirectory(directory) => Some(directory),
-            Self::Pipe(_) | Self::RetainedReadOnly(_) | Self::WritableRegular(_) => None,
+            Self::Pipe(_)
+            | Self::RetainedReadOnly(_)
+            | Self::WritableRegular(_)
+            | Self::Subsystem(_) => None,
         }
     }
 
     pub const fn retained_readonly(self) -> Option<OverlayNodeHandle> {
         match self {
             Self::RetainedReadOnly(logical) => Some(logical),
-            Self::Pipe(_) | Self::RetainedDirectory(_) | Self::WritableRegular(_) => None,
+            Self::Pipe(_)
+            | Self::RetainedDirectory(_)
+            | Self::WritableRegular(_)
+            | Self::Subsystem(_) => None,
         }
     }
 
     pub const fn writable_regular(self) -> Option<RetainedRegularHandle> {
         match self {
             Self::WritableRegular(retained) => Some(retained),
-            Self::Pipe(_) | Self::RetainedDirectory(_) | Self::RetainedReadOnly(_) => None,
+            Self::Pipe(_)
+            | Self::RetainedDirectory(_)
+            | Self::RetainedReadOnly(_)
+            | Self::Subsystem(_) => None,
+        }
+    }
+
+    pub const fn subsystem_handle(self) -> Option<SubsystemHandle> {
+        match self {
+            Self::Subsystem(handle) => Some(handle),
+            Self::Pipe(_)
+            | Self::RetainedDirectory(_)
+            | Self::RetainedReadOnly(_)
+            | Self::WritableRegular(_) => None,
         }
     }
 }
@@ -61,12 +84,12 @@ impl PipeDescriptors {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ClosePlan {
+pub(super) struct ClosePlan {
     token: FdToken,
     open_file: OpenFileId,
-    expected_refs: usize,
+    pub(super) expected_refs: usize,
     expected_object: OpenObject,
-    release: Option<ReleasedObject>,
+    pub(super) release: Option<ReleasedObject>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -323,11 +346,11 @@ impl<const N: usize> FdTable<N> {
         Ok(selected)
     }
 
-    fn prepare_close(&self, fd: i32) -> Result<ClosePlan, Error> {
+    pub(super) fn prepare_close(&self, fd: i32) -> Result<ClosePlan, Error> {
         self.prepare_close_token(self.token(fd)?)
     }
 
-    fn prepare_close_token(&self, token: FdToken) -> Result<ClosePlan, Error> {
+    pub(super) fn prepare_close_token(&self, token: FdToken) -> Result<ClosePlan, Error> {
         let descriptor = self
             .descriptor_for_token(token)
             .map_err(|_| Error::StaleOpenFile)?;
@@ -347,7 +370,7 @@ impl<const N: usize> FdTable<N> {
         })
     }
 
-    fn commit_close(&mut self, plan: ClosePlan) -> Result<(), Error> {
+    pub(super) fn commit_close(&mut self, plan: ClosePlan) -> Result<(), Error> {
         let descriptor = self
             .descriptor_for_token(plan.token)
             .map_err(|_| Error::StaleOpenFile)?;
@@ -561,6 +584,9 @@ pub(super) fn released_object(object: OpenObject) -> Option<ReleasedObject> {
         )) => Some(ReleasedObject::RetainedReadOnly(logical)),
         OpenObject::External(ExternalBacking::WritableRegular(retained)) => {
             Some(ReleasedObject::WritableRegular(retained))
+        }
+        OpenObject::External(ExternalBacking::Subsystem(handle)) => {
+            Some(ReleasedObject::Subsystem(handle))
         }
         OpenObject::File(_)
         | OpenObject::Directory(_)

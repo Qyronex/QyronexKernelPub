@@ -419,7 +419,7 @@ unsafe fn exit_current_with_clear_child_tid_raw_impl<
                     exiting_tid,
                     exited,
                     futexes,
-                    |target| unsafe { scheduler.bootstrap_wake_local_exact(target) },
+                    |target| scheduler.bootstrap_wake_local_exact(target),
                     |target| remote_wake(target),
                 )
             }?;
@@ -439,18 +439,15 @@ unsafe fn exit_current_with_clear_child_tid_raw_impl<
             unsafe { clear_child_tid(process, space, user_address) }.map_err(ExitError::Clear)?
         };
 
-        // SAFETY: owner-local reentry remains closed. A consumed same-CPU waiter is made
-        // Ready synchronously; foreign identities are handed to the caller's owner router.
+        // SAFETY: owner-local reentry remains closed and `target` is the exact committed waiter on
+        // this owner CPU while the enclosing exit transaction owns the quiescent scheduler window.
+        // Consumed same-CPU waiters are made Ready synchronously; foreign identities are routed.
         unsafe {
             wake_clear_child_tid_waiter(
                 futexes,
                 key,
                 exited,
-                |target| {
-                    // SAFETY: target is the exact committed waiter on this owner CPU and the
-                    // enclosing exit transaction still owns the quiescent scheduler window.
-                    unsafe { scheduler.bootstrap_wake_local_exact(target) }
-                },
+                |target| scheduler.bootstrap_wake_local_exact(target),
                 |target| remote_wake(target),
             )
         }

@@ -6,7 +6,12 @@
 //! `SCM_RIGHTS`, `SO_PEERCRED`), IPv4/IPv6 loopback TCP & UDP socket state machines,
 //! bounded `NETLINK_ROUTE` (`AF_NETLINK`) link/address/route dumps, and DNS resolver packet codec.
 
-use kernal_linux_abi::Errno;
+extern crate alloc;
+
+pub mod proto;
+pub mod stack;
+
+use kernal_linux_abi::{Errno, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDHUP};
 
 /// Linux address families (`<sys/socket.h>`).
 pub const AF_UNSPEC: u16 = 0;
@@ -44,8 +49,17 @@ pub const SO_REUSEPORT: u32 = 15;
 pub const SO_PASSCRED: u32 = 16;
 pub const SO_PEERCRED: u32 = 17;
 pub const SO_DOMAIN: u32 = 39;
+pub const SO_PROTOCOL: u32 = 38;
+pub const SO_RCVTIMEO_OLD: u32 = 20;
+pub const SO_SNDTIMEO_OLD: u32 = 21;
+pub const SO_RCVTIMEO_NEW: u32 = 66;
+pub const SO_SNDTIMEO_NEW: u32 = 67;
 pub const TCP_NODELAY: u32 = 1;
 pub const IPV6_V6ONLY: u32 = 26;
+
+pub const MSG_PEEK: u32 = 0x02;
+pub const MSG_DONTWAIT: u32 = 0x40;
+pub const MSG_NOSIGNAL: u32 = 0x4000;
 
 /// `SCM_RIGHTS` ancillary control message type (`SOL_SOCKET = 1`, `SCM_RIGHTS = 1`).
 pub const SCM_RIGHTS: i32 = 1;
@@ -788,11 +802,29 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         Ok(take)
     }
 
+    pub fn rx_available(&self, id: usize) -> usize {
+        self.slots
+            .get(id)
+            .filter(|s| s.live)
+            .map(|s| s.rx_len)
+            .unwrap_or(0)
+    }
+
     /// Receives data (and optional `SCM_RIGHTS` fds) from socket `id`.
     pub fn recv(
         &mut self,
         id: usize,
         out: &mut [u8],
+    ) -> Result<(usize, Option<SockAddr>, [i32; MAX_SCM_RIGHTS_FDS], usize), Errno> {
+        self.recv_with_peek(id, out, false)
+    }
+
+    /// Receives data from socket `id`, leaving bytes & ancillary FDs queued when `peek == true`.
+    pub fn recv_with_peek(
+        &mut self,
+        id: usize,
+        out: &mut [u8],
+        peek: bool,
     ) -> Result<(usize, Option<SockAddr>, [i32; MAX_SCM_RIGHTS_FDS], usize), Errno> {
         let (peer_slot, rx_len, shut_rd) = {
             let s = self.slot(id)?;
@@ -813,14 +845,16 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         let slot = self.slot_mut(id)?;
         let take = out.len().min(slot.rx_len);
         out[..take].copy_from_slice(&slot.rx_buf[..take]);
-        let remaining = slot.rx_len - take;
-        if remaining > 0 {
-            slot.rx_buf.copy_within(take..slot.rx_len, 0);
-        }
-        slot.rx_len = remaining;
         let peer_addr = slot.peer_addr;
         let rights = slot.rx_ancillary;
-        slot.rx_ancillary = AncillaryRights::EMPTY;
+        if !peek {
+            let remaining = slot.rx_len - take;
+            if remaining > 0 {
+                slot.rx_buf.copy_within(take..slot.rx_len, 0);
+            }
+            slot.rx_len = remaining;
+            slot.rx_ancillary = AncillaryRights::EMPTY;
+        }
         Ok((take, peer_addr, rights.fds, rights.count))
     }
 
@@ -962,6 +996,68 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         } else {
             false
         }
+    }
+
+    /// Returns the Linux `POLL*` readiness bitmask for socket `id`.
+    pub fn poll_readiness(&self, id: usize) -> Result<u32, Errno> {
+        let s = self.slot(id)?;
+        let mut mask = 0u32;
+        match s.state {
+            SocketState::Listening => {
+                if s.pending_count > 0 {
+                    mask |= u32::from(POLLIN);
+                }
+            }
+            SocketState::Closed => {
+                mask |= u32::from(POLLHUP) | u32::from(POLLERR);
+            }
+            SocketState::Connected => {
+                if s.rx_len > 0 || s.shut_rd {
+                    mask |= u32::from(POLLIN);
+                }
+                let peer_opt = s.peer_slot.and_then(|pid| self.slots.get(pid));
+                let peer_gone = match peer_opt {
+                    Some(peer) => !peer.live || peer.state == SocketState::Closed,
+                    None => true,
+                };
+                let peer_shut_wr = peer_gone || peer_opt.is_some_and(|peer| peer.shut_wr);
+                if peer_shut_wr && s.kind != SocketKind::Dgram {
+                    mask |= u32::from(POLLIN) | u32::from(POLLRDHUP);
+                }
+                if (s.shut_rd && s.shut_wr)
+                    || (s.kind != SocketKind::Dgram
+                        && (peer_gone || peer_opt.is_some_and(|peer| peer.shut_rd && peer.shut_wr)))
+                {
+                    mask |= u32::from(POLLHUP);
+                }
+                if !s.shut_wr {
+                    let can_write = peer_opt.is_some_and(|peer| {
+                        peer.live
+                            && peer.state != SocketState::Closed
+                            && !peer.shut_rd
+                            && peer.rx_len < BUF_CAP
+                    });
+                    let peer_no_rx = peer_gone || peer_opt.is_some_and(|peer| peer.shut_rd);
+                    if can_write || peer_no_rx {
+                        mask |= u32::from(POLLOUT);
+                    }
+                    if peer_opt.is_some_and(|peer| {
+                        peer.live && peer.state != SocketState::Closed && peer.shut_rd
+                    }) {
+                        mask |= u32::from(POLLERR);
+                    }
+                }
+            }
+            SocketState::Unbound | SocketState::Bound => {
+                if s.rx_len > 0 || s.shut_rd {
+                    mask |= u32::from(POLLIN);
+                }
+                if matches!(s.kind, SocketKind::Dgram | SocketKind::Raw) && !s.shut_wr {
+                    mask |= u32::from(POLLOUT);
+                }
+            }
+        }
+        Ok(mask)
     }
 
     /// Finds a listening `SOCK_STREAM` IPv4 slot bound to `guest_port` on wildcard (`0.0.0.0`),
@@ -1178,6 +1274,274 @@ fn write_nlmsghdr(out: &mut [u8], len: u32, msg_type: u16, flags: u16, seq: u32,
     out[12..16].copy_from_slice(&pid.to_le_bytes());
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetInterfaceConfig {
+    pub has_eth0: bool,
+    pub link_up: bool,
+    pub ip: [u8; 4],
+    pub netmask: [u8; 4],
+    pub prefix_len: u8,
+    pub gateway: [u8; 4],
+    pub mac: [u8; 6],
+    pub mtu: u32,
+}
+
+impl NetInterfaceConfig {
+    pub const LOOPBACK_ONLY: Self = Self {
+        has_eth0: false,
+        link_up: false,
+        ip: [0; 4],
+        netmask: [0; 4],
+        prefix_len: 0,
+        gateway: [0; 4],
+        mac: [0; 6],
+        mtu: 1500,
+    };
+}
+
+fn align4(len: usize) -> usize {
+    (len + 3) & !3
+}
+
+fn write_rta(out: &mut [u8], offset: usize, rta_type: u16, payload: &[u8]) -> Result<usize, Errno> {
+    let rta_len = 4 + payload.len();
+    let aligned = align4(rta_len);
+    if offset + aligned > out.len() {
+        return Err(Errno::ENOBUFS);
+    }
+    out[offset..offset + 2].copy_from_slice(&(rta_len as u16).to_le_bytes());
+    out[offset + 2..offset + 4].copy_from_slice(&rta_type.to_le_bytes());
+    out[offset + 4..offset + 4 + payload.len()].copy_from_slice(payload);
+    for b in &mut out[offset + rta_len..offset + aligned] {
+        *b = 0;
+    }
+    Ok(offset + aligned)
+}
+
+fn write_nlmsg_done(out: &mut [u8], offset: usize, seq: u32, pid: u32) -> Result<usize, Errno> {
+    if offset + 20 > out.len() {
+        return Err(Errno::ENOBUFS);
+    }
+    write_nlmsghdr(
+        &mut out[offset..offset + 16],
+        20,
+        NLMSG_DONE,
+        NLM_F_MULTI,
+        seq,
+        pid,
+    );
+    out[offset + 16..offset + 20].copy_from_slice(&0i32.to_le_bytes());
+    Ok(offset + 20)
+}
+
+pub fn handle_netlink_route_request_with_cfg(
+    req: &[u8],
+    out: &mut [u8],
+    nlmsg_pid: u32,
+    cfg: &NetInterfaceConfig,
+) -> Result<usize, Errno> {
+    if !cfg.has_eth0 {
+        return handle_netlink_route_request(req, out);
+    }
+    if req.len() < 16 {
+        return Err(Errno::EINVAL);
+    }
+    let nlmsg_len = u32::from_le_bytes([req[0], req[1], req[2], req[3]]) as usize;
+    let nlmsg_type = u16::from_le_bytes([req[4], req[5]]);
+    let nlmsg_seq = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+    if nlmsg_len < 16 || nlmsg_len > req.len() {
+        return Err(Errno::EINVAL);
+    }
+    let req_family = if req.len() >= 17 { req[16] } else { 0 };
+
+    match nlmsg_type {
+        RTM_GETLINK => {
+            let mut pos = 0usize;
+            // 1. lo (ifindex=1)
+            let lo_start = pos;
+            if pos + 32 > out.len() {
+                return Err(Errno::ENOBUFS);
+            }
+            out[pos + 16..pos + 20].copy_from_slice(&[0, 0, 0x04, 0x03]); // ARPHRD_LOOPBACK=772
+            out[pos + 20..pos + 24].copy_from_slice(&1i32.to_le_bytes());
+            out[pos + 24..pos + 28].copy_from_slice(&0x0001_0049u32.to_le_bytes());
+            out[pos + 28..pos + 32].copy_from_slice(&0u32.to_le_bytes());
+            pos += 32;
+            pos = write_rta(out, pos, 3, b"lo\0")?; // IFLA_IFNAME
+            pos = write_rta(out, pos, 4, &65536u32.to_le_bytes())?; // IFLA_MTU
+            pos = write_rta(out, pos, 1, &[0u8; 6])?; // IFLA_ADDRESS
+            write_nlmsghdr(
+                &mut out[lo_start..lo_start + 16],
+                (pos - lo_start) as u32,
+                RTM_NEWLINK,
+                NLM_F_MULTI,
+                nlmsg_seq,
+                nlmsg_pid,
+            );
+
+            // 2. eth0 (ifindex=2, ARPHRD_ETHER=1)
+            let eth_start = pos;
+            if pos + 32 > out.len() {
+                return Err(Errno::ENOBUFS);
+            }
+            let flags: u32 = if cfg.link_up {
+                0x0001_1043
+            } else {
+                0x0000_1002
+            };
+            out[pos + 16..pos + 20].copy_from_slice(&[0, 0, 1, 0]);
+            out[pos + 20..pos + 24].copy_from_slice(&2i32.to_le_bytes());
+            out[pos + 24..pos + 28].copy_from_slice(&flags.to_le_bytes());
+            out[pos + 28..pos + 32].copy_from_slice(&0u32.to_le_bytes());
+            pos += 32;
+            pos = write_rta(out, pos, 3, b"eth0\0")?; // IFLA_IFNAME
+            pos = write_rta(out, pos, 4, &cfg.mtu.to_le_bytes())?; // IFLA_MTU
+            pos = write_rta(out, pos, 1, &cfg.mac)?; // IFLA_ADDRESS
+            write_nlmsghdr(
+                &mut out[eth_start..eth_start + 16],
+                (pos - eth_start) as u32,
+                RTM_NEWLINK,
+                NLM_F_MULTI,
+                nlmsg_seq,
+                nlmsg_pid,
+            );
+
+            write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+        }
+        RTM_GETADDR => {
+            let mut pos = 0usize;
+            if req_family == 0 || req_family == AF_INET as u8 {
+                // 127.0.0.1/8 on lo
+                let lo_start = pos;
+                if pos + 24 > out.len() {
+                    return Err(Errno::ENOBUFS);
+                }
+                out[pos + 16] = AF_INET as u8;
+                out[pos + 17] = 8;
+                out[pos + 18] = 0x80; // IFA_F_PERMANENT
+                out[pos + 19] = 254; // RT_SCOPE_HOST
+                out[pos + 20..pos + 24].copy_from_slice(&1u32.to_le_bytes());
+                pos += 24;
+                pos = write_rta(out, pos, 1, &[127, 0, 0, 1])?; // IFA_ADDRESS
+                pos = write_rta(out, pos, 2, &[127, 0, 0, 1])?; // IFA_LOCAL
+                pos = write_rta(out, pos, 3, b"lo\0")?; // IFA_LABEL
+                write_nlmsghdr(
+                    &mut out[lo_start..lo_start + 16],
+                    (pos - lo_start) as u32,
+                    RTM_NEWADDR,
+                    NLM_F_MULTI,
+                    nlmsg_seq,
+                    nlmsg_pid,
+                );
+
+                // Configured IPv4 address on eth0
+                if cfg.ip != [0, 0, 0, 0] {
+                    let eth_start = pos;
+                    if pos + 24 > out.len() {
+                        return Err(Errno::ENOBUFS);
+                    }
+                    let broadcast = [
+                        cfg.ip[0] | !cfg.netmask[0],
+                        cfg.ip[1] | !cfg.netmask[1],
+                        cfg.ip[2] | !cfg.netmask[2],
+                        cfg.ip[3] | !cfg.netmask[3],
+                    ];
+                    out[pos + 16] = AF_INET as u8;
+                    out[pos + 17] = cfg.prefix_len;
+                    out[pos + 18] = 0x80;
+                    out[pos + 19] = 0; // RT_SCOPE_UNIVERSE
+                    out[pos + 20..pos + 24].copy_from_slice(&2u32.to_le_bytes());
+                    pos += 24;
+                    pos = write_rta(out, pos, 1, &cfg.ip)?; // IFA_ADDRESS
+                    pos = write_rta(out, pos, 2, &cfg.ip)?; // IFA_LOCAL
+                    pos = write_rta(out, pos, 4, &broadcast)?; // IFA_BROADCAST
+                    pos = write_rta(out, pos, 3, b"eth0\0")?; // IFA_LABEL
+                    write_nlmsghdr(
+                        &mut out[eth_start..eth_start + 16],
+                        (pos - eth_start) as u32,
+                        RTM_NEWADDR,
+                        NLM_F_MULTI,
+                        nlmsg_seq,
+                        nlmsg_pid,
+                    );
+                }
+            }
+            write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+        }
+        RTM_GETROUTE => {
+            let mut pos = 0usize;
+            if (req_family == 0 || req_family == AF_INET as u8) && cfg.ip != [0, 0, 0, 0] {
+                let net_ip = [
+                    cfg.ip[0] & cfg.netmask[0],
+                    cfg.ip[1] & cfg.netmask[1],
+                    cfg.ip[2] & cfg.netmask[2],
+                    cfg.ip[3] & cfg.netmask[3],
+                ];
+                // Subnet route
+                let sub_start = pos;
+                if pos + 28 > out.len() {
+                    return Err(Errno::ENOBUFS);
+                }
+                out[pos + 16..pos + 24].copy_from_slice(&[
+                    AF_INET as u8,
+                    cfg.prefix_len,
+                    0,
+                    0,
+                    254, // RT_TABLE_MAIN
+                    4,   // RTPROT_STATIC
+                    253, // RT_SCOPE_LINK
+                    1,   // RTN_UNICAST
+                ]);
+                out[pos + 24..pos + 28].copy_from_slice(&0u32.to_le_bytes());
+                pos += 28;
+                pos = write_rta(out, pos, 1, &net_ip)?; // RTA_DST
+                pos = write_rta(out, pos, 4, &2u32.to_le_bytes())?; // RTA_OIF = 2
+                pos = write_rta(out, pos, 7, &cfg.ip)?; // RTA_PREFSRC
+                write_nlmsghdr(
+                    &mut out[sub_start..sub_start + 16],
+                    (pos - sub_start) as u32,
+                    RTM_NEWROUTE,
+                    NLM_F_MULTI,
+                    nlmsg_seq,
+                    nlmsg_pid,
+                );
+
+                // Default route via gateway
+                if cfg.gateway != [0, 0, 0, 0] {
+                    let def_start = pos;
+                    if pos + 28 > out.len() {
+                        return Err(Errno::ENOBUFS);
+                    }
+                    out[pos + 16..pos + 24].copy_from_slice(&[
+                        AF_INET as u8,
+                        0,
+                        0,
+                        0,
+                        254,
+                        4,
+                        0, // RT_SCOPE_UNIVERSE
+                        1,
+                    ]);
+                    out[pos + 24..pos + 28].copy_from_slice(&0u32.to_le_bytes());
+                    pos += 28;
+                    pos = write_rta(out, pos, 5, &cfg.gateway)?; // RTA_GATEWAY
+                    pos = write_rta(out, pos, 4, &2u32.to_le_bytes())?; // RTA_OIF = 2
+                    write_nlmsghdr(
+                        &mut out[def_start..def_start + 16],
+                        (pos - def_start) as u32,
+                        RTM_NEWROUTE,
+                        NLM_F_MULTI,
+                        nlmsg_seq,
+                        nlmsg_pid,
+                    );
+                }
+            }
+            write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+        }
+        _ => Err(Errno::EOPNOTSUPP),
+    }
+}
+
 /// Synthesizes a RFC-1035 DNS A (`127.0.0.1`) or AAAA (`::1`) response for local/test queries on
 /// loopback port 53 so glibc `getaddrinfo(3)` resolver probes complete deterministically.
 pub fn build_dns_loopback_response(query: &[u8], out: &mut [u8]) -> Result<usize, Errno> {
@@ -1385,5 +1749,60 @@ mod tests {
         let (n, from, _, _) = table.recv(udev_sock, &mut rx).unwrap();
         assert_eq!(&rx[..n], payload);
         assert_eq!(from, Some(SockAddr::Netlink { pid: 0, groups: 1 }));
+    }
+
+    #[test]
+    fn socket_poll_readiness_tracks_connect_data_and_shutdown() {
+        let mut table = SocketTable::<8, 64>::new();
+        let cred = Ucred {
+            pid: 1,
+            uid: 0,
+            gid: 0,
+        };
+        let (a, b) = table.socketpair(AF_UNIX, SOCK_STREAM, 0, cred).unwrap();
+
+        assert_eq!(table.poll_readiness(a), Ok(u32::from(POLLOUT)));
+        assert_eq!(table.poll_readiness(b), Ok(u32::from(POLLOUT)));
+
+        assert_eq!(table.send(a, b"ping", None, &[]).unwrap(), 4);
+        assert_eq!(table.poll_readiness(b), Ok(u32::from(POLLIN | POLLOUT)));
+
+        table.shutdown(a, SHUT_WR).unwrap();
+        let b_mask = table.poll_readiness(b).unwrap();
+        assert_ne!(b_mask & u32::from(POLLIN), 0);
+        assert_ne!(b_mask & u32::from(POLLRDHUP), 0);
+        assert_eq!(b_mask & u32::from(POLLHUP), 0);
+
+        table.close(a).unwrap();
+        let b_after_close = table.poll_readiness(b).unwrap();
+        assert_ne!(b_after_close & u32::from(POLLHUP), 0);
+        assert_ne!(b_after_close & u32::from(POLLIN), 0);
+    }
+
+    #[test]
+    fn netlink_route_eth0_config_emits_link_addr_and_route() {
+        let cfg = NetInterfaceConfig {
+            has_eth0: true,
+            link_up: true,
+            ip: [10, 0, 2, 15],
+            netmask: [255, 255, 255, 0],
+            prefix_len: 24,
+            gateway: [10, 0, 2, 2],
+            mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56],
+            mtu: 1500,
+        };
+        let mut req = [0u8; 32];
+        write_nlmsghdr(&mut req[0..16], 32, RTM_GETLINK, 0x301, 1, 0);
+        let mut out = [0u8; 512];
+        let n = handle_netlink_route_request_with_cfg(&req, &mut out, 42, &cfg).unwrap();
+        assert!(out[..n].windows(5).any(|w| w == b"eth0\0"));
+
+        write_nlmsghdr(&mut req[0..16], 32, RTM_GETADDR, 0x301, 2, 0);
+        let n_addr = handle_netlink_route_request_with_cfg(&req, &mut out, 42, &cfg).unwrap();
+        assert!(out[..n_addr].windows(4).any(|w| w == [10, 0, 2, 15]));
+
+        write_nlmsghdr(&mut req[0..16], 32, RTM_GETROUTE, 0x301, 3, 0);
+        let n_rt = handle_netlink_route_request_with_cfg(&req, &mut out, 42, &cfg).unwrap();
+        assert!(out[..n_rt].windows(4).any(|w| w == [10, 0, 2, 2]));
     }
 }

@@ -40,7 +40,7 @@ pub const UTIME_OMIT: i64 = (1 << 30) - 2;
 pub const MAX_BINPRM_BYTES: usize = 256;
 pub const MAX_SHEBANG_DEPTH: u8 = 4;
 
-const MAX_KEY_BYTES: usize = 96;
+const MAX_KEY_BYTES: usize = 512;
 const MAX_XATTR_NAME: usize = 64;
 
 /// Stable key used to index advisory locks, xattrs, and metadata overrides across FDs or paths.
@@ -79,6 +79,14 @@ impl TargetKey {
         bytes[0..3].copy_from_slice(b"fd:");
         bytes[3..7].copy_from_slice(&fd.to_le_bytes());
         Ok(Self { bytes, len: 7 })
+    }
+
+    pub fn from_ext4_inode(mount_id: u32, ino: u32) -> Self {
+        let mut bytes = [0u8; MAX_KEY_BYTES];
+        bytes[0..5].copy_from_slice(b"ext4:");
+        bytes[5..9].copy_from_slice(&mount_id.to_le_bytes());
+        bytes[9..13].copy_from_slice(&ino.to_le_bytes());
+        Self { bytes, len: 13 }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -420,6 +428,20 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
         let caller = u64::from(caller_pid);
         for entry in &mut self.locks {
             if entry.live && entry.kind.is_posix() && entry.owner == caller {
+                *entry = LockEntry::EMPTY;
+            }
+        }
+    }
+
+    /// Releases all POSIX locks owned by `caller_pid` on one specific inode/target (`close(2)`).
+    pub fn release_posix_target_pid(&mut self, target: TargetKey, caller_pid: u32) {
+        let caller = u64::from(caller_pid);
+        for entry in &mut self.locks {
+            if entry.live
+                && entry.kind.is_posix()
+                && entry.target == target
+                && entry.owner == caller
+            {
                 *entry = LockEntry::EMPTY;
             }
         }
@@ -997,5 +1019,34 @@ mod tests {
             parse_shebang(b"#!/bin/sh\n", MAX_SHEBANG_DEPTH),
             Err(Errno::ELOOP)
         );
+    }
+
+    #[test]
+    fn ext4_inode_key_detects_cross_fd_and_cleans_on_close() {
+        let mut locks = AdvisoryLockTable::<8>::new();
+        let ino_a = TargetKey::from_ext4_inode(1, 42);
+        let ino_b = TargetKey::from_ext4_inode(1, 43);
+        assert_ne!(ino_a, ino_b);
+
+        locks.flock_op(ino_a, 100, LOCK_EX | LOCK_NB).unwrap();
+        assert_eq!(
+            locks.flock_op(ino_a, 101, LOCK_EX | LOCK_NB),
+            Err(Errno::EAGAIN)
+        );
+        locks.flock_op(ino_b, 101, LOCK_EX | LOCK_NB).unwrap();
+        locks.release_flock_owner(100);
+        locks.flock_op(ino_a, 101, LOCK_EX | LOCK_NB).unwrap();
+
+        let wl = PosixFlock {
+            l_type: F_WRLCK,
+            l_whence: 0,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        locks.fcntl_setlk(ino_a, 10, wl, 0, 0).unwrap();
+        assert_eq!(locks.fcntl_setlk(ino_a, 11, wl, 0, 0), Err(Errno::EAGAIN));
+        locks.release_posix_target_pid(ino_a, 10);
+        locks.fcntl_setlk(ino_a, 11, wl, 0, 0).unwrap();
     }
 }

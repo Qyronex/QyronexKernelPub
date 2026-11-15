@@ -321,6 +321,8 @@ impl<const WAITERS: usize> Drop for Guard<'_, WAITERS> {
 
 pub(super) const STEP30_PIPE_WAITERS: usize = super::runtime::STEP15_RUNTIME_THREADS;
 static PIPE_WAITS: SerializedPipeWaitTable<STEP30_PIPE_WAITERS> = SerializedPipeWaitTable::new();
+static WRITE_PIPE_WAITS: SerializedPipeWaitTable<STEP30_PIPE_WAITERS> =
+    SerializedPipeWaitTable::new();
 
 /// Publishes one exact Prepared waiter and releases the PipeWait serializer before returning.
 ///
@@ -330,12 +332,24 @@ pub(super) unsafe fn prepare(pipe: PipeId, thread: GlobalThreadId) -> Result<(),
     PIPE_WAITS.lock().table_mut().prepare(pipe, thread)
 }
 
+/// Publishes one exact Prepared write waiter for a full pipe and releases the serializer.
+#[allow(dead_code)]
+pub(super) unsafe fn prepare_write(pipe: PipeId, thread: GlobalThreadId) -> Result<(), Error> {
+    WRITE_PIPE_WAITS.lock().table_mut().prepare(pipe, thread)
+}
+
 /// Commits one previously Prepared exact waiter immediately before the scheduler block edge.
 ///
 /// `AlreadyWoken` means either readiness won while the caller was revalidating the pipe or a retained
 /// signal interruption won; the caller must re-observe the relevant canonical owner and must not sleep.
 pub(super) unsafe fn commit(thread: GlobalThreadId) -> Result<WaitCommit, Error> {
     PIPE_WAITS.lock().table_mut().commit(thread)
+}
+
+/// Commits one previously Prepared exact write waiter immediately before the scheduler block edge.
+#[allow(dead_code)]
+pub(super) unsafe fn commit_write(thread: GlobalThreadId) -> Result<WaitCommit, Error> {
+    WRITE_PIPE_WAITS.lock().table_mut().commit(thread)
 }
 
 /// Compatibility helper for tests/diagnostics that do not cross a readiness revalidation window.
@@ -359,36 +373,41 @@ pub(super) unsafe fn cancel(thread: GlobalThreadId) -> Result<bool, Error> {
     PIPE_WAITS.lock().table_mut().cancel(thread)
 }
 
-pub(super) unsafe fn notify_one(
-    pipe: PipeId,
-) -> Result<(NotifyReport, Option<GlobalThreadId>), Error> {
-    let mut output = [None; 1];
-    let mut exact = [GlobalThreadId::new(
+#[allow(dead_code)]
+pub(super) unsafe fn cancel_write(thread: GlobalThreadId) -> Result<bool, Error> {
+    WRITE_PIPE_WAITS.lock().table_mut().cancel(thread)
+}
+
+fn empty_thread() -> GlobalThreadId {
+    GlobalThreadId::new(
         kernal_percpu::CpuIndex(0),
         kernal_scheduler::ThreadId {
             slot: 0,
             generation: 0,
         },
-    ); 1];
-    let report = PIPE_WAITS.lock().table_mut().notify(pipe, 1, &mut exact)?;
+    )
+}
+
+fn notify_one_in(
+    table: &SerializedPipeWaitTable<STEP30_PIPE_WAITERS>,
+    pipe: PipeId,
+) -> Result<(NotifyReport, Option<GlobalThreadId>), Error> {
+    let mut output = [None; 1];
+    let mut exact = [empty_thread(); 1];
+    let report = table.lock().table_mut().notify(pipe, 1, &mut exact)?;
     if report.runnable == 1 {
         output[0] = Some(exact[0]);
     }
     Ok((report, output[0]))
 }
 
-pub(super) unsafe fn notify_all(
+fn notify_all_in(
+    table: &SerializedPipeWaitTable<STEP30_PIPE_WAITERS>,
     pipe: PipeId,
 ) -> Result<([Option<GlobalThreadId>; STEP30_PIPE_WAITERS], NotifyReport), Error> {
-    let mut exact = [GlobalThreadId::new(
-        kernal_percpu::CpuIndex(0),
-        kernal_scheduler::ThreadId {
-            slot: 0,
-            generation: 0,
-        },
-    ); STEP30_PIPE_WAITERS];
+    let mut exact = [empty_thread(); STEP30_PIPE_WAITERS];
     let mut out = [None; STEP30_PIPE_WAITERS];
-    let report = PIPE_WAITS
+    let report = table
         .lock()
         .table_mut()
         .notify(pipe, STEP30_PIPE_WAITERS, &mut exact)?;
@@ -398,14 +417,48 @@ pub(super) unsafe fn notify_all(
     Ok((out, report))
 }
 
+pub(super) unsafe fn notify_one(
+    pipe: PipeId,
+) -> Result<(NotifyReport, Option<GlobalThreadId>), Error> {
+    notify_one_in(&PIPE_WAITS, pipe)
+}
+
+pub(super) unsafe fn notify_all(
+    pipe: PipeId,
+) -> Result<([Option<GlobalThreadId>; STEP30_PIPE_WAITERS], NotifyReport), Error> {
+    notify_all_in(&PIPE_WAITS, pipe)
+}
+
+#[allow(dead_code)]
+pub(super) unsafe fn notify_all_write(
+    pipe: PipeId,
+) -> Result<([Option<GlobalThreadId>; STEP30_PIPE_WAITERS], NotifyReport), Error> {
+    notify_all_in(&WRITE_PIPE_WAITS, pipe)
+}
+
 pub(super) unsafe fn interrupt(thread: GlobalThreadId) -> Result<InterruptOutcome, Error> {
     PIPE_WAITS.lock().table_mut().interrupt(thread)
+}
+
+pub(super) unsafe fn interrupt_write(thread: GlobalThreadId) -> Result<InterruptOutcome, Error> {
+    WRITE_PIPE_WAITS.lock().table_mut().interrupt(thread)
 }
 
 pub(super) unsafe fn interruption_pending(thread: GlobalThreadId) -> Result<bool, Error> {
     PIPE_WAITS.lock().table().interruption_pending(thread)
 }
 
+pub(super) unsafe fn interruption_pending_write(thread: GlobalThreadId) -> Result<bool, Error> {
+    WRITE_PIPE_WAITS.lock().table().interruption_pending(thread)
+}
+
 pub(super) unsafe fn consume_interrupted(thread: GlobalThreadId) -> Result<bool, Error> {
     PIPE_WAITS.lock().table_mut().consume_interrupted(thread)
+}
+
+pub(super) unsafe fn consume_interrupted_write(thread: GlobalThreadId) -> Result<bool, Error> {
+    WRITE_PIPE_WAITS
+        .lock()
+        .table_mut()
+        .consume_interrupted(thread)
 }

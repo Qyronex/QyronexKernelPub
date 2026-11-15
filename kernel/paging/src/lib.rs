@@ -23,6 +23,7 @@ impl MapFlags {
     pub const WRITE: Self = Self(1 << 1);
     pub const USER: Self = Self(1 << 2);
     pub const GLOBAL: Self = Self(1 << 8);
+    pub const USER_NO_ACCESS: Self = Self(1 << 9);
     pub const EXECUTE: Self = Self(1 << 63);
 
     pub const fn union(self, other: Self) -> Self {
@@ -39,6 +40,10 @@ impl MapFlags {
 
     pub const fn user(self) -> bool {
         self.0 & Self::USER.0 != 0
+    }
+
+    pub const fn user_no_access(self) -> bool {
+        self.0 & Self::USER_NO_ACCESS.0 != 0
     }
 
     pub const fn validate(self) -> Result<Self, Error> {

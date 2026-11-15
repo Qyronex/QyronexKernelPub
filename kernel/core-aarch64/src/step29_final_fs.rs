@@ -269,10 +269,184 @@ fn fchdir(process: kernal_capability::ObjectId, raw_fd: u64) -> Result<u64, Erro
     .map_err(|_| Error::Invariant)?
 }
 
+pub(super) fn openat_overlay_bytes(
+    process: kernal_capability::ObjectId,
+    path: &[u8],
+    raw_flags: u64,
+    raw_mode: u64,
+) -> Result<Option<u64>, Error> {
+    let flags = u64::from(linux_unsigned_int(raw_flags));
+    if let Some(fd) = openat2_ops::openat_owned_bytes(AT_FDCWD as u64, path, flags, raw_mode)? {
+        return Ok(Some(fd));
+    }
+    openat_bytes(process, AT_FDCWD as u64, path, raw_flags, raw_mode)
+}
+
+pub(super) fn newfstatat_host_path(
+    process: kernal_capability::ObjectId,
+    path: &[u8],
+    user_stat: u64,
+    flags: u32,
+) -> Result<Result<i64, Errno>, ()> {
+    to_linux_result(metadata_ops::newfstatat_bytes(
+        process,
+        AT_FDCWD as u64,
+        path,
+        user_stat,
+        flags,
+    ))
+}
+
+pub(super) fn statx_host_path(
+    process: kernal_capability::ObjectId,
+    path: &[u8],
+    flags: u32,
+    user_statx: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    to_linux_result(metadata_ops::statx_bytes(
+        process,
+        AT_FDCWD as u64,
+        path,
+        flags,
+        user_statx,
+    ))
+}
+
+pub(super) fn readlinkat_host_path(
+    process: kernal_capability::ObjectId,
+    path: &[u8],
+    user_buffer: u64,
+    raw_buffer_size: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    to_linux_result(namespace_ops::readlinkat_bytes(
+        process,
+        AT_FDCWD as u64,
+        path,
+        user_buffer,
+        raw_buffer_size,
+    ))
+}
+
+pub(super) fn faccessat_host_path(
+    process: kernal_capability::ObjectId,
+    path: &[u8],
+) -> Result<Result<i64, Errno>, ()> {
+    to_linux_result(namespace_ops::faccessat_bytes(
+        process,
+        AT_FDCWD as u64,
+        path,
+    ))
+}
+
+pub(super) fn chdir_host_path(
+    process: kernal_capability::ObjectId,
+    path: &[u8],
+) -> Result<Result<i64, Errno>, ()> {
+    let res = super::super::step29_runtime::with_process(process, |runtime| {
+        let canonical = canonical_at(runtime, AT_FDCWD as u64, path)?;
+        let directory = runtime
+            .overlay()
+            .open_directory_at(canonical_lookup_bytes(&canonical))
+            .map_err(map_overlay_error)?;
+        let (overlay, context) = runtime.overlay_context_parts();
+        overlay
+            .set_context_cwd(context, directory)
+            .map_err(map_overlay_error)?;
+        Ok(0u64)
+    })
+    .map_err(|_| Error::Invariant)
+    .and_then(|r| r);
+    to_linux_result(res)
+}
+
+pub(super) fn fchdir_host(
+    process: kernal_capability::ObjectId,
+    raw_fd: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    to_linux_result(fchdir(process, raw_fd))
+}
+
+pub(super) fn initramfs_cwd_bytes(
+    process: kernal_capability::ObjectId,
+) -> Result<alloc::vec::Vec<u8>, Errno> {
+    super::super::step29_runtime::with_process(process, |runtime| {
+        let cwd = runtime.fs_context().cwd_handle();
+        let directory = runtime
+            .overlay()
+            .revalidate_directory_handle(cwd)
+            .map_err(map_overlay_error)?;
+        let canonical = runtime
+            .overlay()
+            .directory_canonical_path(directory)
+            .map_err(map_overlay_error)?;
+        let mut output = [0u8; LINUX_PATH_MAX];
+        let len = canonical
+            .write_absolute(&mut output[..LINUX_PATH_MAX - 1])
+            .ok_or_else(|| Error::Linux(Errno::ENAMETOOLONG))?;
+        Ok::<_, Error>(output[..len].to_vec())
+    })
+    .map_err(|_| Errno::EIO)?
+    .map_err(|e| match e {
+        Error::Linux(err) => err,
+        Error::Invariant => Errno::EIO,
+    })
+}
+
+pub(super) fn inspect_initramfs_path(
+    process: kernal_capability::ObjectId,
+    host_path: &[u8],
+) -> Result<Option<(bool, Option<alloc::vec::Vec<u8>>)>, Errno> {
+    super::super::step29_runtime::with_process(process, |runtime| {
+        let rel = host_path.strip_prefix(b"/").unwrap_or(host_path);
+        let lookup = if rel.is_empty() { b"/" } else { rel };
+        if let Ok(root_dir) = runtime.overlay().open_directory_at(b"/") {
+            let mut target = [0u8; LINUX_PATH_MAX];
+            if let Ok(copied) = runtime
+                .overlay()
+                .readlink_from(root_dir, lookup, &mut target)
+            {
+                return Ok::<_, Errno>(Some((false, Some(target[..copied].to_vec()))));
+            }
+        }
+        if runtime.overlay().open_directory_at(lookup).is_ok() {
+            return Ok(Some((true, None)));
+        }
+        match runtime.overlay().lookup_at(rel) {
+            Ok(Some(_)) => Ok(Some((false, None))),
+            Ok(None) => Ok(None),
+            Err(err) => match map_overlay_error(err) {
+                Error::Linux(Errno::ENOENT) => Ok(None),
+                Error::Linux(e) => Err(e),
+                Error::Invariant => Err(Errno::EIO),
+            },
+        }
+    })
+    .map_err(|_| Errno::EIO)?
+}
+
+fn to_linux_result(result: Result<u64, Error>) -> Result<Result<i64, Errno>, ()> {
+    match result {
+        Ok(value) => Ok(Ok(i64::try_from(value).map_err(|_| ())?)),
+        Err(Error::Linux(errno)) => Ok(Err(errno)),
+        Err(Error::Invariant) => Err(()),
+    }
+}
+
 fn openat(
     process: kernal_capability::ObjectId,
     raw_dirfd: u64,
     user_path: u64,
+    raw_flags: u64,
+    raw_mode: u64,
+) -> Result<Option<u64>, Error> {
+    let path = super::copy_user_path(user_path)?;
+    openat_bytes(process, raw_dirfd, path.as_bytes(), raw_flags, raw_mode)
+}
+
+fn openat_bytes(
+    process: kernal_capability::ObjectId,
+    raw_dirfd: u64,
+    path: &[u8],
     raw_flags: u64,
     raw_mode: u64,
 ) -> Result<Option<u64>, Error> {
@@ -281,13 +455,12 @@ fn openat(
     if access == O_ACCMODE {
         return Err(Error::Linux(Errno::EINVAL));
     }
-    let path = super::copy_user_path(user_path)?;
     super::super::step29_runtime::with_process(process, |runtime| {
-        let force_overlay = overlay_base_required(runtime, raw_dirfd, path.as_bytes())?
+        let force_overlay = overlay_base_required(runtime, raw_dirfd, path)?
             || flags & (O_CREAT | O_TRUNC) != 0
             || matches!(access, O_WRONLY | O_RDWR);
         if !force_overlay {
-            let canonical = canonical_at_root_only(path.as_bytes())?;
+            let canonical = canonical_at_root_only(path)?;
             let Some(logical) = runtime
                 .overlay()
                 .lookup_at(canonical_lookup_bytes(&canonical))
@@ -306,7 +479,7 @@ fn openat(
             return Err(Error::Linux(Errno::EINVAL));
         }
 
-        let canonical = canonical_at(runtime, raw_dirfd, path.as_bytes())?;
+        let canonical = canonical_at(runtime, raw_dirfd, path)?;
         let lookup_path = canonical_lookup_bytes(&canonical);
         let close_on_exec = flags & O_CLOEXEC != 0;
         let status_flags = flags & OFD_STATUS_FLAGS;
@@ -477,9 +650,9 @@ fn close(process: kernal_capability::ObjectId, raw_fd: u64) -> Result<Option<u64
                 ReleasedObject::WritableRegular(retained) => overlay
                     .release_retained_regular(retained)
                     .map_err(map_overlay_error),
-                ReleasedObject::RetainedDirectory(_) | ReleasedObject::Pipe(_) => {
-                    Err(Error::Invariant)
-                }
+                ReleasedObject::RetainedDirectory(_)
+                | ReleasedObject::Pipe(_)
+                | ReleasedObject::Subsystem(_) => Err(Error::Invariant),
             })
             .map_err(super::map_fd_error)?;
         closed?;

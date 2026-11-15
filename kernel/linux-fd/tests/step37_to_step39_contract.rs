@@ -12,7 +12,10 @@ fn steps37_to_39_are_wired_into_aarch64_svc_dispatch() {
     assert!(STEP15_QEMU.contains("#[path = \"step37_38_systemd_udev.rs\"]"));
     assert!(STEP15_QEMU.contains("step37_38_systemd_udev::try_handle_syscall(request)"));
     assert!(STEP15_QEMU.contains("#[path = \"step39_dpkg.rs\"]"));
-    assert!(STEP15_QEMU.contains("step39_dpkg::try_handle_syscall(request)"));
+    assert!(
+        STEP15_QEMU.contains("step39_dpkg::try_handle_syscall(request)")
+            || STEP15_QEMU.contains("step39_dpkg::try_handle_syscall_with_frame(request,")
+    );
 }
 
 #[test]

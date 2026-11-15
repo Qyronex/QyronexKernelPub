@@ -18,10 +18,11 @@ pub use step30::{
 mod step31;
 pub use step31::{
     ARCH_GET_FS, ARCH_GET_GS, ARCH_SET_FS, ARCH_SET_GS, ArchPrctlOp, GRND_INSECURE, GRND_NONBLOCK,
-    GRND_RANDOM, GetrandomFlags, IOVEC_BYTES, IoVec, KERNEL_TERMIOS_BYTES, MAX_RW_COUNT,
-    RLIM_NLIMITS, RLIM64_INFINITY, RLIMIT64_BYTES, Rlimit64, RlimitResource, Step31GlibcCall,
-    TCGETS, TCSETS, TCSETSF, TCSETSW, TIOCGPGRP, TIOCGPTN, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP,
-    TIOCSPTLCK, TIOCSWINSZ, UIO_MAXIOV, UTSNAME_BYTES, UTSNAME_FIELD_BYTES, WINSIZE_BYTES, WinSize,
+    GRND_RANDOM, GetrandomFlags, IOVEC_BYTES, IoVec, KERNEL_TERMIOS_BYTES, MAX_RW_COUNT, POLLERR,
+    POLLFD_BYTES, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLPRI, POLLRDHUP, RLIM_NLIMITS,
+    RLIM64_INFINITY, RLIMIT64_BYTES, Rlimit64, RlimitResource, Step31GlibcCall, TCGETS, TCSETS,
+    TCSETSF, TCSETSW, TIOCGPGRP, TIOCGPTN, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK,
+    TIOCSWINSZ, UIO_MAXIOV, UTSNAME_BYTES, UTSNAME_FIELD_BYTES, WINSIZE_BYTES, WinSize,
     X86_64_CANONICAL_USER_LIMIT, decode_arch_prctl, decode_getrandom_flags, decode_iovcnt,
     decode_rlimit_resource, default_rlimit64, encode_default_serial_termios,
     encode_linux_aarch64_utsname, encode_linux_x86_64_utsname, validate_iovec_slice,
@@ -278,6 +279,8 @@ impl Errno {
     pub const ENOTCONN: Self = Self(107);
     pub const ETIMEDOUT: Self = Self(110);
     pub const ECONNREFUSED: Self = Self(111);
+    pub const EALREADY: Self = Self(114);
+    pub const EINPROGRESS: Self = Self(115);
 
     pub const fn new(value: u16) -> Option<Self> {
         if value == 0 || value > MAX_ERRNO {
