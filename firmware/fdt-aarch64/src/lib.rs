@@ -12,8 +12,13 @@ pub enum Error {
     Fdt(kernal_fdt::Error),
     NodeDepthExceeded,
     CpuCapacity,
+    DeviceCapacity,
     MalformedProperty,
     UnsupportedCellCount,
+    ZeroSizedRegion,
+    AddressOverflow,
+    OverlappingRegion,
+    MissingProperty,
 }
 
 impl From<kernal_fdt::Error> for Error {
@@ -103,6 +108,125 @@ impl<const N: usize> Default for PlatformInfo<N> {
     }
 }
 
+pub const MAX_CHOSEN_BOOTARGS_BYTES: usize = 256;
+
+/// One `virtio,mmio` platform transport node discovered from an AArch64 FDT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioMmioInfo {
+    pub region: MmioRegion,
+    pub irq: u32,
+    pub enabled: bool,
+}
+
+impl VirtioMmioInfo {
+    const EMPTY: Self = Self {
+        region: MmioRegion { base: 0, size: 0 },
+        irq: 0,
+        enabled: false,
+    };
+}
+
+/// ARM PrimeCell PL031 real-time clock MMIO node discovered from an AArch64 FDT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RtcMmioInfo {
+    pub region: MmioRegion,
+    pub irq: Option<u32>,
+    pub enabled: bool,
+}
+
+/// Generic PCIe ECAM host controller window (`pci-host-ecam-generic`) from an AArch64 FDT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PciHostEcamInfo {
+    pub region: MmioRegion,
+    pub bus_start: u8,
+    pub bus_end: u8,
+    pub enabled: bool,
+}
+
+/// Kernel boot parameters and seed presence metadata captured from FDT `/chosen`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChosenBootInfo {
+    bootargs: [u8; MAX_CHOSEN_BOOTARGS_BYTES],
+    bootargs_len: usize,
+    pub rng_seed_len: usize,
+}
+
+impl ChosenBootInfo {
+    pub const fn empty() -> Self {
+        Self {
+            bootargs: [0u8; MAX_CHOSEN_BOOTARGS_BYTES],
+            bootargs_len: 0,
+            rng_seed_len: 0,
+        }
+    }
+
+    pub fn bootargs(&self) -> &[u8] {
+        &self.bootargs[..self.bootargs_len]
+    }
+}
+
+/// Hardware device inventory parsed from an AArch64 FDT without fixed board addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceInventory<const M: usize> {
+    virtio_mmio: [VirtioMmioInfo; M],
+    virtio_mmio_count: usize,
+    pub pl011: Option<MmioRegion>,
+    pub pl031_rtc: Option<RtcMmioInfo>,
+    pub pcie_ecam: Option<PciHostEcamInfo>,
+    pub chosen: ChosenBootInfo,
+}
+
+impl<const M: usize> DeviceInventory<M> {
+    pub const fn new() -> Self {
+        Self {
+            virtio_mmio: [VirtioMmioInfo::EMPTY; M],
+            virtio_mmio_count: 0,
+            pl011: None,
+            pl031_rtc: None,
+            pcie_ecam: None,
+            chosen: ChosenBootInfo::empty(),
+        }
+    }
+
+    pub fn virtio_mmio_devices(&self) -> &[VirtioMmioInfo] {
+        &self.virtio_mmio[..self.virtio_mmio_count]
+    }
+
+    fn push_virtio_mmio(&mut self, device: VirtioMmioInfo) -> Result<(), Error> {
+        self.check_non_overlapping(device.region)?;
+        if self.virtio_mmio_count == M {
+            return Err(Error::DeviceCapacity);
+        }
+        self.virtio_mmio[self.virtio_mmio_count] = device;
+        self.virtio_mmio_count += 1;
+        Ok(())
+    }
+
+    fn check_non_overlapping(&self, candidate: MmioRegion) -> Result<(), Error> {
+        let candidate_end = validate_nonzero_region(candidate)?;
+        let existing_regions = self
+            .virtio_mmio_devices()
+            .iter()
+            .map(|dev| dev.region)
+            .chain(self.pl011)
+            .chain(self.pl031_rtc.map(|rtc| rtc.region))
+            .chain(self.pcie_ecam.map(|ecam| ecam.region));
+        for region in existing_regions {
+            let end = validate_nonzero_region(region)?;
+            if candidate.base < end && region.base < candidate_end {
+                return Err(Error::OverlappingRegion);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<const M: usize> Default for DeviceInventory<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct NodeScratch {
     parent_address_cells: u8,
@@ -116,11 +240,17 @@ struct NodeScratch {
     gicv3_compatible: bool,
     timer_compatible: bool,
     pl011_compatible: bool,
+    pl031_compatible: bool,
+    virtio_mmio_compatible: bool,
+    ecam_compatible: bool,
+    chosen_node: bool,
     psci_method: Option<PsciConduit>,
     reg: [u32; MAX_PROPERTY_CELLS],
     reg_len: u8,
     interrupts: [u32; MAX_PROPERTY_CELLS],
     interrupts_len: u8,
+    bus_range: [u32; 2],
+    has_bus_range: bool,
 }
 
 impl NodeScratch {
@@ -136,11 +266,17 @@ impl NodeScratch {
         gicv3_compatible: false,
         timer_compatible: false,
         pl011_compatible: false,
+        pl031_compatible: false,
+        virtio_mmio_compatible: false,
+        ecam_compatible: false,
+        chosen_node: false,
         psci_method: None,
         reg: [0; MAX_PROPERTY_CELLS],
         reg_len: 0,
         interrupts: [0; MAX_PROPERTY_CELLS],
         interrupts_len: 0,
+        bus_range: [0; 2],
+        has_bus_range: false,
     };
 
     fn for_child(parent: Option<Self>, name: &str) -> Self {
@@ -151,6 +287,7 @@ impl NodeScratch {
             parent_address_cells,
             parent_size_cells,
             cpu_name: name == "cpu" || name.starts_with("cpu@"),
+            chosen_node: name == "chosen",
             ..Self::EMPTY
         }
     }
@@ -177,6 +314,35 @@ impl NodeScratch {
 
 pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>, Error> {
     let mut platform = PlatformInfo::new();
+    walk_fdt(
+        blob,
+        |_name, _value| Ok(()),
+        |node| finalize_node(node, &mut platform),
+    )?;
+    Ok(platform)
+}
+
+/// Discovers QEMU/hardware MMIO peripherals, PCIe ECAM, PL031 RTC, VirtIO-MMIO transports, and
+/// `/chosen` metadata from an AArch64 DTB without relying on hard-coded platform addresses.
+pub fn parse_device_inventory<const M: usize>(
+    blob: &Blob<'_>,
+) -> Result<DeviceInventory<M>, Error> {
+    let mut inventory = DeviceInventory::new();
+    let mut chosen = ChosenBootInfo::empty();
+    walk_fdt(
+        blob,
+        |name, value| capture_chosen_property(name, value, &mut chosen),
+        |node| finalize_device_node(node, &mut inventory),
+    )?;
+    inventory.chosen = chosen;
+    Ok(inventory)
+}
+
+fn walk_fdt(
+    blob: &Blob<'_>,
+    mut on_chosen_prop: impl FnMut(&str, &[u8]) -> Result<(), Error>,
+    mut on_end_node: impl FnMut(NodeScratch) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut stack = [NodeScratch::EMPTY; MAX_NODE_DEPTH];
     let mut depth = 0usize;
 
@@ -195,6 +361,9 @@ pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>
                     return Err(Error::MalformedProperty);
                 }
                 let node = &mut stack[depth - 1];
+                if node.chosen_node {
+                    on_chosen_prop(name, value)?;
+                }
                 match name {
                     "#address-cells" => node.child_address_cells = one_cell(value)?,
                     "#size-cells" => node.child_size_cells = one_cell(value)?,
@@ -209,6 +378,9 @@ pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>
                         node.gicv3_compatible = compatible_contains(value, "arm,gic-v3");
                         node.timer_compatible = compatible_contains(value, "arm,armv8-timer");
                         node.pl011_compatible = compatible_contains(value, "arm,pl011");
+                        node.pl031_compatible = compatible_contains(value, "arm,pl031");
+                        node.virtio_mmio_compatible = compatible_contains(value, "virtio,mmio");
+                        node.ecam_compatible = compatible_contains(value, "pci-host-ecam-generic");
                     }
                     "method" => {
                         node.psci_method = match property_string(value) {
@@ -222,6 +394,15 @@ pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>
                         node.interrupts_len =
                             NodeScratch::capture_cells(&mut node.interrupts, value)?;
                     }
+                    "bus-range" => {
+                        let mut cells = [0u32; MAX_PROPERTY_CELLS];
+                        let len = NodeScratch::capture_cells(&mut cells, value)?;
+                        if len != 2 || cells[0] > cells[1] || cells[1] > 255 {
+                            return Err(Error::MalformedProperty);
+                        }
+                        node.bus_range = [cells[0], cells[1]];
+                        node.has_bus_range = true;
+                    }
                     _ => {}
                 }
             }
@@ -230,7 +411,7 @@ pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>
                     return Err(Error::MalformedProperty);
                 }
                 let node = stack[depth - 1];
-                finalize_node(node, &mut platform)?;
+                on_end_node(node)?;
                 depth -= 1;
             }
         }
@@ -239,7 +420,131 @@ pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>
     if depth != 0 {
         return Err(Error::MalformedProperty);
     }
-    Ok(platform)
+    Ok(())
+}
+
+fn capture_chosen_property(
+    name: &str,
+    value: &[u8],
+    chosen: &mut ChosenBootInfo,
+) -> Result<(), Error> {
+    match name {
+        "bootargs" => {
+            let trimmed = match value.iter().position(|b| *b == 0) {
+                Some(idx) => &value[..idx],
+                None => value,
+            };
+            if trimmed.len() > MAX_CHOSEN_BOOTARGS_BYTES {
+                return Err(Error::MalformedProperty);
+            }
+            chosen.bootargs[..trimmed.len()].copy_from_slice(trimmed);
+            chosen.bootargs_len = trimmed.len();
+        }
+        "rng-seed" => {
+            chosen.rng_seed_len = value.len();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_nonzero_region(region: MmioRegion) -> Result<u64, Error> {
+    if region.size == 0 {
+        return Err(Error::ZeroSizedRegion);
+    }
+    region
+        .base
+        .checked_add(region.size)
+        .ok_or(Error::AddressOverflow)
+}
+
+fn finalize_device_node<const M: usize>(
+    node: NodeScratch,
+    inventory: &mut DeviceInventory<M>,
+) -> Result<(), Error> {
+    if node.pl011_compatible && node.reg_len != 0 {
+        let region = decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?;
+        inventory.check_non_overlapping(region)?;
+        inventory.pl011 = Some(region);
+    }
+
+    if node.pl031_compatible {
+        if node.reg_len == 0 {
+            return Err(Error::MissingProperty);
+        }
+        let region = decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?;
+        inventory.check_non_overlapping(region)?;
+        let irq = if node.interrupts_len != 0 {
+            if node.interrupts_len < 3 {
+                return Err(Error::MalformedProperty);
+            }
+            Some(decode_gic_interrupt(&node.interrupts[..3])?)
+        } else {
+            None
+        };
+        inventory.pl031_rtc = Some(RtcMmioInfo {
+            region,
+            irq,
+            enabled: node.enabled,
+        });
+    }
+
+    if node.virtio_mmio_compatible {
+        if node.reg_len == 0 || node.interrupts_len == 0 {
+            return Err(Error::MissingProperty);
+        }
+        if node.interrupts_len < 3 {
+            return Err(Error::MalformedProperty);
+        }
+        let region = decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?;
+        let irq = decode_gic_interrupt(&node.interrupts[..3])?;
+        inventory.push_virtio_mmio(VirtioMmioInfo {
+            region,
+            irq,
+            enabled: node.enabled,
+        })?;
+    }
+
+    if node.ecam_compatible {
+        if node.reg_len == 0 {
+            return Err(Error::MissingProperty);
+        }
+        let region = decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?;
+        inventory.check_non_overlapping(region)?;
+        let (bus_start, bus_end) = if node.has_bus_range {
+            (node.bus_range[0] as u8, node.bus_range[1] as u8)
+        } else {
+            (0, 255)
+        };
+        inventory.pcie_ecam = Some(PciHostEcamInfo {
+            region,
+            bus_start,
+            bus_end,
+            enabled: node.enabled,
+        });
+    }
+
+    Ok(())
 }
 
 fn finalize_node<const N: usize>(
@@ -635,5 +940,154 @@ mod tests {
         let blob = Blob::parse(&bytes).unwrap();
         let platform = parse_platform::<8>(&blob).unwrap();
         assert!(!platform.cpus()[1].enabled);
+    }
+
+    fn build_dtb_with_nodes(build: impl FnOnce(&mut Vec<u8>, &mut Vec<u8>)) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut structure = Vec::new();
+        begin_node(&mut structure, "");
+        let addr_cells = intern(&mut strings, "#address-cells");
+        let size_cells = intern(&mut strings, "#size-cells");
+        property(&mut structure, addr_cells, &2u32.to_be_bytes());
+        property(&mut structure, size_cells, &2u32.to_be_bytes());
+        build(&mut strings, &mut structure);
+        end_node(&mut structure);
+        push_u32(&mut structure, FDT_END);
+
+        let reserve_offset = 40usize;
+        let structure_offset = reserve_offset + 16;
+        let strings_offset = structure_offset + structure.len();
+        let total_size = strings_offset + strings.len();
+        let mut blob = vec![0u8; total_size];
+        blob[0..4].copy_from_slice(&MAGIC.to_be_bytes());
+        blob[4..8].copy_from_slice(&(total_size as u32).to_be_bytes());
+        blob[8..12].copy_from_slice(&(structure_offset as u32).to_be_bytes());
+        blob[12..16].copy_from_slice(&(strings_offset as u32).to_be_bytes());
+        blob[16..20].copy_from_slice(&(reserve_offset as u32).to_be_bytes());
+        blob[20..24].copy_from_slice(&17u32.to_be_bytes());
+        blob[24..28].copy_from_slice(&16u32.to_be_bytes());
+        blob[28..32].copy_from_slice(&0u32.to_be_bytes());
+        blob[32..36].copy_from_slice(&(strings.len() as u32).to_be_bytes());
+        blob[36..40].copy_from_slice(&(structure.len() as u32).to_be_bytes());
+        blob[structure_offset..strings_offset].copy_from_slice(&structure);
+        blob[strings_offset..].copy_from_slice(&strings);
+        blob
+    }
+
+    #[test]
+    fn device_inventory_discovers_virtio_mmio_rtc_ecam_and_chosen() {
+        let dtb = build_dtb_with_nodes(|strings, structure| {
+            let compatible = intern(strings, "compatible");
+            let reg = intern(strings, "reg");
+            let interrupts = intern(strings, "interrupts");
+            let bus_range = intern(strings, "bus-range");
+            let bootargs = intern(strings, "bootargs");
+            let rng_seed = intern(strings, "rng-seed");
+
+            begin_node(structure, "chosen");
+            property(
+                structure,
+                bootargs,
+                b"root=/dev/vda1 rw rootfstype=ext4 console=ttyAMA0\0",
+            );
+            property(structure, rng_seed, &[0x5au8; 32]);
+            end_node(structure);
+
+            begin_node(structure, "pl011@9000000");
+            property(structure, compatible, b"arm,pl011\0");
+            property(structure, reg, &cells(&[0, 0x0900_0000, 0, 0x1000]));
+            end_node(structure);
+
+            begin_node(structure, "rtc@9010000");
+            property(structure, compatible, b"arm,pl031\0");
+            property(structure, reg, &cells(&[0, 0x0901_0000, 0, 0x1000]));
+            property(structure, interrupts, &cells(&[0, 2, 4]));
+            end_node(structure);
+
+            begin_node(structure, "virtio_mmio@a000000");
+            property(structure, compatible, b"virtio,mmio\0");
+            property(structure, reg, &cells(&[0, 0x0a00_0000, 0, 0x200]));
+            property(structure, interrupts, &cells(&[0, 16, 1]));
+            end_node(structure);
+
+            begin_node(structure, "virtio_mmio@a000200");
+            property(structure, compatible, b"virtio,mmio\0");
+            property(structure, reg, &cells(&[0, 0x0a00_0200, 0, 0x200]));
+            property(structure, interrupts, &cells(&[0, 17, 1]));
+            end_node(structure);
+
+            begin_node(structure, "pcie@10000000");
+            property(structure, compatible, b"pci-host-ecam-generic\0");
+            property(structure, reg, &cells(&[0x40, 0x1000_0000, 0, 0x1000_0000]));
+            property(structure, bus_range, &cells(&[0, 15]));
+            end_node(structure);
+        });
+
+        let blob = Blob::parse(&dtb).unwrap();
+        let inv = parse_device_inventory::<8>(&blob).unwrap();
+        assert_eq!(inv.virtio_mmio_devices().len(), 2);
+        assert_eq!(inv.virtio_mmio_devices()[0].region.base, 0x0a00_0000);
+        assert_eq!(inv.virtio_mmio_devices()[0].irq, 48); // SPI 16 + 32
+        assert_eq!(inv.virtio_mmio_devices()[1].irq, 49);
+        assert_eq!(inv.pl031_rtc.unwrap().region.base, 0x0901_0000);
+        assert_eq!(inv.pl031_rtc.unwrap().irq, Some(34));
+        assert_eq!(inv.pcie_ecam.unwrap().bus_end, 15);
+        assert_eq!(
+            inv.chosen.bootargs(),
+            b"root=/dev/vda1 rw rootfstype=ext4 console=ttyAMA0"
+        );
+        assert_eq!(inv.chosen.rng_seed_len, 32);
+    }
+
+    #[test]
+    fn device_inventory_rejects_overlapping_zero_size_and_missing_irq_virtio() {
+        let missing_irq = build_dtb_with_nodes(|strings, structure| {
+            let compatible = intern(strings, "compatible");
+            let reg = intern(strings, "reg");
+            begin_node(structure, "virtio_mmio@a000000");
+            property(structure, compatible, b"virtio,mmio\0");
+            property(structure, reg, &cells(&[0, 0x0a00_0000, 0, 0x200]));
+            end_node(structure);
+        });
+        assert_eq!(
+            parse_device_inventory::<4>(&Blob::parse(&missing_irq).unwrap()),
+            Err(Error::MissingProperty)
+        );
+
+        let zero_size = build_dtb_with_nodes(|strings, structure| {
+            let compatible = intern(strings, "compatible");
+            let reg = intern(strings, "reg");
+            let interrupts = intern(strings, "interrupts");
+            begin_node(structure, "virtio_mmio@a000000");
+            property(structure, compatible, b"virtio,mmio\0");
+            property(structure, reg, &cells(&[0, 0x0a00_0000, 0, 0]));
+            property(structure, interrupts, &cells(&[0, 16, 1]));
+            end_node(structure);
+        });
+        assert_eq!(
+            parse_device_inventory::<4>(&Blob::parse(&zero_size).unwrap()),
+            Err(Error::ZeroSizedRegion)
+        );
+
+        let overlapping = build_dtb_with_nodes(|strings, structure| {
+            let compatible = intern(strings, "compatible");
+            let reg = intern(strings, "reg");
+            let interrupts = intern(strings, "interrupts");
+            begin_node(structure, "virtio_mmio@a000000");
+            property(structure, compatible, b"virtio,mmio\0");
+            property(structure, reg, &cells(&[0, 0x0a00_0000, 0, 0x400]));
+            property(structure, interrupts, &cells(&[0, 16, 1]));
+            end_node(structure);
+
+            begin_node(structure, "virtio_mmio@a000200");
+            property(structure, compatible, b"virtio,mmio\0");
+            property(structure, reg, &cells(&[0, 0x0a00_0200, 0, 0x200]));
+            property(structure, interrupts, &cells(&[0, 17, 1]));
+            end_node(structure);
+        });
+        assert_eq!(
+            parse_device_inventory::<4>(&Blob::parse(&overlapping).unwrap()),
+            Err(Error::OverlappingRegion)
+        );
     }
 }

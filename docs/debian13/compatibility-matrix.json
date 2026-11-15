@@ -117,14 +117,14 @@
       "kind": "device",
       "name": "VirtIO block storage",
       "state": "PARTIAL",
-      "note": "Step 33/40 ext4 durable journal and cmdline root=/dev/vda1 boot profile implemented; full QEMU Debian rootfs block I/O proof pending."
+      "note": "FDT virtio,mmio discovery (firmware/fdt-aarch64) plus VirtioMmioTransport, SplitVirtqueue, and VirtioBlkDevice (drivers/virtio) pass all 12 Step 20 corpus cases and /dev/vda integration on host; live QEMU Debian rootfs block I/O proof pending (qemu-system-aarch64 unavailable on host)."
     },
     {
       "id": "feature.virtio_net",
       "kind": "device",
       "name": "VirtIO network interface",
       "state": "PARTIAL",
-      "note": "Step 34/40 socket, netlink, DNS, and host-forward profile implemented; live VirtIO-net QEMU Debian boot proof pending."
+      "note": "FDT virtio,mmio discovery plus VirtioNetDevice and Step 21 descriptor/checksum/MTU guards pass all 14 Step 21 corpus cases on host; live VirtIO-net QEMU Debian boot proof pending (qemu-system-aarch64 unavailable on host)."
     },
     {
       "id": "feature.systemd_udev_dpkg",
@@ -139,6 +139,27 @@
       "name": "User/pid/net/mnt namespaces, veth/bridge, cgroups v2, overlayfs, and seccomp",
       "state": "SUPPORTED_UNVERIFIED",
       "note": "Step 41 implements CLONE_NEWUSER with non-ambient delegated capability authority, setns, veth+bridge, cgroup cpu/memory/pids enforcement, overlay copy-up/whiteouts, and bounded cBPF seccomp on host tests; live OCI runtime proof under Debian 13 QEMU pending."
+    },
+    {
+      "id": "feature.server_hardware_expansion",
+      "kind": "device",
+      "name": "Server hardware expansion: NVMe, AHCI, wired NIC, USB, PL031 RTC, watchdog, telemetry, and entropy",
+      "state": "SUPPORTED_UNVERIFIED",
+      "note": "Step 42 implements NVMe/AHCI/wired-NIC/USB host models, PL031 RTC, watchdog magic-close, thermal/CPU sysfs telemetry, ChaCha-style HardwareEntropyPool, and /dev/rtc0 + /dev/watchdog + /dev/hwrng + /dev/vda AArch64 FD routing (step42_hardware.rs) on host tests; live bare-metal/QEMU hardware proof pending."
+    },
+    {
+      "id": "feature.desktop_seat_drm_evdev",
+      "kind": "device",
+      "name": "Optional isolated desktop: DRM/KMS/fb, evdev input, PCM audio, and seat/session revocation",
+      "state": "SUPPORTED_UNVERIFIED",
+      "note": "Step 43 implements overflow-checked DRM dumb buffers, CRTC master lock, evdev EVIOCGRAB, PCM audio, SeatManager atomic session-switch revocation, and /dev/dri/card0 + /dev/fb0 + /dev/input/event0 + /dev/snd/pcmC0D0p + /run/systemd/seats/seat0 AArch64 routing (step43_desktop.rs) on host tests; live graphical Debian session proof pending."
+    },
+    {
+      "id": "feature.conformance_release_gate",
+      "kind": "verification",
+      "name": "Release gate conformance, fuzz/stress bounds, and read-only telemetry",
+      "state": "SUPPORTED_UNVERIFIED",
+      "note": "Step 44 implements kernal-linux-conformance 5-gate validation (ABI/boot, VirtIO corpus, server hardware bounds, capability/desktop isolation, deterministic fuzz/stress) and read-only /proc/kernal/conformance reporting on host tests; full QEMU Debian CI proof pending."
     }
   ]
 }

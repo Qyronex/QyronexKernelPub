@@ -86,6 +86,14 @@ mod step39_dpkg;
 mod step40_debian_boot;
 #[path = "step41_container.rs"]
 mod step41_container;
+#[path = "step42_hardware.rs"]
+mod step42_hardware;
+#[path = "step43_desktop.rs"]
+mod step43_desktop;
+#[path = "step44_conformance.rs"]
+mod step44_conformance;
+#[path = "step_fd_util.rs"]
+mod step_fd_util;
 #[path = "step15_write.rs"]
 mod write;
 
@@ -737,6 +745,33 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         request,
         "Step 41 container",
         step41_container::try_handle_syscall,
+    ) {
+        return handled;
+    }
+
+    if let Some(handled) = dispatch_step_subsystem(
+        frame,
+        request,
+        "Step 42 hardware",
+        step42_hardware::try_handle_syscall,
+    ) {
+        return handled;
+    }
+
+    if let Some(handled) = dispatch_step_subsystem(
+        frame,
+        request,
+        "Step 43 desktop",
+        step43_desktop::try_handle_syscall,
+    ) {
+        return handled;
+    }
+
+    if let Some(handled) = dispatch_step_subsystem(
+        frame,
+        request,
+        "Step 44 conformance",
+        step44_conformance::try_handle_syscall,
     ) {
         return handled;
     }

@@ -1,0 +1,15 @@
+[package]
+name = "kernal-virtio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kernal-capability = { path = "../../kernel/capability" }
+kernal-fdt-aarch64 = { path = "../../firmware/fdt-aarch64" }
+kernal-iommu = { path = "../../kernel/iommu" }
+kernal-linux-abi = { path = "../../abi/linux" }

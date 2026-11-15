@@ -1,0 +1,17 @@
+[package]
+name = "kernal-linux-hardware"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kernal-capability = { path = "../capability" }
+kernal-iommu = { path = "../iommu" }
+kernal-linux-abi = { path = "../../abi/linux" }
+kernal-linux-systemd = { path = "../linux-systemd" }
+kernal-pci = { path = "../../drivers/pci" }
+kernal-virtio = { path = "../../drivers/virtio" }

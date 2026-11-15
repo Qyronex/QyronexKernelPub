@@ -35,9 +35,11 @@ kernal-linux-clone-runtime-aarch64 = { path = "../linux-clone-runtime-aarch64" }
 kernal-linux-clone-exit-aarch64 = { path = "../linux-clone-exit-aarch64" }
 kernal-linux-clone-trap-aarch64 = { path = "../linux-clone-trap-aarch64" }
 kernal-linux-cgroup = { path = "../linux-cgroup" }
+kernal-linux-conformance = { path = "../linux-conformance" }
 kernal-linux-container = { path = "../linux-container" }
 kernal-linux-credentials = { path = "../linux-credentials" }
 kernal-linux-debian-profile = { path = "../linux-debian-profile" }
+kernal-linux-desktop = { path = "../linux-desktop" }
 kernal-linux-dev = { path = "../linux-dev" }
 kernal-linux-dpkg = { path = "../linux-dpkg" }
 kernal-linux-events = { path = "../linux-events" }
@@ -46,6 +48,7 @@ kernal-linux-exit-lifecycle = { path = "../linux-exit-lifecycle" }
 kernal-linux-fd = { path = "../linux-fd" }
 kernal-linux-futex-runtime = { path = "../linux-futex-runtime" }
 kernal-linux-futex-trap-aarch64 = { path = "../linux-futex-trap-aarch64" }
+kernal-linux-hardware = { path = "../linux-hardware" }
 kernal-linux-identity = { path = "../linux-identity" }
 kernal-linux-mounts = { path = "../linux-mounts" }
 kernal-linux-net = { path = "../linux-net" }
@@ -80,6 +83,7 @@ kernal-user-entry-aarch64 = { path = "../user-entry-aarch64" }
 kernal-user-initial-context-aarch64 = { path = "../user-initial-context-aarch64" }
 kernal-usercopy = { path = "../usercopy" }
 kernal-usercopy-aarch64 = { path = "../usercopy-aarch64" }
+kernal-virtio = { path = "../../drivers/virtio" }
 kernal-vm = { path = "../vm" }
 
 [features]

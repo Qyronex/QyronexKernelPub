@@ -1,0 +1,23 @@
+[package]
+name = "kernal-linux-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kernal-capability = { path = "../capability" }
+kernal-fdt = { path = "../../firmware/fdt" }
+kernal-fdt-aarch64 = { path = "../../firmware/fdt-aarch64" }
+kernal-iommu = { path = "../iommu" }
+kernal-linux-abi = { path = "../../abi/linux" }
+kernal-linux-cgroup = { path = "../linux-cgroup" }
+kernal-linux-debian-profile = { path = "../linux-debian-profile" }
+kernal-linux-desktop = { path = "../linux-desktop" }
+kernal-linux-dpkg = { path = "../linux-dpkg" }
+kernal-linux-hardware = { path = "../linux-hardware" }
+kernal-pci = { path = "../../drivers/pci" }
+kernal-virtio = { path = "../../drivers/virtio" }

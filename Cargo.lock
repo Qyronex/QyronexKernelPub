@@ -229,9 +229,11 @@ dependencies = [
  "kernal-linux-clone-exit-aarch64",
  "kernal-linux-clone-runtime-aarch64",
  "kernal-linux-clone-trap-aarch64",
+ "kernal-linux-conformance",
  "kernal-linux-container",
  "kernal-linux-credentials",
  "kernal-linux-debian-profile",
+ "kernal-linux-desktop",
  "kernal-linux-dev",
  "kernal-linux-dpkg",
  "kernal-linux-events",
@@ -240,6 +242,7 @@ dependencies = [
  "kernal-linux-fd",
  "kernal-linux-futex-runtime",
  "kernal-linux-futex-trap-aarch64",
+ "kernal-linux-hardware",
  "kernal-linux-identity",
  "kernal-linux-mounts",
  "kernal-linux-net",
@@ -274,6 +277,7 @@ dependencies = [
  "kernal-user-initial-context-aarch64",
  "kernal-usercopy",
  "kernal-usercopy-aarch64",
+ "kernal-virtio",
  "kernal-vm",
 ]
 
@@ -569,6 +573,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernal-linux-conformance"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-fdt",
+ "kernal-fdt-aarch64",
+ "kernal-iommu",
+ "kernal-linux-abi",
+ "kernal-linux-cgroup",
+ "kernal-linux-debian-profile",
+ "kernal-linux-desktop",
+ "kernal-linux-dpkg",
+ "kernal-linux-hardware",
+ "kernal-pci",
+ "kernal-virtio",
+]
+
+[[package]]
 name = "kernal-linux-container"
 version = "0.1.0"
 dependencies = [
@@ -603,6 +625,14 @@ dependencies = [
  "kernal-linux-mounts",
  "kernal-linux-net",
  "kernal-linux-systemd",
+]
+
+[[package]]
+name = "kernal-linux-desktop"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
 ]
 
 [[package]]
@@ -709,6 +739,18 @@ dependencies = [
  "kernal-scheduler-cpu",
  "kernal-scheduler-smp",
  "kernal-syscall-entry-aarch64",
+]
+
+[[package]]
+name = "kernal-linux-hardware"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-iommu",
+ "kernal-linux-abi",
+ "kernal-linux-systemd",
+ "kernal-pci",
+ "kernal-virtio",
 ]
 
 [[package]]
@@ -1347,6 +1389,16 @@ dependencies = [
  "kernal-exceptions-aarch64",
  "kernal-page-table-aarch64",
  "kernal-usercopy",
+]
+
+[[package]]
+name = "kernal-virtio"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-fdt-aarch64",
+ "kernal-iommu",
+ "kernal-linux-abi",
 ]
 
 [[package]]
