@@ -254,9 +254,12 @@ impl Errno {
     pub const ESPIPE: Self = Self(29);
     pub const EROFS: Self = Self(30);
     pub const EPIPE: Self = Self(32);
+    pub const ERANGE: Self = Self(34);
     pub const ENAMETOOLONG: Self = Self(36);
+    pub const ENOLCK: Self = Self(37);
     pub const ENOSYS: Self = Self(38);
     pub const ELOOP: Self = Self(40);
+    pub const ENODATA: Self = Self(61);
     pub const EOVERFLOW: Self = Self(75);
     pub const ENOTSOCK: Self = Self(88);
     pub const EDESTADDRREQ: Self = Self(89);
