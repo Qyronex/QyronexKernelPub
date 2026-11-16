@@ -234,11 +234,12 @@ pub(super) unsafe fn fork_process<const THREADS: usize, const WAKES: usize>(
     priority: u8,
 ) -> Result<super::step30_fork::PublishedForkLeaderReceipt, ()> {
     // SAFETY: delegated caller contract matches `fork_process_inner`.
-    unsafe { fork_process_inner(frame, current, plan, scheduler, priority, None, None) }
+    unsafe { fork_process_inner(frame, current, plan, scheduler, priority, None, None, None) }
 }
 
 /// Variant of [`fork_process`] that applies optional `CLONE_CHILD_SETTID` / `CLONE_CHILD_CLEARTID`
-/// metadata for unmodified dynamic glibc `_Fork` / `fork` callers.
+/// metadata and optional explicit child user stack (`posix_spawn`) for unmodified dynamic Debian
+/// userspace.
 ///
 /// # Safety
 /// Identical to [`fork_process`].
@@ -255,6 +256,7 @@ pub(super) unsafe fn fork_process_with_tid_options<const THREADS: usize, const W
     priority: u8,
     child_tid_set: Option<u64>,
     child_tid_clear: Option<u64>,
+    child_stack_override: Option<u64>,
 ) -> Result<super::step30_fork::PublishedForkLeaderReceipt, ()> {
     // SAFETY: delegated caller contract matches `fork_process_inner`.
     unsafe {
@@ -266,6 +268,7 @@ pub(super) unsafe fn fork_process_with_tid_options<const THREADS: usize, const W
             priority,
             child_tid_set,
             child_tid_clear,
+            child_stack_override,
         )
     }
 }
@@ -279,9 +282,11 @@ unsafe fn fork_process_inner<const THREADS: usize, const WAKES: usize>(
     priority: u8,
     child_tid_set: Option<u64>,
     child_tid_clear: Option<u64>,
+    child_stack_override: Option<u64>,
 ) -> Result<super::step30_fork::PublishedForkLeaderReceipt, ()> {
+    let target_sp = child_stack_override.unwrap_or(frame.sp_el0);
     let parent_return =
-        El0ReturnState::new(frame.elr_el1, frame.spsr_el1, frame.sp_el0).map_err(|_| ())?;
+        El0ReturnState::new(frame.elr_el1, frame.spsr_el1, target_sp).map_err(|_| ())?;
     let parent_registers = frame.x;
     // SAFETY: delegated caller contract proves this is the exact current EL0 scheduler generation.
     let parent_tls = unsafe { kernal_context_aarch64::read_el0_thread_pointer() };

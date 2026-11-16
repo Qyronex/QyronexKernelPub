@@ -133,6 +133,7 @@ pub(super) enum ProcessExitWaitDisposition {
 pub(super) struct ProcessExitWaitPlan {
     disposition: ProcessExitWaitDisposition,
     signal_targets: ProcessExitSignalTargets,
+    exited_child: Option<(ObjectId, u32, u32)>,
 }
 
 impl ProcessExitWaitPlan {
@@ -142,6 +143,10 @@ impl ProcessExitWaitPlan {
 
     pub(super) const fn signal_targets(self) -> ProcessExitSignalTargets {
         self.signal_targets
+    }
+
+    pub(super) const fn exited_child(self) -> Option<(ObjectId, u32, u32)> {
+        self.exited_child
     }
 }
 
@@ -410,12 +415,14 @@ impl Step15LinuxRuntime {
             return Ok(ProcessExitWaitPlan {
                 disposition: ProcessExitWaitDisposition::NoParentPublication,
                 signal_targets: ProcessExitSignalTargets::empty(),
+                exited_child: None,
             });
         }
         if self.process.id() == process_id {
             return Ok(ProcessExitWaitPlan {
                 disposition: ProcessExitWaitDisposition::NoParentPublication,
                 signal_targets: ProcessExitSignalTargets::empty(),
+                exited_child: None,
             });
         }
 
@@ -453,7 +460,7 @@ impl Step15LinuxRuntime {
         }
 
         let mut signal_targets = ProcessExitSignalTargets::empty();
-        let auto_reap = {
+        let (auto_reap, child_uid) = {
             let Self {
                 process,
                 address_space,
@@ -548,14 +555,16 @@ impl Step15LinuxRuntime {
                     kernal_linux_signal::SignalProvenance::Child(child_provenance),
                 )
                 .map_err(Error::Signal)?;
-            auto_reap
+            (auto_reap, child_uid)
         };
 
+        let exited_child = Some((parent_id, child_pid.get(), child_uid));
         if auto_reap {
             self.retire_exited_process_break(process_id)?;
             return Ok(ProcessExitWaitPlan {
                 disposition: ProcessExitWaitDisposition::AutoReap(process_id),
                 signal_targets,
+                exited_child,
             });
         }
 
@@ -574,6 +583,7 @@ impl Step15LinuxRuntime {
         Ok(ProcessExitWaitPlan {
             disposition: ProcessExitWaitDisposition::ZombiePublished(wakes),
             signal_targets,
+            exited_child,
         })
     }
 

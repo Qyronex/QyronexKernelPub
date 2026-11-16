@@ -24,7 +24,6 @@ const PTY_RING_BYTES: usize = 2048;
 const DEV_IO_CHUNK: usize = 256;
 const IOVEC_BYTES_LEN: usize = 16;
 const S_IFCHR_MODE: u32 = 0o020_666;
-const ARM64_STAT_BYTES: usize = 128;
 
 const O_ACCMODE: u64 = 0x3;
 const O_RDONLY: u64 = 0;
@@ -33,14 +32,14 @@ const O_RDWR: u64 = 2;
 const O_NONBLOCK: u64 = 0x0000_0800;
 const O_DIRECTORY: u64 = 0x0000_4000;
 const O_CLOEXEC: u64 = 0x0008_0000;
-const ARM64_STATX_BYTES: usize = 256;
-const STATX_BASIC_STATS: u32 = 0x07ff;
+const O_PATH: u64 = 0x0020_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeviceAccess {
     ReadOnly,
     WriteOnly,
     ReadWrite,
+    PathOnly,
 }
 
 impl DeviceAccess {
@@ -57,6 +56,7 @@ impl DeviceAccess {
             Self::ReadOnly => CapRights::READ,
             Self::WriteOnly => CapRights::WRITE,
             Self::ReadWrite => CapRights::READ.union(CapRights::WRITE),
+            Self::PathOnly => CapRights::READ,
         }
     }
 }
@@ -136,8 +136,9 @@ fn dev_status_flags(access: DeviceAccess, nonblocking: bool) -> u64 {
         DeviceAccess::ReadOnly => O_RDONLY,
         DeviceAccess::WriteOnly => O_WRONLY,
         DeviceAccess::ReadWrite => O_RDWR,
+        DeviceAccess::PathOnly => O_PATH,
     };
-    if nonblocking {
+    if nonblocking && access != DeviceAccess::PathOnly {
         acc | O_NONBLOCK_U64
     } else {
         acc
@@ -397,6 +398,27 @@ pub(super) fn on_process_exit(process: ObjectId) {
         for idx in 0..MAX_DEV_FDS {
             if state.fds[idx].live {
                 let _ = state.fds[idx].owners.close_owner(process);
+                retire_dev_slot_if_unused(state, idx);
+            }
+        }
+    });
+}
+
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let _ = with_dev_state(|state| {
+        for idx in 0..MAX_DEV_FDS {
+            let fd = DEV_FD_BASE + (idx as i32);
+            if super::step_fd_util::fd_in_close_range(fd, first, last)
+                && state.fds[idx].live
+                && state.fds[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
                 retire_dev_slot_if_unused(state, idx);
             }
         }
@@ -697,6 +719,19 @@ pub(super) fn try_handle_blocking_read(
     }
 }
 
+fn meta_noop_dev_fd(raw_fd: u64) -> Result<SyscallReturn, ()> {
+    let process = current_process_id()?;
+    let Ok((slot_idx, alias_gen)) = resolve_dev_slot_idx(process, raw_fd) else {
+        return Ok(SyscallReturn::error(Errno::EBADF));
+    };
+    with_dev_state(|state| {
+        if resolve_dev_entry_in_state(state, process, slot_idx, alias_gen).is_none() {
+            return Ok(SyscallReturn::error(Errno::EBADF));
+        }
+        Ok(SyscallReturn::success(0).ok_or(())?)
+    })?
+}
+
 /// Intercepts `/dev/*` path-based syscalls (`openat = 56`, `newfstatat = 79`) and `/dev` descriptor
 /// syscalls (`close = 57`, `lseek = 62`, `read = 63`, `write = 64`, `fstat = 80`).
 ///
@@ -704,6 +739,16 @@ pub(super) fn try_handle_blocking_read(
 /// leaving existing Step-29 VFS/FD dispatch completely unchanged.
 pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<SyscallReturn>, ()> {
     match request.number {
+        52 | 55 if is_dev_or_aliased_fd(request.args[0]) => {
+            meta_noop_dev_fd(request.args[0]).map(Some)
+        }
+        53 | 54 | 452 => {
+            if inspect_user_dev_path(request.args[1])?.is_some() {
+                Ok(Some(SyscallReturn::success(0).ok_or(())?))
+            } else {
+                Ok(None)
+            }
+        }
         56 => try_openat(request.args[1], request.args[2]),
         57 if is_dev_fd(request.args[0]) => close_dev_fd(request.args[0]).map(Some),
         62 if is_dev_or_aliased_fd(request.args[0]) => lseek_dev_fd(request.args[0]).map(Some),
@@ -760,6 +805,9 @@ pub(super) fn handle_dev_ioctl(
         let Some(entry) = resolve_dev_entry_in_state(state, process, slot_idx, alias_gen) else {
             return Ok((SyscallReturn::error(Errno::EBADF), None));
         };
+        if entry.access == DeviceAccess::PathOnly {
+            return Ok((SyscallReturn::error(Errno::EBADF), None));
+        }
 
         match entry.backing {
             DevBacking::PtyMaster(master) => {
@@ -1016,23 +1064,30 @@ fn open_dev_kind(kind: DeviceNodeKind, raw_flags: u64) -> Result<SyscallReturn, 
     if raw_flags & O_DIRECTORY != 0 {
         return Ok(SyscallReturn::error(Errno::ENOTDIR));
     }
-    let access = match raw_flags & O_ACCMODE {
-        O_RDONLY => DeviceAccess::ReadOnly,
-        O_WRONLY => DeviceAccess::WriteOnly,
-        O_RDWR => DeviceAccess::ReadWrite,
-        _ => return Ok(SyscallReturn::error(Errno::EINVAL)),
+    let is_path = (raw_flags & O_PATH) != 0;
+    let access = if is_path {
+        DeviceAccess::PathOnly
+    } else {
+        match raw_flags & O_ACCMODE {
+            O_RDONLY => DeviceAccess::ReadOnly,
+            O_WRONLY => DeviceAccess::WriteOnly,
+            O_RDWR => DeviceAccess::ReadWrite,
+            _ => return Ok(SyscallReturn::error(Errno::EINVAL)),
+        }
     };
-    let nonblocking = raw_flags & O_NONBLOCK != 0;
+    let nonblocking = !is_path && (raw_flags & O_NONBLOCK != 0);
     let close_on_exec = raw_flags & O_CLOEXEC != 0;
     let process = current_process_id()?;
 
-    // Enforce capability mediation for the process opening this device node.
-    let cap = Capability {
-        object: process,
-        rights: CapRights::READ.union(CapRights::WRITE),
-    };
-    if let Err(err) = kind.authorize_capability(&cap, access.required_rights()) {
-        return Ok(SyscallReturn::error(err.to_errno()));
+    if !is_path {
+        // Enforce capability mediation for the process opening this device node.
+        let cap = Capability {
+            object: process,
+            rights: CapRights::READ.union(CapRights::WRITE),
+        };
+        if let Err(err) = kind.authorize_capability(&cap, access.required_rights()) {
+            return Ok(SyscallReturn::error(err.to_errno()));
+        }
     }
 
     with_dev_state(|state| {
@@ -1045,16 +1100,20 @@ fn open_dev_kind(kind: DeviceNodeKind, raw_flags: u64) -> Result<SyscallReturn, 
             return Ok(SyscallReturn::error(Errno::EMFILE));
         };
 
-        let backing = match kind {
-            DeviceNodeKind::Ptmx => match state.ptys.allocate_ptmx() {
-                Ok(master) => DevBacking::PtyMaster(master),
-                Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
-            },
-            DeviceNodeKind::Pts(idx) => match state.ptys.open_slave(idx) {
-                Ok(slave) => DevBacking::PtySlave(slave),
-                Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
-            },
-            other => DevBacking::Node(other),
+        let backing = if is_path {
+            DevBacking::Node(kind)
+        } else {
+            match kind {
+                DeviceNodeKind::Ptmx => match state.ptys.allocate_ptmx() {
+                    Ok(master) => DevBacking::PtyMaster(master),
+                    Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
+                },
+                DeviceNodeKind::Pts(idx) => match state.ptys.open_slave(idx) {
+                    Ok(slave) => DevBacking::PtySlave(slave),
+                    Err(err) => return Ok(SyscallReturn::error(err.to_errno())),
+                },
+                other => DevBacking::Node(other),
+            }
         };
 
         let generation = state.next_generation;
@@ -1730,47 +1789,80 @@ fn is_user_cstr_empty(user_path: u64) -> bool {
     kernal_usercopy_aarch64::copy_from_user(&mut byte, user_path).is_ok() && byte[0] == 0
 }
 
+pub(super) fn list_active_pts(mut emit: impl FnMut(u32)) {
+    let mut seen = [false; MAX_PTYS];
+    let _ = with_dev_state(|state| {
+        for entry in &state.fds {
+            if !entry.live {
+                continue;
+            }
+            let idx = match entry.backing {
+                DevBacking::PtyMaster(m) => Some(m.pty().index()),
+                DevBacking::PtySlave(s) => Some(s.pty().index()),
+                DevBacking::Node(DeviceNodeKind::Pts(i)) => Some(i),
+                DevBacking::Node(_) => None,
+            };
+            if let Some(i) = idx
+                && (i as usize) < MAX_PTYS
+                && !seen[i as usize]
+            {
+                seen[i as usize] = true;
+            }
+        }
+    });
+    for (idx, active) in seen.iter().enumerate() {
+        if *active {
+            emit(idx as u32);
+        }
+    }
+}
+
+fn dev_stat_meta(kind: DeviceNodeKind) -> super::step_fd_util::StatMeta {
+    let fstype = if matches!(kind, DeviceNodeKind::Pts(_)) {
+        kernal_linux_mounts::FilesystemType::Devpts
+    } else {
+        kernal_linux_mounts::FilesystemType::Devtmpfs
+    };
+    let (dev, _, _, mnt_id) = super::step33_mounts::dev_and_mnt_id_for_fstype(fstype);
+    let rdev = kind.rdev();
+    super::step_fd_util::StatMeta {
+        dev,
+        ino: (1u64 << 61) | rdev,
+        mode: S_IFCHR_MODE,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev,
+        size: 0,
+        blksize: 4096,
+        blocks: 0,
+        atime_sec: 1_784_000_000,
+        atime_nsec: 0,
+        mtime_sec: 1_784_000_000,
+        mtime_nsec: 0,
+        ctime_sec: 1_784_000_000,
+        ctime_nsec: 0,
+        mnt_id,
+        is_mount_root: false,
+    }
+}
+
 fn copy_chrdev_statx_to_user(kind: DeviceNodeKind, user_statx: u64) -> Result<SyscallReturn, ()> {
     if user_statx == 0 {
         return Ok(SyscallReturn::error(Errno::EFAULT));
     }
-    let mut statx = [0u8; ARM64_STATX_BYTES];
-    let rdev = kind.rdev();
-    let major = ((rdev >> 8) & 0xfff) as u32;
-    let minor = ((rdev & 0xff) | ((rdev >> 12) & 0xfff00)) as u32;
-    let ino = (1u64 << 61) | rdev;
-    statx[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
-    statx[4..8].copy_from_slice(&4096u32.to_le_bytes());
-    statx[16..20].copy_from_slice(&1u32.to_le_bytes());
-    statx[28..30].copy_from_slice(&(S_IFCHR_MODE as u16).to_le_bytes());
-    statx[32..40].copy_from_slice(&ino.to_le_bytes());
-    statx[128..132].copy_from_slice(&major.to_le_bytes());
-    statx[132..136].copy_from_slice(&minor.to_le_bytes());
-    statx[140..144].copy_from_slice(&5u32.to_le_bytes());
-    if let Err(err) = kernal_usercopy_aarch64::copy_to_user(user_statx, &statx) {
-        return map_usercopy(err);
-    }
-    Ok(SyscallReturn::success(0).ok_or(())?)
+    let meta = dev_stat_meta(kind);
+    let res = super::step_fd_util::write_aarch64_statx_meta(user_statx, &meta);
+    Ok(super::step_fd_util::encode_result(res))
 }
 
 fn copy_chrdev_stat_to_user(kind: DeviceNodeKind, user_stat: u64) -> Result<SyscallReturn, ()> {
     if user_stat == 0 {
         return Ok(SyscallReturn::error(Errno::EFAULT));
     }
-    let mut stat = [0u8; ARM64_STAT_BYTES];
-    let rdev = kind.rdev();
-    let ino = (1u64 << 61) | rdev;
-    stat[0..8].copy_from_slice(&5u64.to_le_bytes()); // st_dev (devtmpfs = 5)
-    stat[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
-    stat[16..20].copy_from_slice(&S_IFCHR_MODE.to_le_bytes()); // st_mode (S_IFCHR | 0666)
-    stat[20..24].copy_from_slice(&1u32.to_le_bytes()); // st_nlink = 1
-    stat[32..40].copy_from_slice(&rdev.to_le_bytes()); // st_rdev = makedev(major, minor)
-    stat[56..60].copy_from_slice(&4096i32.to_le_bytes()); // st_blksize = 4096
-
-    if let Err(err) = kernal_usercopy_aarch64::copy_to_user(user_stat, &stat) {
-        return map_usercopy(err);
-    }
-    Ok(SyscallReturn::success(0).ok_or(())?)
+    let meta = dev_stat_meta(kind);
+    let res = super::step_fd_util::write_aarch64_stat_meta(user_stat, &meta);
+    Ok(super::step_fd_util::encode_result(res))
 }
 
 fn inspect_user_dev_path(user_path: u64) -> Result<Option<DeviceNodeKind>, ()> {

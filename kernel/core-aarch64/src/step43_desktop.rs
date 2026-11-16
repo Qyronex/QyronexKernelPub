@@ -143,6 +143,13 @@ pub(super) const fn is_desktop_fd(raw_fd: u64) -> bool {
     fd >= DESKTOP_FD_BASE && fd < DESKTOP_FD_BASE + (MAX_DESKTOP_FDS as i32)
 }
 
+pub(super) fn is_open_desktop_fd(raw_fd: u64) -> bool {
+    let Ok(idx) = desktop_fd_idx(raw_fd) else {
+        return false;
+    };
+    with_step43_state(|state| state.fds[idx].kind != DesktopNodeKind::None).unwrap_or(false)
+}
+
 fn desktop_fd_idx(raw_fd: u64) -> Result<usize, Errno> {
     if !is_desktop_fd(raw_fd) {
         return Err(Errno::EBADF);
@@ -156,7 +163,9 @@ fn match_desktop_path(path: &[u8]) -> Option<DesktopNodeKind> {
         b"/dev/fb0" => Some(DesktopNodeKind::Fb0),
         b"/dev/input/event0" => Some(DesktopNodeKind::InputEvent0),
         b"/dev/snd/pcmC0D0p" => Some(DesktopNodeKind::SndPcm0),
-        b"/run/systemd/seats/seat0" => Some(DesktopNodeKind::Seat0Status),
+        b"/run/systemd/seats/seat0" if !super::step33_mounts::has_live_ext4_mounts() => {
+            Some(DesktopNodeKind::Seat0Status)
+        }
         _ => None,
     }
 }

@@ -8,43 +8,48 @@ use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use kernal_capability::ObjectId;
 use kernal_linux_abi::{
-    Errno, POLLIN, POLLOUT, SyscallRequest, SyscallReturn, linux_signed_int, linux_unsigned_int,
+    Errno, POLLERR, POLLIN, POLLOUT, POLLPRI, SyscallRequest, SyscallReturn, linux_signed_int,
+    linux_unsigned_int,
 };
 use kernal_linux_fd::SubsystemHandle;
 use kernal_linux_mounts::{
     BlockDevice, Ext4DurableJournal, Ext4StatFsInfo, Ext4Volume, FilesystemType, MAX_MOUNT_PATH,
     MS_BIND, MS_MOVE, MS_RDONLY, MS_REMOUNT, MountTable, ProcPidSelector, ProcProcessInfo,
-    ProcSysSnapshot, enumerate_sysfs_dir, parse_proc_pid_subpath, read_procfs_node,
-    read_procfs_process_node, read_sysfs_node,
+    ProcSysSnapshot, UMOUNT_NOFOLLOW, enumerate_sysfs_dir, parse_proc_pid_subpath,
+    read_procfs_node, read_procfs_process_node, read_sysfs_node,
 };
 use kernal_linux_vfs::{LINUX_PATH_MAX, NodeKind};
 
 use super::step_fd_util::{
-    DirectProcessRefs, SUBSYS_DEV, SUBSYS_PROC_SYS, collect_process_fd_numbers,
-    current_scheduler_thread, describe_process_fd_target, lookup_aliased_subsystem,
-    lookup_aliased_subsystem_current,
+    DirectProcessRefs, EPOCH_BASE_SECONDS, SUBSYS_DEV, SUBSYS_PROC_SYS, collect_process_fd_numbers,
+    current_epoch_now_secs, current_scheduler_thread, current_uid_gid, decode_chown_id,
+    describe_process_fd_target_with_proc_sys, lookup_aliased_subsystem,
+    lookup_aliased_subsystem_current, parse_utimens_pair, read_user_iovec, write_aarch64_stat_meta,
+    write_aarch64_statx_meta, write_linux_file_handle,
 };
+use super::step33_memfs::{MemFs, MemNodeKind, MemStat};
 
-/// Dedicated file-descriptor base for Step-33 `/proc` and `/sys` virtual nodes (`96..128`),
-/// partitioned cleanly above `STEP29_RUNTIME_FDS` (`0..64`) and `DEV_FD_BASE` (`64..96`).
-pub(super) const PROC_SYS_FD_BASE: i32 = 96;
-const MAX_PROC_SYS_FDS: usize = 32;
-const MAX_MOUNTS: usize = 16;
+/// Dedicated file-descriptor base for Step-33 virtual mounts and filesystems (`416..480`),
+/// partitioned cleanly above `EXT4_FD_BASE` (`288..416`).
+pub(super) const PROC_SYS_FD_BASE: i32 = 416;
+const MAX_PROC_SYS_FDS: usize = 64;
+const MAX_MOUNTS: usize = 64;
 pub(super) const MAX_EXT4_MOUNTS: usize = 4;
 const MAX_JOURNAL_ENTRIES: usize = 16;
 const MAX_JOURNAL_DATA: usize = 256;
 const MAX_VIRTUAL_NODE_BYTES: usize = 4096;
 const MAX_HOSTNAME_BYTES: usize = 64;
-const ARM64_STAT_BYTES: usize = 128;
-const ARM64_STATX_BYTES: usize = 256;
 const ARM64_STATFS_BYTES: usize = 120;
-const STATX_BASIC_STATS: u32 = 0x07ff;
 const S_IFREG_RO_MODE: u32 = 0o100_444;
+const S_IFREG_RW_MODE: u32 = 0o100_644;
 const S_IFDIR_RX_MODE: u32 = 0o040_555;
 const S_IFLNK_MODE: u32 = 0o120_777;
+const RENAME_NOREPLACE: u64 = 1;
 
 const AT_FDCWD_I32: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_REMOVEDIR: u64 = 0x200;
+const AT_SYMLINK_FOLLOW: u64 = 0x400;
 const AT_NO_AUTOMOUNT: u64 = 0x800;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const AT_STATX_SYNC_TYPE: u64 = 0x6000;
@@ -53,10 +58,17 @@ const ACCESS_MODE_MASK: u64 = 0x7;
 
 const O_ACCMODE: u64 = 0x3;
 const O_RDONLY: u64 = 0;
+const O_WRONLY: u64 = 1;
+const O_RDWR: u64 = 2;
+const O_CREAT: u64 = 0x40;
+const O_EXCL: u64 = 0x80;
+const O_TRUNC: u64 = 0x200;
+const O_APPEND: u64 = 0x400;
 const O_DIRECTORY: u64 = 0x4000;
 const O_NOFOLLOW: u64 = 0x8000;
 const O_CLOEXEC: u64 = 0x0008_0000;
 const O_PATH: u64 = 0x0020_0000;
+const O_TMPFILE: u64 = 0x0040_4000;
 
 const SEEK_SET: i32 = 0;
 const SEEK_CUR: i32 = 1;
@@ -69,17 +81,25 @@ struct VirtualDirEntry {
     name: Vec<u8>,
 }
 
-struct ProcSysFdEntry {
+pub(super) struct ProcSysFdEntry {
     live: bool,
     is_dir: bool,
     generation: u64,
     alias_refs: usize,
     owners: DirectProcessRefs<{ super::step29_runtime::STEP29_RUNTIME_PROCESS_VIEWS }>,
+    mount_id: u32,
     fstype: FilesystemType,
+    mem_ino: u64,
+    readable: bool,
+    writable: bool,
+    append: bool,
+    path_only: bool,
+    abs_path: Vec<u8>,
     rel_path: Vec<u8>,
     offset: usize,
     content: Vec<u8>,
     dir_entries: Vec<VirtualDirEntry>,
+    last_mount_gen: u64,
 }
 
 impl ProcSysFdEntry {
@@ -89,11 +109,19 @@ impl ProcSysFdEntry {
         generation: 0,
         alias_refs: 0,
         owners: DirectProcessRefs::empty(),
+        mount_id: 0,
         fstype: FilesystemType::Procfs,
+        mem_ino: 0,
+        readable: false,
+        writable: false,
+        append: false,
+        path_only: false,
+        abs_path: Vec::new(),
         rel_path: Vec::new(),
         offset: 0,
         content: Vec::new(),
         dir_entries: Vec::new(),
+        last_mount_gen: 0,
     };
 }
 
@@ -130,6 +158,7 @@ static HAS_LIVE_EXT4_MOUNTS: AtomicBool = AtomicBool::new(false);
 struct Step33MountState {
     initialized: bool,
     next_generation: u64,
+    mounts_gen: u64,
     next_ext4_mount_id: u32,
     mounts: MountTable<MAX_MOUNTS>,
     ext4_mounts: [Ext4MountSlot; MAX_EXT4_MOUNTS],
@@ -137,6 +166,7 @@ struct Step33MountState {
     initramfs_prefix_len: usize,
     initramfs_unmounted: bool,
     fds: [ProcSysFdEntry; MAX_PROC_SYS_FDS],
+    memfs: MemFs,
     journal: Ext4DurableJournal<MAX_JOURNAL_ENTRIES, MAX_JOURNAL_DATA>,
     hostname: [u8; MAX_HOSTNAME_BYTES],
     hostname_len: usize,
@@ -158,6 +188,7 @@ impl Step33MountState {
         Self {
             initialized: false,
             next_generation: 1,
+            mounts_gen: 1,
             next_ext4_mount_id: 1,
             mounts: MountTable::new(),
             ext4_mounts: [const { Ext4MountSlot::EMPTY }; MAX_EXT4_MOUNTS],
@@ -165,6 +196,7 @@ impl Step33MountState {
             initramfs_prefix_len: 1,
             initramfs_unmounted: false,
             fds: [const { ProcSysFdEntry::EMPTY }; MAX_PROC_SYS_FDS],
+            memfs: MemFs::new(),
             journal: Ext4DurableJournal::new(),
             hostname,
             hostname_len: 7,
@@ -175,9 +207,24 @@ impl Step33MountState {
         }
     }
 
+    fn bump_mounts_gen(&mut self) {
+        self.mounts_gen = self.mounts_gen.wrapping_add(1).max(1);
+    }
+
     fn refresh_live_ext4_flag(&self) {
         let any = self.ext4_mounts.iter().any(|m| m.live);
         HAS_LIVE_EXT4_MOUNTS.store(any, Ordering::Release);
+    }
+
+    fn sync_memfs_mounts(&mut self, override_perm: Option<(u32, u32)>) {
+        let now = current_epoch_now_secs();
+        let memfs = &mut self.memfs;
+        self.mounts.for_each_live(|mnt| {
+            let perm = override_perm
+                .filter(|(id, _)| *id == mnt.mount_id())
+                .map(|(_, p)| p);
+            memfs.ensure_mount(mnt.mount_id(), mnt.fstype(), perm, now);
+        });
     }
 
     fn ensure_initialized(&mut self) {
@@ -191,6 +238,7 @@ impl Step33MountState {
             self.boot_id_seed = random_seed;
         }
         self.try_auto_mount_boot_root();
+        self.sync_memfs_mounts(None);
     }
 
     fn try_auto_mount_boot_root(&mut self) {
@@ -257,11 +305,23 @@ pub(super) const fn is_proc_sys_fd(raw_fd: u64) -> bool {
     fd >= PROC_SYS_FD_BASE && fd < PROC_SYS_FD_BASE + (MAX_PROC_SYS_FDS as i32)
 }
 
+pub(super) fn is_open_proc_sys_fd(process: ObjectId, raw_fd: u64) -> bool {
+    if !is_proc_sys_fd(raw_fd) {
+        return false;
+    }
+    let idx = (linux_signed_int(raw_fd) - PROC_SYS_FD_BASE) as usize;
+    with_mount_state(|state| resolve_proc_sys_entry(state, process, idx, None).is_some())
+        .unwrap_or(false)
+}
+
 fn retire_proc_sys_slot_if_unused(state: &mut Step33MountState, slot_idx: usize) {
     let Some(entry) = state.fds.get_mut(slot_idx) else {
         return;
     };
     if entry.live && entry.owners.is_empty() && entry.alias_refs == 0 {
+        if entry.mem_ino != 0 {
+            state.memfs.release_fd(entry.mount_id, entry.mem_ino);
+        }
         *entry = ProcSysFdEntry::EMPTY;
     }
 }
@@ -336,13 +396,122 @@ pub(super) fn probe_proc_sys_readiness(
     let res: Result<u32, Errno> = (|| {
         let (slot_idx, alias_gen) = resolve_proc_sys_slot_idx(process, raw_fd)?;
         with_mount_state(|state| {
-            resolve_proc_sys_entry(state, process, slot_idx, alias_gen)
-                .map(|_| u32::from(POLLIN) | u32::from(POLLOUT))
-                .ok_or(Errno::EBADF)
+            let Some(entry) = resolve_proc_sys_entry(state, process, slot_idx, alias_gen) else {
+                return Err(Errno::EBADF);
+            };
+            if entry.mem_ino != 0
+                && let Some(ms) = state.memfs.stat_ino(entry.mount_id, entry.mem_ino)
+                && ms.kind == MemNodeKind::Fifo
+            {
+                let mut mask = u32::from(POLLOUT);
+                if ms.size > 0 {
+                    mask |= u32::from(POLLIN);
+                }
+                return Ok(mask);
+            }
+            let mut mask = u32::from(POLLIN) | u32::from(POLLOUT);
+            if entry.fstype == FilesystemType::Procfs
+                && !entry.is_dir
+                && entry.mem_ino == 0
+                && is_live_mountinfo_proc_path(&entry.rel_path)
+                && entry.last_mount_gen != state.mounts_gen
+            {
+                mask |= u32::from(POLLPRI) | u32::from(POLLERR);
+            }
+            Ok(mask)
         })
         .map_err(|()| Errno::EIO)?
     })();
     Some(res)
+}
+
+/// Consumes a pending `POLLPRI` change notification on an open `/proc/*/mountinfo` or
+/// `/proc/mounts` descriptor once `epoll`/`poll` has delivered the event to userspace.
+pub(super) fn ack_mountinfo_poll_change(process: ObjectId, raw_fd: u64) {
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(process, raw_fd) else {
+        return;
+    };
+    let _ = with_mount_state(|state| {
+        let cur_gen = state.mounts_gen;
+        if let Some(entry) = resolve_proc_sys_entry_mut(state, process, idx, alias_gen)
+            && entry.fstype == FilesystemType::Procfs
+            && !entry.is_dir
+            && entry.mem_ino == 0
+            && is_live_mountinfo_proc_path(&entry.rel_path)
+        {
+            entry.last_mount_gen = cur_gen;
+        }
+    });
+}
+
+pub(super) fn try_read_proc_sys_fd_for_mmap(
+    process: ObjectId,
+    raw_fd: u64,
+    require_writable: bool,
+) -> Result<Option<(Vec<u8>, Option<(u32, u64)>)>, Errno> {
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(process, raw_fd) else {
+        return Ok(None);
+    };
+    let caller = CallerSnapshotData::capture();
+    let res = with_mount_state(|state| {
+        refresh_procfs_fd_entry(state, idx, &caller);
+        let Some(entry) = resolve_proc_sys_entry(state, process, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.path_only || !entry.readable || entry.is_dir {
+            return Err(Errno::EACCES);
+        }
+        if entry.mem_ino != 0 {
+            if require_writable && !entry.writable {
+                return Err(Errno::EACCES);
+            }
+            let mount_id = entry.mount_id;
+            let mem_ino = entry.mem_ino;
+            let st = state
+                .memfs
+                .stat_ino(mount_id, mem_ino)
+                .ok_or(Errno::EBADF)?;
+            let sz = usize::try_from(st.size).map_err(|_| Errno::ENOMEM)?;
+            let mut out = vec![0u8; sz];
+            let mut read = 0usize;
+            while read < sz {
+                let n = state
+                    .memfs
+                    .read_at(mount_id, mem_ino, read, &mut out[read..])?;
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+            out.truncate(read);
+            Ok((out, Some((mount_id, mem_ino))))
+        } else {
+            if require_writable {
+                return Err(Errno::EACCES);
+            }
+            Ok((entry.content.clone(), None))
+        }
+    })
+    .map_err(|()| Errno::EIO)?;
+    res.map(Some)
+}
+
+pub(super) fn write_back_memfs_mmap(mount_id: u32, mem_ino: u64, file_offset: usize, data: &[u8]) {
+    let now = current_epoch_now_secs();
+    let _ = with_mount_state(|state| {
+        if let Some(st) = state.memfs.stat_ino(mount_id, mem_ino) {
+            let take = usize::try_from(st.size)
+                .unwrap_or(0)
+                .saturating_sub(file_offset)
+                .min(data.len());
+            if take > 0 {
+                let _ =
+                    state
+                        .memfs
+                        .write_at(mount_id, mem_ino, file_offset, &data[..take], false, now);
+            }
+        }
+    });
 }
 
 pub(super) fn append_open_proc_sys_fds(process: ObjectId, out: &mut Vec<i32>) {
@@ -355,6 +524,39 @@ pub(super) fn append_open_proc_sys_fds(process: ObjectId, out: &mut Vec<i32>) {
     });
 }
 
+pub(super) fn describe_proc_sys_entry_in_slice(
+    fds: &[ProcSysFdEntry],
+    slot: u16,
+    generation: Option<u64>,
+    process: Option<ObjectId>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let entry = fds.get(usize::from(slot))?;
+    if !entry.live {
+        return None;
+    }
+    if let Some(expected_gen) = generation {
+        if entry.generation != expected_gen || entry.alias_refs == 0 {
+            return None;
+        }
+    } else if let Some(owner) = process
+        && !entry.owners.has_owner(owner)
+    {
+        return None;
+    }
+    let path_slice: &[u8] = if !entry.abs_path.is_empty() {
+        &entry.abs_path
+    } else {
+        match entry.fstype {
+            FilesystemType::Procfs => &b"/proc"[..],
+            _ => &b"/sys"[..],
+        }
+    };
+    let c = path_slice.len().min(out.len());
+    out[..c].copy_from_slice(&path_slice[..c]);
+    Some(c)
+}
+
 pub(super) fn describe_proc_sys_slot(
     slot: u16,
     generation: Option<u64>,
@@ -363,37 +565,21 @@ pub(super) fn describe_proc_sys_slot(
 ) -> Option<usize> {
     let mut written = None;
     let _ = with_mount_state(|state| {
-        let Some(entry) = state.fds.get(usize::from(slot)) else {
-            return;
-        };
-        if !entry.live {
-            return;
-        }
-        if let Some(expected_gen) = generation {
-            if entry.generation != expected_gen || entry.alias_refs == 0 {
-                return;
-            }
-        } else if let Some(owner) = process
-            && !entry.owners.has_owner(owner)
-        {
-            return;
-        }
-        let prefix = match entry.fstype {
-            FilesystemType::Procfs => &b"/proc"[..],
-            _ => &b"/sys"[..],
-        };
-        let mut c = prefix.len().min(out.len());
-        out[..c].copy_from_slice(&prefix[..c]);
-        if !entry.rel_path.is_empty() && c < out.len() {
-            out[c] = b'/';
-            c += 1;
-            let take = out.len().saturating_sub(c).min(entry.rel_path.len());
-            out[c..c + take].copy_from_slice(&entry.rel_path[..take]);
-            c += take;
-        }
-        written = Some(c);
+        written = describe_proc_sys_entry_in_slice(&state.fds, slot, generation, process, out);
     });
     written
+}
+
+fn entry_status_flags(entry: &ProcSysFdEntry) -> u64 {
+    if entry.path_only {
+        return O_PATH;
+    }
+    let acc = match (entry.readable, entry.writable) {
+        (true, true) => O_RDWR,
+        (false, true) => O_WRONLY,
+        _ => O_RDONLY,
+    };
+    if entry.append { acc | O_APPEND } else { acc }
 }
 
 fn is_aliased_proc_sys_fd(raw_fd: u64) -> bool {
@@ -416,13 +602,14 @@ pub(super) fn retain_alias_handle(
             return Err(Errno::EBADF);
         }
         entry.alias_refs += 1;
+        let status = entry_status_flags(entry);
         Ok((
             SubsystemHandle {
                 kind: SUBSYS_PROC_SYS,
                 slot: idx as u16,
                 generation: entry.generation,
             },
-            O_RDONLY,
+            status,
         ))
     })
     .map_err(|()| Errno::EIO)?
@@ -468,8 +655,13 @@ pub(super) fn handle_native_fcntl(
                 let _ = entry.owners.set_cloexec(process, (argi & 1) != 0);
                 Ok(0)
             }
-            3 => Ok(O_RDONLY as i64),
-            4 => Ok(0),
+            3 => Ok(entry_status_flags(entry) as i64),
+            4 => {
+                if !entry.path_only {
+                    entry.append = ((argi as u64) & O_APPEND) != 0;
+                }
+                Ok(0)
+            }
             _ => Err(Errno::EINVAL),
         }
     });
@@ -511,12 +703,63 @@ pub(super) fn on_process_exit(process: ObjectId) {
     });
 }
 
-/// Intercepts Step-33 mount/filesystem syscalls (`umount2`, `mount`, `pivot_root`, `statfs`,
-/// `fstatfs`, `sync`, `fsync`, `fdatasync`, `syncfs`, `sethostname`) and `/proc` + `/sys`
-/// virtual-node operations (`openat`, `close`, `getdents64`, `lseek`, `read`, `readlinkat`,
-/// `newfstatat`, `fstat`).
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let _ = with_mount_state(|state| {
+        for idx in 0..MAX_PROC_SYS_FDS {
+            let fd = PROC_SYS_FD_BASE + (idx as i32);
+            if super::step_fd_util::fd_in_close_range(fd, first, last)
+                && state.fds[idx].live
+                && state.fds[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
+                retire_proc_sys_slot_if_unused(state, idx);
+            }
+        }
+    });
+}
+
+/// Intercepts Step-33 mount/filesystem syscalls and virtual mount operations (`/proc`, `/sys`,
+/// `/sys/fs/cgroup`, `/dev`, `/dev/pts`, `/run`, `/dev/shm`, `tmpfs`).
 pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<SyscallReturn>, ()> {
+    let owns_fd = |fd: u64| is_proc_sys_fd(fd) || is_aliased_proc_sys_fd(fd);
     match request.number {
+        // ioctl(fd, req, arg)
+        29 if owns_fd(request.args[0]) => Ok(Some(SyscallReturn::error(Errno::ENOTTY))),
+        // mknodat(dirfd, pathname, mode, dev)
+        33 => handle_mknodat_virtual(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+        ),
+        // mkdirat(dirfd, pathname, mode)
+        34 => handle_mkdirat_virtual(request.args[0], request.args[1], request.args[2]),
+        // unlinkat(dirfd, pathname, flags)
+        35 => handle_unlinkat_virtual(request.args[0], request.args[1], request.args[2]),
+        // symlinkat(target, newdirfd, linkpath)
+        36 => handle_symlinkat_virtual(request.args[0], request.args[1], request.args[2]),
+        // linkat(olddirfd, oldpath, newdirfd, newpath, flags)
+        37 => handle_linkat_virtual(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+        ),
+        // renameat(olddirfd, oldpath, newdirfd, newpath)
+        38 => handle_renameat_virtual(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            0,
+        ),
         // umount2(target, flags)
         39 => Ok(Some(encode_result(handle_umount2(
             request.args[0],
@@ -528,6 +771,7 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[1],
             request.args[2],
             request.args[3],
+            request.args[4],
         )?))),
         // pivot_root(new_root, put_old)
         41 => Ok(Some(encode_result(handle_pivot_root(
@@ -544,8 +788,36 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[0],
             request.args[1],
         )?))),
+        // truncate(path, length)
+        45 => handle_truncate_virtual(request.args[0], request.args[1] as i64),
+        // ftruncate(fd, length)
+        46 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_ftruncate(
+            request.args[0],
+            request.args[1] as i64,
+        )?))),
         // faccessat(dirfd, pathname, mode)
         48 => handle_faccessat_if_proc_or_sys(request.args[0], request.args[1], request.args[2], 0),
+        // fchmod(fd, mode)
+        52 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_fchmod(
+            request.args[0],
+            request.args[1],
+        )?))),
+        // fchmodat(dirfd, pathname, mode)
+        53 => handle_fchmodat_virtual(request.args[0], request.args[1], request.args[2], 0),
+        // fchownat(dirfd, pathname, uid, gid, flags)
+        54 => handle_fchownat_virtual(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+        ),
+        // fchown(fd, uid, gid)
+        55 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_fchown(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
         // openat(dirfd, pathname, flags, mode)
         56 => handle_openat_if_proc_or_sys(
             request.args[0],
@@ -558,29 +830,57 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             Ok(Some(encode_result(handle_close(request.args[0])?)))
         }
         // getdents64(fd, dirp, count)
-        61 if is_proc_sys_fd(request.args[0]) || is_aliased_proc_sys_fd(request.args[0]) => {
-            Ok(Some(encode_result(handle_getdents64(
-                request.args[0],
-                request.args[1],
-                request.args[2],
-            )?)))
-        }
+        61 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_getdents64(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
         // lseek(fd, offset, whence)
-        62 if is_proc_sys_fd(request.args[0]) || is_aliased_proc_sys_fd(request.args[0]) => {
-            Ok(Some(encode_result(handle_lseek(
-                request.args[0],
-                request.args[1] as i64,
-                linux_signed_int(request.args[2]),
-            )?)))
-        }
+        62 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_lseek(
+            request.args[0],
+            request.args[1] as i64,
+            linux_signed_int(request.args[2]),
+        )?))),
         // read(fd, buf, count)
-        63 if is_proc_sys_fd(request.args[0]) || is_aliased_proc_sys_fd(request.args[0]) => {
-            Ok(Some(encode_result(handle_read(
-                request.args[0],
-                request.args[1],
-                request.args[2],
-            )?)))
-        }
+        63 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_read(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            None,
+        )?))),
+        // write(fd, buf, count)
+        64 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_write(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            None,
+        )?))),
+        // readv(fd, iov, iovcnt)
+        65 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_readv(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
+        // writev(fd, iov, iovcnt)
+        66 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_writev(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
+        // pread64(fd, buf, count, offset)
+        67 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_read(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            Some(request.args[3] as i64),
+        )?))),
+        // pwrite64(fd, buf, count, offset)
+        68 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_write(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            Some(request.args[3] as i64),
+        )?))),
         // readlinkat(dirfd, pathname, buf, bufsiz)
         78 => handle_readlinkat_if_proc_or_sys(
             request.args[0],
@@ -596,21 +896,42 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[3],
         ),
         // fstat(fd, statbuf)
-        80 if is_proc_sys_fd(request.args[0]) || is_aliased_proc_sys_fd(request.args[0]) => {
-            Ok(Some(encode_result(handle_fstat(
-                request.args[0],
-                request.args[1],
-            )?)))
-        }
+        80 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_fstat(
+            request.args[0],
+            request.args[1],
+        )?))),
         // sync()
         81 => Ok(Some(encode_result(handle_sync()?))),
         // fsync(fd) | fdatasync(fd) | syncfs(fd)
         82 | 83 | 267 => Ok(Some(encode_result(handle_fsync(request.args[0])?))),
+        // utimensat(dirfd, pathname, times, flags)
+        88 => handle_utimensat_virtual(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+        ),
         // sethostname(name, len)
         161 => Ok(Some(encode_result(handle_sethostname(
             request.args[0],
             request.args[1],
         )?))),
+        // name_to_handle_at(dirfd, pathname, handle, mount_id, flags)
+        264 => handle_name_to_handle_at(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+        ),
+        // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
+        276 => handle_renameat_virtual(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+        ),
         // statx(dirfd, pathname, flags, mask, statxbuf)
         291 => handle_statx_if_proc_or_sys(
             request.args[0],
@@ -619,8 +940,22 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[3],
             request.args[4],
         ),
+        // openat2(dirfd, pathname, how, size)
+        437 => handle_openat2_if_proc_or_sys(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+        ),
         // faccessat2(dirfd, pathname, mode, flags)
         439 => handle_faccessat_if_proc_or_sys(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+        ),
+        // fchmodat2(dirfd, pathname, mode, flags)
+        452 => handle_fchmodat_virtual(
             request.args[0],
             request.args[1],
             request.args[2],
@@ -885,6 +1220,89 @@ fn mount_ext4_slot(
     Ok(mount_id)
 }
 
+pub(super) fn ensure_boot_initialized() {
+    let _ = with_mount_state(|state| {
+        state.ensure_initialized();
+    });
+}
+
+pub(super) const fn is_virtual_fstype(fstype: FilesystemType) -> bool {
+    matches!(
+        fstype,
+        FilesystemType::Procfs
+            | FilesystemType::Sysfs
+            | FilesystemType::Devtmpfs
+            | FilesystemType::Devpts
+            | FilesystemType::Cgroup2
+            | FilesystemType::Tmpfs
+    )
+}
+
+pub(super) const fn is_memfs_fstype(fstype: FilesystemType) -> bool {
+    matches!(
+        fstype,
+        FilesystemType::Tmpfs | FilesystemType::Devtmpfs | FilesystemType::Devpts
+    )
+}
+
+pub(super) fn dev_and_mnt_id_for_fstype(fstype: FilesystemType) -> (u64, u32, u32, u32) {
+    let mut found_id: Option<u32> = None;
+    let _ = with_mount_state(|state| {
+        state.ensure_initialized();
+        state.mounts.for_each_live(|m| {
+            if m.fstype() == fstype && found_id.is_none() {
+                found_id = Some(m.mount_id());
+            }
+        });
+    });
+    let mnt_id = found_id.unwrap_or(match fstype {
+        FilesystemType::Devtmpfs => 2,
+        FilesystemType::Devpts => 3,
+        FilesystemType::Procfs => 4,
+        FilesystemType::Sysfs => 5,
+        FilesystemType::Tmpfs => 6,
+        _ => 1,
+    });
+    let (maj, min) = fstype.st_dev_pair(mnt_id);
+    (fstype.st_dev(mnt_id), maj, min, mnt_id)
+}
+
+pub(super) fn ext4_table_mount_id(ext4_slot_id: u32) -> u32 {
+    let mut mnt_id = ext4_slot_id;
+    let _ = with_mount_state(|state| {
+        if let Some(slot) = state
+            .ext4_mounts
+            .iter()
+            .find(|m| m.live && m.mount_id == ext4_slot_id)
+        {
+            let mp = &slot.mount_path[..slot.mount_path_len];
+            if let Ok((entry, _)) = state.mounts.resolve(mp) {
+                mnt_id = entry.mount_id();
+            }
+        }
+    });
+    mnt_id
+}
+
+pub(super) fn fd_dir_abs_path(process: ObjectId, raw_fd: u64) -> Option<Result<Vec<u8>, Errno>> {
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(process, raw_fd) else {
+        return None;
+    };
+    let res = with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, process, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if !entry.is_dir {
+            return Err(Errno::ENOTDIR);
+        }
+        Ok(entry.abs_path.clone())
+    });
+    Some(match res {
+        Ok(inner) => inner,
+        Err(()) => Err(Errno::EIO),
+    })
+}
+
 pub(super) fn has_live_ext4_mounts() -> bool {
     HAS_LIVE_EXT4_MOUNTS.load(Ordering::Acquire)
 }
@@ -899,13 +1317,7 @@ pub(super) fn has_virtual_mount_prefix(abs_path: &[u8]) -> bool {
         let Ok((entry, _)) = state.mounts.resolve(abs_path) else {
             return;
         };
-        if matches!(
-            entry.fstype(),
-            FilesystemType::Procfs
-                | FilesystemType::Sysfs
-                | FilesystemType::Devtmpfs
-                | FilesystemType::Cgroup2
-        ) {
+        if is_virtual_fstype(entry.fstype()) {
             let virt_len = entry.target().len();
             let ext4_len = state
                 .ext4_mounts
@@ -1018,23 +1430,136 @@ pub(super) fn resolve_initramfs_host_path(abs_path: &[u8], out: &mut [u8]) -> Op
     result
 }
 
+fn parse_mount_mode_opt(user_data: u64) -> Option<u32> {
+    if user_data == 0 {
+        return None;
+    }
+    let mut buf = [0u8; 128];
+    let len = read_user_cstr(user_data, &mut buf).ok()?;
+    for opt in buf[..len].split(|&b| b == b',') {
+        if let Some(val) = opt.strip_prefix(b"mode=") {
+            if val.is_empty() {
+                continue;
+            }
+            let mut acc = 0u32;
+            let mut valid = true;
+            for &b in val {
+                if !(b'0'..=b'7').contains(&b) {
+                    valid = false;
+                    break;
+                }
+                acc = (acc << 3) | u32::from(b - b'0');
+            }
+            if valid {
+                return Some(acc & 0o7777);
+            }
+        }
+    }
+    None
+}
+
+enum CrossHop {
+    Done(Vec<u8>),
+    Continue(Vec<u8>),
+}
+
+fn resolve_virtual_hop(
+    owner: ObjectId,
+    candidate: &[u8],
+    follow_final: bool,
+) -> Result<CrossHop, Errno> {
+    let caller = CallerSnapshotData::capture();
+    with_mount_state(|state| {
+        state.ensure_initialized();
+        match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            candidate,
+            None,
+            false,
+            false,
+            follow_final,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(None) => Ok(CrossHop::Done(candidate.to_vec())),
+            Ok(Some(ResolvedVirtualTarget::Virtual { abs_path, .. })) => {
+                Ok(CrossHop::Done(abs_path))
+            }
+            Ok(Some(ResolvedVirtualTarget::HostAbsolute(host))) => Ok(CrossHop::Continue(host)),
+            Ok(Some(ResolvedVirtualTarget::MissingLeaf { .. })) => Err(Errno::ENOENT),
+            Err(e) => Err(e),
+        }
+    })
+    .map_err(|()| Errno::EIO)?
+    .map_err(|e| e)
+}
+
+pub(super) fn resolve_virtual_host_target_once(
+    owner: ObjectId,
+    virt_abs: &[u8],
+    follow_final: bool,
+) -> Result<Option<Vec<u8>>, Errno> {
+    match resolve_virtual_hop(owner, virt_abs, follow_final)? {
+        CrossHop::Continue(host) => Ok(Some(host)),
+        CrossHop::Done(_) => Ok(None),
+    }
+}
+
+fn resolve_mount_syscall_path(
+    owner: ObjectId,
+    raw_path: &[u8],
+    follow_final: bool,
+    out: &mut [u8],
+) -> Result<usize, Errno> {
+    let mut cur = raw_path.to_vec();
+    for _ in 0..8 {
+        let mut ext4_buf = vec![0u8; LINUX_PATH_MAX];
+        let ext4_len = super::step33_ext4_vfs::resolve_abs_for_current_with_follow(
+            &cur,
+            follow_final,
+            &mut ext4_buf,
+        )?;
+        match resolve_virtual_hop(owner, &ext4_buf[..ext4_len], follow_final)? {
+            CrossHop::Done(resolved) => {
+                if resolved.len() > out.len() {
+                    return Err(Errno::ENAMETOOLONG);
+                }
+                out[..resolved.len()].copy_from_slice(&resolved);
+                return Ok(resolved.len());
+            }
+            CrossHop::Continue(host) => {
+                cur = host;
+            }
+        }
+    }
+    Err(Errno::ELOOP)
+}
+
 fn handle_mount(
     user_source: u64,
     user_target: u64,
     user_fstype: u64,
     flags: u64,
+    user_data: u64,
 ) -> Result<Result<i64, Errno>, ()> {
     if let Err(errno) = require_root_admin() {
         return Ok(Err(errno));
     }
-    let mut target_buf = [0u8; MAX_MOUNT_PATH];
+    let owner = current_process_id()?;
+    let mut target_buf = vec![0u8; LINUX_PATH_MAX];
     let raw_target_len = match read_user_cstr(user_target, &mut target_buf) {
         Ok(len) => len,
         Err(errno) => return Ok(Err(errno)),
     };
     let mut abs_target_buf = [0u8; MAX_MOUNT_PATH];
-    let target_len = match super::step33_ext4_vfs::resolve_abs_for_current_into(
+    let target_len = match resolve_mount_syscall_path(
+        owner,
         &target_buf[..raw_target_len],
+        true,
         &mut abs_target_buf,
     ) {
         Ok(n) => n,
@@ -1042,7 +1567,7 @@ fn handle_mount(
     };
     let target_slice = &abs_target_buf[..target_len];
 
-    let mut source_buf = [0u8; MAX_MOUNT_PATH];
+    let mut source_buf = vec![0u8; LINUX_PATH_MAX];
     let source_len = if user_source == 0 {
         0
     } else {
@@ -1052,19 +1577,22 @@ fn handle_mount(
         }
     };
     let mut abs_source_buf = [0u8; MAX_MOUNT_PATH];
-    let abs_source_len = if (flags & MS_MOVE) != 0 || (flags & MS_BIND) != 0 {
-        match super::step33_ext4_vfs::resolve_abs_for_current_into(
-            &source_buf[..source_len],
-            &mut abs_source_buf,
-        ) {
-            Ok(n) => n,
-            Err(errno) => return Ok(Err(errno)),
-        }
-    } else {
-        let take = source_len.min(MAX_MOUNT_PATH);
-        abs_source_buf[..take].copy_from_slice(&source_buf[..take]);
-        take
-    };
+    let abs_source_len =
+        if (flags & MS_REMOUNT) == 0 && ((flags & MS_MOVE) != 0 || (flags & MS_BIND) != 0) {
+            match resolve_mount_syscall_path(
+                owner,
+                &source_buf[..source_len],
+                true,
+                &mut abs_source_buf,
+            ) {
+                Ok(n) => n,
+                Err(errno) => return Ok(Err(errno)),
+            }
+        } else {
+            let take = source_len.min(MAX_MOUNT_PATH);
+            abs_source_buf[..take].copy_from_slice(&source_buf[..take]);
+            take
+        };
     let source_slice = &abs_source_buf[..abs_source_len];
 
     let mut fstype_buf = [0u8; 32];
@@ -1077,69 +1605,82 @@ fn handle_mount(
         }
     };
 
+    let mode_opt = if (flags & (MS_BIND | MS_MOVE)) == 0 {
+        parse_mount_mode_opt(user_data)
+    } else {
+        None
+    };
+
     let mut moved_pair: Option<(u32, [u8; MAX_MOUNT_PATH], usize)> = None;
     let res = with_mount_state(|state| {
         state.ensure_initialized();
         let fstype_slice = fstype_opt.map(|n| &fstype_buf[..n]);
-        if (flags & MS_REMOUNT) != 0 {
-            if let Some(slot) = state
-                .ext4_mounts
-                .iter_mut()
-                .find(|m| m.live && &m.mount_path[..m.mount_path_len] == target_slice)
-            {
-                let ro = (flags & MS_RDONLY) != 0;
-                if let Some(ref mut vol) = slot.vol {
-                    super::step42_hardware::with_active_block_device(|dev, _| {
-                        vol.sync(dev)?;
-                        vol.set_read_only(dev, ro)?;
-                        dev.flush()
-                    })?;
+        let mnt_res: Result<i64, Errno> = (|| {
+            if (flags & MS_REMOUNT) != 0 {
+                if let Some(slot) = state
+                    .ext4_mounts
+                    .iter_mut()
+                    .find(|m| m.live && &m.mount_path[..m.mount_path_len] == target_slice)
+                {
+                    let ro = (flags & MS_RDONLY) != 0;
+                    if let Some(ref mut vol) = slot.vol {
+                        super::step42_hardware::with_active_block_device(|dev, _| {
+                            vol.sync(dev)?;
+                            vol.set_read_only(dev, ro)?;
+                            dev.flush()
+                        })?;
+                    }
+                    slot.flags = flags & !MS_REMOUNT;
                 }
-                slot.flags = flags & !MS_REMOUNT;
-            }
-            return state
-                .mounts
-                .mount(source_slice, target_slice, fstype_slice, flags)
-                .map(|_| 0);
-        }
-
-        if (flags & MS_MOVE) != 0 {
-            if let Some(slot) = state
-                .ext4_mounts
-                .iter_mut()
-                .find(|m| m.live && &m.mount_path[..m.mount_path_len] == source_slice)
-            {
-                let old_mp_len = slot.mount_path_len;
-                let mut old_mp = [0u8; MAX_MOUNT_PATH];
-                old_mp[..old_mp_len].copy_from_slice(&slot.mount_path[..old_mp_len]);
-                slot.mount_path = [0u8; MAX_MOUNT_PATH];
-                slot.mount_path[..target_len].copy_from_slice(target_slice);
-                slot.mount_path_len = target_len;
-                moved_pair = Some((slot.mount_id, old_mp, old_mp_len));
-            }
-            return state
-                .mounts
-                .mount(source_slice, target_slice, fstype_slice, flags)
-                .map(|_| 0);
-        }
-
-        if (flags & MS_BIND) == 0 {
-            let wants_ext4 = matches!(fstype_slice, Some(b"ext4" | b"ext3" | b"ext2"))
-                || ((fstype_slice.is_none() || fstype_slice == Some(b""))
-                    && source_slice.starts_with(b"/dev/vda"));
-            if wants_ext4 {
-                mount_ext4_slot(state, source_slice, target_slice, flags)?;
                 return state
                     .mounts
-                    .mount(source_slice, target_slice, Some(b"ext4"), flags)
+                    .mount(source_slice, target_slice, fstype_slice, flags)
                     .map(|_| 0);
             }
-        }
 
-        state
-            .mounts
-            .mount(source_slice, target_slice, fstype_slice, flags)
-            .map(|_| 0)
+            if (flags & MS_MOVE) != 0 {
+                if let Some(slot) = state
+                    .ext4_mounts
+                    .iter_mut()
+                    .find(|m| m.live && &m.mount_path[..m.mount_path_len] == source_slice)
+                {
+                    let old_mp_len = slot.mount_path_len;
+                    let mut old_mp = [0u8; MAX_MOUNT_PATH];
+                    old_mp[..old_mp_len].copy_from_slice(&slot.mount_path[..old_mp_len]);
+                    slot.mount_path = [0u8; MAX_MOUNT_PATH];
+                    slot.mount_path[..target_len].copy_from_slice(target_slice);
+                    slot.mount_path_len = target_len;
+                    moved_pair = Some((slot.mount_id, old_mp, old_mp_len));
+                }
+                return state
+                    .mounts
+                    .mount(source_slice, target_slice, fstype_slice, flags)
+                    .map(|_| 0);
+            }
+
+            if (flags & MS_BIND) == 0 {
+                let wants_ext4 = matches!(fstype_slice, Some(b"ext4" | b"ext3" | b"ext2"))
+                    || ((fstype_slice.is_none() || fstype_slice == Some(b""))
+                        && source_slice.starts_with(b"/dev/vda"));
+                if wants_ext4 {
+                    mount_ext4_slot(state, source_slice, target_slice, flags)?;
+                    return state
+                        .mounts
+                        .mount(source_slice, target_slice, Some(b"ext4"), flags)
+                        .map(|_| 0);
+                }
+            }
+
+            let mnt_id = state
+                .mounts
+                .mount(source_slice, target_slice, fstype_slice, flags)?;
+            state.sync_memfs_mounts(mode_opt.map(|m| (mnt_id, m)));
+            Ok(0)
+        })();
+        if mnt_res.is_ok() {
+            state.bump_mounts_gen();
+        }
+        mnt_res
     })?;
     if res.is_ok()
         && let Some((mount_id, old_mp, old_len)) = moved_pair
@@ -1153,17 +1694,20 @@ fn handle_umount2(user_target: u64, raw_flags: u64) -> Result<Result<i64, Errno>
     if let Err(errno) = require_root_admin() {
         return Ok(Err(errno));
     }
+    let owner = current_process_id()?;
     let Ok(flags) = u32::try_from(raw_flags) else {
         return Ok(Err(Errno::EINVAL));
     };
-    let mut target_buf = [0u8; MAX_MOUNT_PATH];
+    let mut target_buf = vec![0u8; LINUX_PATH_MAX];
     let raw_target_len = match read_user_cstr(user_target, &mut target_buf) {
         Ok(len) => len,
         Err(errno) => return Ok(Err(errno)),
     };
     let mut abs_target_buf = [0u8; MAX_MOUNT_PATH];
-    let target_len = match super::step33_ext4_vfs::resolve_abs_for_current_into(
+    let target_len = match resolve_mount_syscall_path(
+        owner,
         &target_buf[..raw_target_len],
+        (flags & UMOUNT_NOFOLLOW) == 0,
         &mut abs_target_buf,
     ) {
         Ok(n) => n,
@@ -1196,7 +1740,23 @@ fn handle_umount2(user_target: u64, raw_flags: u64) -> Result<Result<i64, Errno>
         {
             state.initramfs_unmounted = true;
         }
-        state.mounts.umount2(target_slice, flags).map(|()| 0)
+        let umount_mem_id = state
+            .mounts
+            .resolve(target_slice)
+            .ok()
+            .and_then(|(m, rel)| {
+                if rel.is_empty() && is_memfs_fstype(m.fstype()) {
+                    Some(m.mount_id())
+                } else {
+                    None
+                }
+            });
+        state.mounts.umount2(target_slice, flags)?;
+        if let Some(mem_id) = umount_mem_id {
+            state.memfs.unmount(mem_id);
+        }
+        state.bump_mounts_gen();
+        Ok(0)
     })?;
     if res.is_ok()
         && let Some(mount_id) = removed_mount_id
@@ -1307,16 +1867,15 @@ fn handle_statfs(user_path: u64, user_buf: u64) -> Result<Result<i64, Errno>, ()
     if user_buf == 0 {
         return Ok(Err(Errno::EFAULT));
     }
+    let owner = current_process_id()?;
     let mut path_buf = vec![0u8; LINUX_PATH_MAX];
     let raw_len = match read_user_cstr(user_path, &mut path_buf) {
         Ok(len) => len,
         Err(errno) => return Ok(Err(errno)),
     };
     let mut abs_buf = vec![0u8; LINUX_PATH_MAX];
-    let abs_len = match super::step33_ext4_vfs::resolve_abs_for_current_following(
-        &path_buf[..raw_len],
-        &mut abs_buf,
-    ) {
+    let abs_len = match resolve_mount_syscall_path(owner, &path_buf[..raw_len], true, &mut abs_buf)
+    {
         Ok(n) => n,
         Err(errno) => return Ok(Err(errno)),
     };
@@ -1336,13 +1895,7 @@ fn handle_statfs(user_path: u64, user_buf: u64) -> Result<Result<i64, Errno>, ()
         let mut virt_len = 0usize;
         let virt = state.mounts.resolve(abs_slice);
         if let Ok((entry, _)) = virt
-            && matches!(
-                entry.fstype(),
-                FilesystemType::Procfs
-                    | FilesystemType::Sysfs
-                    | FilesystemType::Devtmpfs
-                    | FilesystemType::Cgroup2
-            )
+            && is_virtual_fstype(entry.fstype())
         {
             virt_len = entry.target().len();
         }
@@ -1470,6 +2023,7 @@ fn virtual_inode(fstype: FilesystemType, rel: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let tag = match fstype {
         FilesystemType::Procfs => 0x70u8,
+        FilesystemType::Cgroup2 => 0x63u8,
         _ => 0x73u8,
     };
     hash ^= u64::from(tag);
@@ -1480,6 +2034,7 @@ fn virtual_inode(fstype: FilesystemType, rel: &[u8]) -> u64 {
     }
     let prefix = match fstype {
         FilesystemType::Procfs => 0x7000_0000_0000_0000u64,
+        FilesystemType::Cgroup2 => 0x7200_0000_0000_0000u64,
         _ => 0x7100_0000_0000_0000u64,
     };
     prefix | (hash & 0x00ff_ffff_ffff_ffff).max(1)
@@ -1487,17 +2042,33 @@ fn virtual_inode(fstype: FilesystemType, rel: &[u8]) -> u64 {
 
 enum ResolvedVirtualTarget {
     Virtual {
+        mount_id: u32,
+        is_mount_root: bool,
         fstype: FilesystemType,
+        abs_path: Vec<u8>,
         rel_path: Vec<u8>,
         node: Option<VirtualNode>,
+        mem_stat: Option<MemStat>,
+    },
+    MissingLeaf {
+        mount_id: u32,
+        fstype: FilesystemType,
+        parent_ino: u64,
+        parent_abs: Vec<u8>,
+        parent_rel: Vec<u8>,
+        leaf: Vec<u8>,
+        trailing_slash: bool,
     },
     HostAbsolute(Vec<u8>),
 }
 
 enum WalkState {
     Virtual {
+        mount_id: u32,
+        mount_target: Vec<u8>,
         fstype: FilesystemType,
         parts: Vec<Vec<u8>>,
+        mem_ino: u64,
     },
     Host(Vec<Vec<u8>>),
 }
@@ -1531,6 +2102,27 @@ fn join_part_slices(parts: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
+fn join_abs_from_mount(mount_target: &[u8], parts: &[Vec<u8>]) -> Vec<u8> {
+    if parts.is_empty() {
+        return mount_target.to_vec();
+    }
+    let rel = join_part_slices(parts);
+    join_mount_and_rel(mount_target, &rel)
+}
+
+fn join_mount_and_rel(mount_target: &[u8], rel: &[u8]) -> Vec<u8> {
+    if rel.is_empty() {
+        return mount_target.to_vec();
+    }
+    let mut out = Vec::with_capacity(mount_target.len() + 1 + rel.len());
+    out.extend_from_slice(mount_target);
+    if mount_target != b"/" {
+        out.push(b'/');
+    }
+    out.extend_from_slice(rel);
+    out
+}
+
 fn host_absolute_from_parts(parts: &[Vec<u8>]) -> Vec<u8> {
     if parts.is_empty() {
         return b"/".to_vec();
@@ -1548,6 +2140,16 @@ fn split_nonempty_segments(path: &[u8]) -> Vec<Vec<u8>> {
         .filter(|seg| !seg.is_empty() && *seg != b".")
         .map(|seg| seg.to_vec())
         .collect()
+}
+
+fn parent_abs_path(path: &[u8]) -> &[u8] {
+    if path.len() <= 1 {
+        return b"/";
+    }
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(0) | None => b"/",
+        Some(idx) => &path[..idx],
+    }
 }
 
 fn join_rel(prefix: &[u8], child: &[u8]) -> Vec<u8> {
@@ -1589,6 +2191,56 @@ fn make_dir_entry(
     }
 }
 
+fn path_starts_with_mount(path: &[u8], tgt: &[u8]) -> bool {
+    tgt != b"/"
+        && (path == tgt
+            || (path.len() > tgt.len() && path.starts_with(tgt) && path[tgt.len()] == b'/'))
+}
+
+fn find_virtual_mount_for_path(
+    state: &Step33MountState,
+    abs_path: &[u8],
+) -> Option<(u32, FilesystemType, Vec<u8>)> {
+    if !abs_path.starts_with(b"/") {
+        return None;
+    }
+    let mut best: Option<(u32, FilesystemType, Vec<u8>)> = None;
+    state.mounts.for_each_live(|entry| {
+        if is_virtual_fstype(entry.fstype()) && path_starts_with_mount(abs_path, entry.target()) {
+            let replace = match &best {
+                None => true,
+                Some((_, _, prev)) => entry.target().len() > prev.len(),
+            };
+            if replace {
+                best = Some((entry.mount_id(), entry.fstype(), entry.target().to_vec()));
+            }
+        }
+    });
+    let (id, fs, tgt) = best?;
+    let ext4_len = state
+        .ext4_mounts
+        .iter()
+        .filter(|m| m.live && path_matches_prefix(abs_path, &m.mount_path[..m.mount_path_len]))
+        .map(|m| m.mount_path_len)
+        .max()
+        .unwrap_or(0);
+    if ext4_len > tgt.len() {
+        return None;
+    }
+    Some((id, fs, tgt))
+}
+
+fn walk_memfs_ino(memfs: &MemFs, mount_id: u32, parts: &[Vec<u8>]) -> Result<u64, Errno> {
+    let mut ino = memfs.root_stat(mount_id).ok_or(Errno::ENOENT)?.ino;
+    for seg in parts {
+        let child = memfs
+            .lookup_child_stat(mount_id, ino, seg)
+            .ok_or(Errno::ENOENT)?;
+        ino = child.ino;
+    }
+    Ok(ino)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_virtual_path<const M: usize>(
     state: &Step33MountState,
@@ -1596,51 +2248,119 @@ fn resolve_virtual_path<const M: usize>(
     owner: ObjectId,
     dirfd: u64,
     user_path: u64,
+    cwd_if_fdc: Option<&[u8]>,
     allow_empty: bool,
+    stop_at_missing_leaf: bool,
     follow_final: bool,
     caller: &CallerSnapshotData,
     hostname: &[u8],
     boot_id_seed: [u8; 16],
 ) -> Result<Option<ResolvedVirtualTarget>, Errno> {
     let mut path_buf = vec![0u8; LINUX_PATH_MAX];
-    let Ok(path_len) = read_user_cstr(user_path, &mut path_buf) else {
-        return Ok(None);
+    let path_len = match read_user_cstr(user_path, &mut path_buf) {
+        Ok(len) => len,
+        Err(e) => {
+            if is_proc_sys_fd(dirfd) || is_aliased_proc_sys_fd(dirfd) {
+                return Err(e);
+            }
+            return Ok(None);
+        }
     };
-    let path = &path_buf[..path_len];
+    resolve_virtual_bytes(
+        state,
+        mounts,
+        owner,
+        dirfd,
+        &path_buf[..path_len],
+        cwd_if_fdc,
+        allow_empty,
+        stop_at_missing_leaf,
+        follow_final,
+        caller,
+        hostname,
+        boot_id_seed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_virtual_bytes<const M: usize>(
+    state: &Step33MountState,
+    mounts: &kernal_linux_mounts::MountTable<M>,
+    owner: ObjectId,
+    dirfd: u64,
+    raw_path: &[u8],
+    cwd_if_fdc: Option<&[u8]>,
+    allow_empty: bool,
+    stop_at_missing_leaf: bool,
+    follow_final: bool,
+    caller: &CallerSnapshotData,
+    hostname: &[u8],
+    boot_id_seed: [u8; 16],
+) -> Result<Option<ResolvedVirtualTarget>, Errno> {
+    let mut path = raw_path;
+    while path.starts_with(b"//") {
+        path = &path[1..];
+    }
     let trailing_slash = path.ends_with(b"/");
     let mut queue = VecDeque::new();
+    let mut last_mem_stat: Option<MemStat> = None;
 
-    let mut walk_state = if path == b"/proc" || path.starts_with(b"/proc/") {
-        if path.len() > 5 {
-            push_segments_back(&mut queue, &path[6..]);
-        }
-        WalkState::Virtual {
-            fstype: FilesystemType::Procfs,
-            parts: Vec::new(),
-        }
-    } else if path == b"/sys" || path.starts_with(b"/sys/") {
-        if path.len() > 4 {
-            push_segments_back(&mut queue, &path[5..]);
-        }
-        WalkState::Virtual {
-            fstype: FilesystemType::Sysfs,
-            parts: Vec::new(),
-        }
-    } else if path.starts_with(b"/") || linux_signed_int(dirfd) == AT_FDCWD_I32 {
-        return Ok(None);
-    } else {
-        let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, dirfd) else {
+    let mut walk_state = if path.starts_with(b"/") {
+        let Some((mount_id, fstype, mount_target)) = find_virtual_mount_for_path(state, path)
+        else {
             return Ok(None);
+        };
+        if path.len() > mount_target.len() {
+            push_segments_back(&mut queue, &path[mount_target.len() + 1..]);
+        }
+        let mem_ino = if is_memfs_fstype(fstype) {
+            let root = state.memfs.root_stat(mount_id).ok_or(Errno::ENOENT)?;
+            if queue.is_empty() {
+                last_mem_stat = Some(root);
+            }
+            root.ino
+        } else {
+            0
+        };
+        WalkState::Virtual {
+            mount_id,
+            mount_target,
+            fstype,
+            parts: Vec::new(),
+            mem_ino,
+        }
+    } else if is_proc_sys_fd(dirfd) || is_aliased_proc_sys_fd(dirfd) {
+        let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, dirfd) else {
+            return Err(Errno::EBADF);
         };
         let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
             return Err(Errno::EBADF);
         };
+        let mount_target = mounts
+            .entry_by_id(entry.mount_id)
+            .map(|m| m.target().to_vec())
+            .unwrap_or_else(|| match entry.fstype {
+                FilesystemType::Procfs => b"/proc".to_vec(),
+                FilesystemType::Cgroup2 => b"/sys/fs/cgroup".to_vec(),
+                FilesystemType::Devtmpfs => b"/dev".to_vec(),
+                FilesystemType::Devpts => b"/dev/pts".to_vec(),
+                _ => b"/sys".to_vec(),
+            });
         if path.is_empty() {
             if allow_empty {
+                let mem_stat = if entry.mem_ino != 0 {
+                    state.memfs.stat_ino(entry.mount_id, entry.mem_ino)
+                } else {
+                    None
+                };
                 return Ok(Some(ResolvedVirtualTarget::Virtual {
+                    mount_id: entry.mount_id,
+                    is_mount_root: entry.rel_path.is_empty(),
                     fstype: entry.fstype,
+                    abs_path: entry.abs_path.clone(),
                     rel_path: entry.rel_path.clone(),
                     node: None,
+                    mem_stat,
                 }));
             }
             return Err(Errno::ENOENT);
@@ -1649,10 +2369,52 @@ fn resolve_virtual_path<const M: usize>(
             return Err(Errno::ENOTDIR);
         }
         push_segments_back(&mut queue, path);
+        let mem_ino = if entry.mem_ino != 0 {
+            entry.mem_ino
+        } else if is_memfs_fstype(entry.fstype) {
+            let parts = split_nonempty_segments(&entry.rel_path);
+            walk_memfs_ino(&state.memfs, entry.mount_id, &parts)?
+        } else {
+            0
+        };
         WalkState::Virtual {
+            mount_id: entry.mount_id,
+            mount_target,
             fstype: entry.fstype,
             parts: split_nonempty_segments(&entry.rel_path),
+            mem_ino,
         }
+    } else if linux_signed_int(dirfd) == AT_FDCWD_I32 {
+        let Some(cwd) = cwd_if_fdc else {
+            return Ok(None);
+        };
+        let Some((mount_id, fstype, mount_target)) = find_virtual_mount_for_path(state, cwd) else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Err(Errno::ENOENT);
+        }
+        let cwd_rel = if cwd.len() > mount_target.len() {
+            &cwd[mount_target.len() + 1..]
+        } else {
+            b""
+        };
+        let parts = split_nonempty_segments(cwd_rel);
+        let mem_ino = if is_memfs_fstype(fstype) {
+            walk_memfs_ino(&state.memfs, mount_id, &parts)?
+        } else {
+            0
+        };
+        push_segments_back(&mut queue, path);
+        WalkState::Virtual {
+            mount_id,
+            mount_target,
+            fstype,
+            parts,
+            mem_ino,
+        }
+    } else {
+        return Ok(None);
     };
 
     let mut symlink_depth = 0usize;
@@ -1661,18 +2423,182 @@ fn resolve_virtual_path<const M: usize>(
     while let Some(seg) = queue.pop_front() {
         let is_final = queue.is_empty();
         last_node = None;
+        last_mem_stat = None;
         match &mut walk_state {
-            WalkState::Virtual { fstype, parts } => {
+            WalkState::Virtual {
+                mount_id,
+                mount_target,
+                fstype,
+                parts,
+                mem_ino,
+            } => {
                 if seg == b".." {
-                    if parts.pop().is_none() {
-                        walk_state = WalkState::Host(Vec::new());
+                    if parts.pop().is_some() {
+                        if is_memfs_fstype(*fstype) {
+                            *mem_ino = state
+                                .memfs
+                                .parent_ino(*mount_id, *mem_ino)
+                                .unwrap_or(*mem_ino);
+                        }
+                    } else {
+                        let parent_abs = parent_abs_path(mount_target);
+                        if let Some((pm_id, p_fs, p_tgt)) =
+                            find_virtual_mount_for_path(state, parent_abs)
+                        {
+                            let p_rel = if parent_abs.len() > p_tgt.len() {
+                                &parent_abs[p_tgt.len() + 1..]
+                            } else {
+                                b""
+                            };
+                            let p_parts = split_nonempty_segments(p_rel);
+                            let p_mem_ino = if is_memfs_fstype(p_fs) {
+                                walk_memfs_ino(&state.memfs, pm_id, &p_parts)?
+                            } else {
+                                0
+                            };
+                            *mount_id = pm_id;
+                            *mount_target = p_tgt;
+                            *fstype = p_fs;
+                            *parts = p_parts;
+                            *mem_ino = p_mem_ino;
+                        } else {
+                            walk_state = WalkState::Host(split_nonempty_segments(parent_abs));
+                        }
                     }
                     continue;
                 }
-                parts.push(seg);
+
+                parts.push(seg.clone());
+                let cand_abs = join_abs_from_mount(mount_target, parts);
+
+                // Check crossing into a child mountpoint.
+                if let Some((cm_id, c_fs, c_tgt)) = find_virtual_mount_for_path(state, &cand_abs)
+                    && cm_id != *mount_id
+                    && c_tgt.len() > mount_target.len()
+                    && c_tgt == cand_abs.as_slice()
+                {
+                    *mount_id = cm_id;
+                    *mount_target = c_tgt;
+                    *fstype = c_fs;
+                    parts.clear();
+                    *mem_ino = if is_memfs_fstype(c_fs) {
+                        let root = state.memfs.root_stat(cm_id).ok_or(Errno::ENOENT)?;
+                        if is_final {
+                            last_mem_stat = Some(root);
+                        }
+                        root.ino
+                    } else {
+                        0
+                    };
+                    continue;
+                }
+                if state
+                    .ext4_mounts
+                    .iter()
+                    .any(|m| m.live && &m.mount_path[..m.mount_path_len] == cand_abs.as_slice())
+                {
+                    walk_state = WalkState::Host(split_nonempty_segments(&cand_abs));
+                    continue;
+                }
+
+                if is_memfs_fstype(*fstype) {
+                    let Some(child_stat) = state.memfs.lookup_child_stat(*mount_id, *mem_ino, &seg)
+                    else {
+                        if *fstype == FilesystemType::Devpts
+                            && parts.len() == 1
+                            && is_final
+                            && !trailing_slash
+                            && parse_u32_decimal(&seg).is_some()
+                        {
+                            return Ok(Some(ResolvedVirtualTarget::HostAbsolute(cand_abs)));
+                        }
+                        if stop_at_missing_leaf && is_final {
+                            parts.pop();
+                            let parent_rel = join_part_slices(parts);
+                            let parent_abs = join_mount_and_rel(mount_target, &parent_rel);
+                            return Ok(Some(ResolvedVirtualTarget::MissingLeaf {
+                                mount_id: *mount_id,
+                                fstype: *fstype,
+                                parent_ino: *mem_ino,
+                                parent_abs,
+                                parent_rel,
+                                leaf: seg,
+                                trailing_slash,
+                            }));
+                        }
+                        return Err(Errno::ENOENT);
+                    };
+                    match child_stat.kind {
+                        MemNodeKind::Dir => {
+                            *mem_ino = child_stat.ino;
+                            if is_final {
+                                last_mem_stat = Some(child_stat);
+                            }
+                        }
+                        MemNodeKind::Symlink => {
+                            let must_follow = !is_final || follow_final || trailing_slash;
+                            if !must_follow {
+                                last_mem_stat = Some(child_stat);
+                                continue;
+                            }
+                            let target = state
+                                .memfs
+                                .read_symlink(*mount_id, child_stat.ino)
+                                .ok_or(Errno::ENOENT)?
+                                .to_vec();
+                            symlink_depth += 1;
+                            if symlink_depth > 40 {
+                                return Err(Errno::ELOOP);
+                            }
+                            if target.starts_with(b"/") {
+                                prepend_segments_front(&mut queue, &target[1..]);
+                                walk_state = WalkState::Host(Vec::new());
+                            } else {
+                                parts.pop();
+                                prepend_segments_front(&mut queue, &target);
+                            }
+                        }
+                        MemNodeKind::File
+                        | MemNodeKind::Socket
+                        | MemNodeKind::Fifo
+                        | MemNodeKind::ChrDev(_)
+                        | MemNodeKind::BlkDev(_) => {
+                            if !is_final || trailing_slash {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            last_mem_stat = Some(child_stat);
+                        }
+                    }
+                    continue;
+                }
+
                 let rel = join_part_slices(parts);
-                let node =
-                    synthesize_virtual_node(*fstype, &rel, mounts, caller, hostname, boot_id_seed)?;
+                let node = match synthesize_virtual_node(
+                    *fstype,
+                    &rel,
+                    mounts,
+                    Some(&state.fds),
+                    caller,
+                    hostname,
+                    boot_id_seed,
+                ) {
+                    Ok(n) => n,
+                    Err(Errno::ENOENT) if stop_at_missing_leaf && is_final => {
+                        parts.pop();
+                        let parent_rel = join_part_slices(parts);
+                        let parent_abs = join_mount_and_rel(mount_target, &parent_rel);
+                        return Ok(Some(ResolvedVirtualTarget::MissingLeaf {
+                            mount_id: *mount_id,
+                            fstype: *fstype,
+                            parent_ino: 0,
+                            parent_abs,
+                            parent_rel,
+                            leaf: seg,
+                            trailing_slash,
+                        }));
+                    }
+                    Err(e) => return Err(e),
+                };
                 match node {
                     VirtualNode::Directory(_) => {
                         if is_final {
@@ -1699,22 +2625,10 @@ fn resolve_virtual_path<const M: usize>(
                             continue;
                         }
                         symlink_depth += 1;
-                        if symlink_depth > 8 {
+                        if symlink_depth > 40 {
                             return Err(Errno::ELOOP);
                         }
-                        if target == b"/proc" || target.starts_with(b"/proc/") {
-                            *fstype = FilesystemType::Procfs;
-                            parts.clear();
-                            if target.len() > 5 {
-                                prepend_segments_front(&mut queue, &target[6..]);
-                            }
-                        } else if target == b"/sys" || target.starts_with(b"/sys/") {
-                            *fstype = FilesystemType::Sysfs;
-                            parts.clear();
-                            if target.len() > 4 {
-                                prepend_segments_front(&mut queue, &target[5..]);
-                            }
-                        } else if target.starts_with(b"/") {
+                        if target.starts_with(b"/") {
                             prepend_segments_front(&mut queue, &target[1..]);
                             walk_state = WalkState::Host(Vec::new());
                         } else {
@@ -1729,18 +2643,27 @@ fn resolve_virtual_path<const M: usize>(
                     parts.pop();
                 } else {
                     parts.push(seg);
-                    if parts.len() == 1 {
-                        if parts[0].as_slice() == b"proc" {
-                            walk_state = WalkState::Virtual {
-                                fstype: FilesystemType::Procfs,
-                                parts: Vec::new(),
-                            };
-                        } else if parts[0].as_slice() == b"sys" {
-                            walk_state = WalkState::Virtual {
-                                fstype: FilesystemType::Sysfs,
-                                parts: Vec::new(),
-                            };
-                        }
+                    let cand_abs = host_absolute_from_parts(parts);
+                    if let Some((vm_id, v_fs, v_tgt)) =
+                        find_virtual_mount_for_path(state, &cand_abs)
+                        && v_tgt == cand_abs.as_slice()
+                    {
+                        let mem_ino = if is_memfs_fstype(v_fs) {
+                            let root = state.memfs.root_stat(vm_id).ok_or(Errno::ENOENT)?;
+                            if is_final {
+                                last_mem_stat = Some(root);
+                            }
+                            root.ino
+                        } else {
+                            0
+                        };
+                        walk_state = WalkState::Virtual {
+                            mount_id: vm_id,
+                            mount_target: v_tgt,
+                            fstype: v_fs,
+                            parts: Vec::new(),
+                            mem_ino,
+                        };
                     }
                 }
             }
@@ -1748,23 +2671,55 @@ fn resolve_virtual_path<const M: usize>(
     }
 
     Ok(Some(match walk_state {
-        WalkState::Virtual { fstype, parts } => {
+        WalkState::Virtual {
+            mount_id,
+            mount_target,
+            fstype,
+            parts,
+            mem_ino,
+        } => {
             let rel_path = join_part_slices(&parts);
-            let node = match last_node {
-                Some(node) => Some(node),
-                None => Some(synthesize_virtual_node(
+            let abs_path = join_mount_and_rel(&mount_target, &rel_path);
+            let is_mount_root = rel_path.is_empty();
+            if is_memfs_fstype(fstype) {
+                let mem_stat = match last_mem_stat {
+                    Some(st) => Some(st),
+                    None => state.memfs.stat_ino(mount_id, mem_ino),
+                };
+                if mem_stat.is_none() {
+                    return Err(Errno::ENOENT);
+                }
+                ResolvedVirtualTarget::Virtual {
+                    mount_id,
+                    is_mount_root,
                     fstype,
-                    &rel_path,
-                    mounts,
-                    caller,
-                    hostname,
-                    boot_id_seed,
-                )?),
-            };
-            ResolvedVirtualTarget::Virtual {
-                fstype,
-                rel_path,
-                node,
+                    abs_path,
+                    rel_path,
+                    node: None,
+                    mem_stat,
+                }
+            } else {
+                let node = match last_node {
+                    Some(node) => Some(node),
+                    None => Some(synthesize_virtual_node(
+                        fstype,
+                        &rel_path,
+                        mounts,
+                        Some(&state.fds),
+                        caller,
+                        hostname,
+                        boot_id_seed,
+                    )?),
+                };
+                ResolvedVirtualTarget::Virtual {
+                    mount_id,
+                    is_mount_root,
+                    fstype,
+                    abs_path,
+                    rel_path,
+                    node,
+                    mem_stat: None,
+                }
             }
         }
         WalkState::Host(parts) => {
@@ -1881,30 +2836,31 @@ fn push_encoded_dir_entries(
 }
 
 fn build_proc_pid_entries(rel_pid: &[u8]) -> Vec<VirtualDirEntry> {
-    let mut entries = Vec::with_capacity(15);
+    let mut entries = Vec::with_capacity(16);
     push_encoded_dir_entries(
         &mut entries,
         FilesystemType::Procfs,
         rel_pid,
-        b".:D|..:D|cgroup:R|cmdline:R|comm:R|cwd:L|exe:L|fd:D|mountinfo:R|mounts:R|ns:D|oom_score_adj:R|root:L|stat:R|status:R",
+        b".:D|..:D|cgroup:R|cmdline:R|comm:R|cwd:L|exe:L|fd:D|fdinfo:D|mountinfo:R|mounts:R|ns:D|oom_score_adj:R|root:L|stat:R|status:R",
     );
     entries
 }
 
-fn build_proc_fd_entries(
-    rel_fd_dir: &[u8],
+fn build_proc_fd_list(
+    rel_dir: &[u8],
     proc_snap: &super::runtime::ProcProcessSnapshot,
+    kind: NodeKind,
 ) -> Vec<VirtualDirEntry> {
     let mut entries = Vec::new();
     entries.push(make_dir_entry(
         FilesystemType::Procfs,
-        rel_fd_dir,
+        rel_dir,
         b".",
         NodeKind::Directory,
     ));
     entries.push(make_dir_entry(
         FilesystemType::Procfs,
-        rel_fd_dir,
+        rel_dir,
         b"..",
         NodeKind::Directory,
     ));
@@ -1914,15 +2870,34 @@ fn build_proc_fd_entries(
     for fd in open_fds {
         if fd >= 0 {
             let name = format_u64_bytes(fd as u64);
-            entries.push(make_dir_entry(
-                FilesystemType::Procfs,
-                rel_fd_dir,
-                &name,
-                NodeKind::Symlink,
-            ));
+            entries.push(make_dir_entry(FilesystemType::Procfs, rel_dir, &name, kind));
         }
     }
     entries
+}
+
+fn build_proc_fdinfo_bytes(
+    proc_snap: &super::runtime::ProcProcessSnapshot,
+    fd_num: i32,
+) -> Option<Vec<u8>> {
+    let mut open_fds = Vec::new();
+    collect_process_fd_numbers(proc_snap.process, &mut open_fds);
+    if !open_fds.contains(&fd_num) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(64);
+    if let Some(target_pid) =
+        super::step35_events_cgroup::pidfd_target_for_process_fd(proc_snap.process, fd_num)
+    {
+        out.extend_from_slice(b"pos:\t0\nflags:\t02004000\nmnt_id:\t0\nino:\t0\nPid:\t");
+        out.extend_from_slice(&format_u64_bytes(u64::from(target_pid)));
+        out.extend_from_slice(b"\nNSpid:\t");
+        out.extend_from_slice(&format_u64_bytes(u64::from(target_pid)));
+        out.push(b'\n');
+    } else {
+        out.extend_from_slice(b"pos:\t0\nflags:\t02000002\nmnt_id:\t0\nino:\t1\n");
+    }
+    Some(out)
 }
 
 fn build_proc_ns_entries(rel_ns_dir: &[u8]) -> Vec<VirtualDirEntry> {
@@ -1939,6 +2914,7 @@ fn build_proc_ns_entries(rel_ns_dir: &[u8]) -> Vec<VirtualDirEntry> {
 fn synthesize_proc_virtual_node<const M: usize>(
     rel: &[u8],
     mounts: &kernal_linux_mounts::MountTable<M>,
+    proc_sys_fds: Option<&[ProcSysFdEntry]>,
     caller: &CallerSnapshotData,
     hostname: &[u8],
     boot_id_seed: [u8; 16],
@@ -2018,19 +2994,47 @@ fn synthesize_proc_virtual_node<const M: usize>(
                 return Ok(VirtualNode::Symlink(cwd_vec));
             }
             b"fd" => {
-                return Ok(VirtualNode::Directory(build_proc_fd_entries(
-                    rel, &proc_snap,
+                return Ok(VirtualNode::Directory(build_proc_fd_list(
+                    rel,
+                    &proc_snap,
+                    NodeKind::Symlink,
+                )));
+            }
+            b"fdinfo" => {
+                return Ok(VirtualNode::Directory(build_proc_fd_list(
+                    rel,
+                    &proc_snap,
+                    NodeKind::Regular,
                 )));
             }
             b"ns" => return Ok(VirtualNode::Directory(build_proc_ns_entries(rel))),
             _ => {}
         }
+        if let Some(fd_str) = subpath.strip_prefix(b"fdinfo/") {
+            let fd_num = parse_u32_decimal(fd_str).ok_or(Errno::ENOENT)? as i32;
+            let bytes = build_proc_fdinfo_bytes(&proc_snap, fd_num).ok_or(Errno::ENOENT)?;
+            return Ok(VirtualNode::Regular(bytes));
+        }
         if let Some(fd_str) = subpath.strip_prefix(b"fd/") {
             let fd_num = parse_u32_decimal(fd_str).ok_or(Errno::ENOENT)? as i32;
-            let mut target_buf = [0u8; MAX_MOUNT_PATH];
-            let len = describe_process_fd_target(proc_snap.process, fd_num, &mut target_buf)
-                .ok_or(Errno::ENOENT)?;
+            let mut target_buf = vec![0u8; 512];
+            let len = describe_process_fd_target_with_proc_sys(
+                proc_snap.process,
+                fd_num,
+                proc_sys_fds,
+                &mut target_buf,
+            )
+            .ok_or(Errno::ENOENT)?;
             return Ok(VirtualNode::Symlink(target_buf[..len].to_vec()));
+        }
+        if subpath == b"cgroup" {
+            let mut cg_path = [0u8; 128];
+            let cg_len = super::step35_events_cgroup::pid_cgroup_path(proc_snap.pid, &mut cg_path);
+            let mut out = Vec::with_capacity(4 + cg_len);
+            out.extend_from_slice(b"0::");
+            out.extend_from_slice(&cg_path[..cg_len]);
+            out.push(b'\n');
+            return Ok(VirtualNode::Regular(out));
         }
         if let Some(ns_name) = subpath.strip_prefix(b"ns/")
             && matches!(
@@ -2128,7 +3132,54 @@ fn synthesize_proc_or_sys_node<const M: usize>(
                 }
             }
         }
+        FilesystemType::Cgroup2 => {
+            super::step35_events_cgroup::read_cgroup_control_file(rel, node_buf)
+        }
         _ => Err(Errno::ENOENT),
+    }
+}
+
+fn synthesize_cgroup_node(fstype: FilesystemType, cg_rel: &[u8]) -> Result<VirtualNode, Errno> {
+    if super::step35_events_cgroup::cgroup_has_dir(cg_rel) {
+        let mut entries = Vec::new();
+        entries.push(make_dir_entry(fstype, cg_rel, b".", NodeKind::Directory));
+        entries.push(make_dir_entry(fstype, cg_rel, b"..", NodeKind::Directory));
+        super::step35_events_cgroup::cgroup_list_dir(cg_rel, |name, sub_dir| {
+            entries.push(make_dir_entry(
+                fstype,
+                cg_rel,
+                name,
+                if sub_dir {
+                    NodeKind::Directory
+                } else {
+                    NodeKind::Regular
+                },
+            ));
+        });
+        return Ok(VirtualNode::Directory(entries));
+    }
+    let mut node_buf = vec![0u8; MAX_VIRTUAL_NODE_BYTES];
+    let len = super::step35_events_cgroup::read_cgroup_control_file(cg_rel, &mut node_buf)?;
+    node_buf.truncate(len);
+    Ok(VirtualNode::Regular(node_buf))
+}
+
+fn read_sysfs_symlink_target(rel: &[u8]) -> Option<&'static [u8]> {
+    match rel {
+        b"class/tty/ttyAMA0/subsystem" | b"class/tty/console/subsystem" => {
+            Some(b"../../../class/tty")
+        }
+        b"class/tty/ttyAMA0/device" => Some(b"../../../devices/platform/pl011"),
+        b"devices/platform/pl011/tty/ttyAMA0/subsystem" => Some(b"../../../../../class/tty"),
+        b"devices/platform/pl011/tty/ttyAMA0/device" => Some(b"../../../pl011"),
+        b"class/block/vda/subsystem" => Some(b"../../../class/block"),
+        b"devices/virtio0/block/vda/subsystem" => Some(b"../../../../class/block"),
+        b"class/net/lo/subsystem" | b"class/net/eth0/subsystem" => Some(b"../../../class/net"),
+        b"devices/virtio1/net/eth0/subsystem" => Some(b"../../../../class/net"),
+        b"dev/char/204:64" => Some(b"../../devices/platform/pl011/tty/ttyAMA0"),
+        b"dev/char/5:1" => Some(b"../../class/tty/console"),
+        b"dev/block/254:0" => Some(b"../../devices/virtio0/block/vda"),
+        _ => None,
     }
 }
 
@@ -2140,27 +3191,38 @@ fn synthesize_sys_virtual_node<const M: usize>(
     boot_id_seed: [u8; 16],
 ) -> Result<VirtualNode, Errno> {
     if rel == b"fs/cgroup" {
-        let mut entries = Vec::with_capacity(13);
-        push_encoded_dir_entries(
-            &mut entries,
-            FilesystemType::Sysfs,
-            rel,
-            b".:D|..:D|cgroup.controllers:R|cgroup.events:R|cgroup.procs:R|cgroup.subtree_control:R|cpu.max:R|cpu.stat:R|memory.current:R|memory.max:R|memory.stat:R|pids.current:R|pids.max:R",
-        );
-        return Ok(VirtualNode::Directory(entries));
+        return synthesize_cgroup_node(FilesystemType::Sysfs, b"");
+    }
+    if let Some(cg_rel) = rel.strip_prefix(b"fs/cgroup/") {
+        return synthesize_cgroup_node(FilesystemType::Sysfs, cg_rel);
+    }
+    if let Some(target) = read_sysfs_symlink_target(rel) {
+        return Ok(VirtualNode::Symlink(target.to_vec()));
     }
     let mut entries = Vec::new();
     let is_dir = enumerate_sysfs_dir(rel, |name, sub_dir| {
-        entries.push(make_dir_entry(
-            FilesystemType::Sysfs,
-            rel,
-            name,
-            if sub_dir {
-                NodeKind::Directory
-            } else {
-                NodeKind::Regular
-            },
-        ));
+        let mut child_buf = [0u8; MAX_MOUNT_PATH];
+        let mut c = 0usize;
+        if !rel.is_empty() {
+            let n = rel.len().min(child_buf.len());
+            child_buf[..n].copy_from_slice(&rel[..n]);
+            c = n;
+            if c < child_buf.len() {
+                child_buf[c] = b'/';
+                c += 1;
+            }
+        }
+        let nlen = name.len().min(child_buf.len().saturating_sub(c));
+        child_buf[c..c + nlen].copy_from_slice(&name[..nlen]);
+        c += nlen;
+        let kind = if sub_dir {
+            NodeKind::Directory
+        } else if read_sysfs_symlink_target(&child_buf[..c]).is_some() {
+            NodeKind::Symlink
+        } else {
+            NodeKind::Regular
+        };
+        entries.push(make_dir_entry(FilesystemType::Sysfs, rel, name, kind));
     });
     if is_dir {
         let mut full = Vec::with_capacity(entries.len() + 2);
@@ -2192,41 +3254,401 @@ fn synthesize_virtual_node<const M: usize>(
     fstype: FilesystemType,
     rel: &[u8],
     mounts: &kernal_linux_mounts::MountTable<M>,
+    proc_sys_fds: Option<&[ProcSysFdEntry]>,
     caller: &CallerSnapshotData,
     hostname: &[u8],
     boot_id_seed: [u8; 16],
 ) -> Result<VirtualNode, Errno> {
     match fstype {
         FilesystemType::Procfs => {
-            synthesize_proc_virtual_node(rel, mounts, caller, hostname, boot_id_seed)
+            synthesize_proc_virtual_node(rel, mounts, proc_sys_fds, caller, hostname, boot_id_seed)
         }
         FilesystemType::Sysfs => {
             synthesize_sys_virtual_node(rel, mounts, caller, hostname, boot_id_seed)
         }
+        FilesystemType::Cgroup2 => synthesize_cgroup_node(FilesystemType::Cgroup2, rel),
         _ => Err(Errno::ENOENT),
     }
 }
 
-fn resolve_virtual_node_from_target<const M: usize>(
+fn cwd_if_at_fdcwd(owner: ObjectId, dirfd: u64) -> Option<Vec<u8>> {
+    if linux_signed_int(dirfd) == AT_FDCWD_I32 {
+        Some(super::step33_ext4_vfs::process_proc_cwd_root(owner).0)
+    } else {
+        None
+    }
+}
+
+fn try_delegate_dev_open(abs_path: &[u8], flags: u64) -> Result<Option<SyscallReturn>, ()> {
+    if !abs_path.starts_with(b"/dev/") {
+        return Ok(None);
+    }
+    if let Some(ret) =
+        super::step37_38_systemd_udev::try_open_kmsg_or_uevent_bytes(abs_path, flags)?
+    {
+        return Ok(Some(ret));
+    }
+    if let Some(ret) = super::step42_hardware::try_open_dev_bytes_if_block(abs_path, flags)? {
+        return Ok(Some(ret));
+    }
+    super::step32_dev::try_open_dev_bytes(abs_path, flags)
+}
+
+fn try_delegate_dev_stat(abs_path: &[u8], user_statbuf: u64) -> Result<Option<SyscallReturn>, ()> {
+    if !abs_path.starts_with(b"/dev/") {
+        return Ok(None);
+    }
+    if let Some(ret) = super::step37_38_systemd_udev::try_stat_kmsg_bytes(abs_path, user_statbuf)? {
+        return Ok(Some(ret));
+    }
+    if let Some(ret) = super::step42_hardware::try_stat_hw_bytes(abs_path, user_statbuf)? {
+        return Ok(Some(ret));
+    }
+    super::step32_dev::try_stat_dev_bytes(abs_path, user_statbuf)
+}
+
+fn try_delegate_dev_statx(abs_path: &[u8], user_statx: u64) -> Result<Option<SyscallReturn>, ()> {
+    if !abs_path.starts_with(b"/dev/") {
+        return Ok(None);
+    }
+    if let Some(ret) = super::step37_38_systemd_udev::try_statx_kmsg_bytes(abs_path, user_statx)? {
+        return Ok(Some(ret));
+    }
+    if let Some(ret) = super::step42_hardware::try_statx_hw_bytes(abs_path, user_statx)? {
+        return Ok(Some(ret));
+    }
+    super::step32_dev::try_statx_dev_bytes(abs_path, user_statx)
+}
+
+fn delegate_host_open(
+    owner: ObjectId,
+    host_path: &[u8],
+    flags: u64,
+    mode: u64,
+) -> Result<SyscallReturn, ()> {
+    if let Some(ret) = try_delegate_dev_open(host_path, flags)? {
+        return Ok(ret);
+    }
+    if let Some(ret) = super::step33_ext4_vfs::try_open_host_path(owner, host_path, flags, mode)? {
+        return Ok(ret);
+    }
+    Ok(encode_result(super::step29_fd::openat_host_path(
+        owner, host_path, flags, mode,
+    )?))
+}
+
+fn is_cgroup_ctrl_writable(fstype: FilesystemType, rel: &[u8]) -> Option<&[u8]> {
+    match fstype {
+        FilesystemType::Cgroup2 => Some(rel),
+        FilesystemType::Sysfs => rel.strip_prefix(b"fs/cgroup/"),
+        _ => None,
+    }
+}
+
+fn build_memfs_dir_entries(
+    state: &Step33MountState,
+    fstype: FilesystemType,
+    mount_id: u32,
+    dir_ino: u64,
+) -> Result<Vec<VirtualDirEntry>, Errno> {
+    let raw = state.memfs.list_dir(mount_id, dir_ino)?;
+    let mut out = Vec::with_capacity(raw.len() + 4);
+    for (ino, dt, name) in raw {
+        let kind = match dt {
+            4 => NodeKind::Directory,
+            10 => NodeKind::Symlink,
+            _ => NodeKind::Regular,
+        };
+        out.push(VirtualDirEntry { ino, kind, name });
+    }
+    if fstype == FilesystemType::Devpts
+        && state.memfs.parent_ino(mount_id, dir_ino) == Some(dir_ino)
+    {
+        super::step32_dev::list_active_pts(|pts_idx| {
+            let digits = format_u64_bytes(u64::from(pts_idx));
+            if !out.iter().any(|e| e.name.as_slice() == digits.as_slice()) {
+                out.push(VirtualDirEntry {
+                    ino: (1u64 << 61) | ((136u64 << 8) | u64::from(pts_idx)),
+                    kind: NodeKind::Regular,
+                    name: digits,
+                });
+            }
+        });
+    }
+    Ok(out)
+}
+
+const MAX_CROSS_FS_DEPTH: u8 = 16;
+static CROSS_FS_DEPTH: [AtomicU8; 8] = [const { AtomicU8::new(0) }; 8];
+
+struct CrossFsDepthGuard(usize);
+
+impl CrossFsDepthGuard {
+    fn enter() -> Result<Self, Errno> {
+        let cpu = super::super::current_cpu_index().min(7);
+        let cur = CROSS_FS_DEPTH[cpu].load(Ordering::Relaxed);
+        if cur >= MAX_CROSS_FS_DEPTH {
+            return Err(Errno::ELOOP);
+        }
+        CROSS_FS_DEPTH[cpu].store(cur + 1, Ordering::Relaxed);
+        Ok(Self(cpu))
+    }
+}
+
+impl Drop for CrossFsDepthGuard {
+    fn drop(&mut self) {
+        let cur = CROSS_FS_DEPTH[self.0].load(Ordering::Relaxed);
+        CROSS_FS_DEPTH[self.0].store(cur.saturating_sub(1), Ordering::Relaxed);
+    }
+}
+
+fn open_virtual_resolved(
+    state: &mut Step33MountState,
+    owner: ObjectId,
     target: ResolvedVirtualTarget,
-    mounts: &kernal_linux_mounts::MountTable<M>,
+    flags: u64,
+    mode: u64,
     caller: &CallerSnapshotData,
-    hostname: &[u8],
-    boot_id_seed: [u8; 16],
-) -> Result<(FilesystemType, Vec<u8>, VirtualNode), Errno> {
-    let ResolvedVirtualTarget::Virtual {
+    uid: u32,
+    gid: u32,
+    now: u32,
+) -> Result<(Option<Vec<u8>>, Result<i64, Errno>), ()> {
+    let is_path = (flags & O_PATH) != 0;
+    let acc = flags & O_ACCMODE;
+    if !is_path && acc == 3 {
+        return Ok((None, Err(Errno::EINVAL)));
+    }
+    let readable = !is_path && matches!(acc, O_RDONLY | O_RDWR);
+    let writable = !is_path && matches!(acc, O_WRONLY | O_RDWR);
+    let close_on_exec = (flags & O_CLOEXEC) != 0;
+
+    let (mount_id, fstype, abs_path, rel_path, mem_stat_opt, virt_node_opt, created_new) =
+        match target {
+            ResolvedVirtualTarget::HostAbsolute(host_path) => {
+                return Ok((Some(host_path), Err(Errno::ENOENT)));
+            }
+            ResolvedVirtualTarget::MissingLeaf {
+                mount_id,
+                fstype,
+                parent_ino,
+                parent_abs,
+                parent_rel,
+                leaf,
+                trailing_slash,
+            } => {
+                if is_path || (flags & O_CREAT) == 0 {
+                    return Ok((None, Err(Errno::ENOENT)));
+                }
+                if !is_memfs_fstype(fstype) {
+                    return Ok((None, Err(Errno::EROFS)));
+                }
+                if trailing_slash || (flags & O_DIRECTORY) != 0 {
+                    return Ok((None, Err(Errno::EISDIR)));
+                }
+                let abs = join_mount_and_rel(&parent_abs, &leaf);
+                let rel = join_rel(&parent_rel, &leaf);
+                let stat = match state.memfs.open_or_create_file(
+                    mount_id,
+                    parent_ino,
+                    &leaf,
+                    (mode as u32) & 0o7777,
+                    uid,
+                    gid,
+                    (flags & O_EXCL) != 0,
+                    (flags & O_TRUNC) != 0,
+                    now,
+                ) {
+                    Ok(st) => st,
+                    Err(e) => return Ok((None, Err(e))),
+                };
+                (mount_id, fstype, abs, rel, Some(stat), None, true)
+            }
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                is_mount_root: _,
+                fstype,
+                abs_path,
+                rel_path,
+                node,
+                mem_stat,
+            } => (mount_id, fstype, abs_path, rel_path, mem_stat, node, false),
+        };
+
+    if let Some(mut ms) = mem_stat_opt {
+        let is_tmpfile = (flags & O_TMPFILE) == O_TMPFILE;
+        if !created_new && !is_tmpfile && (flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL) {
+            return Ok((None, Err(Errno::EEXIST)));
+        }
+        if matches!(ms.kind, MemNodeKind::ChrDev(_) | MemNodeKind::BlkDev(_)) {
+            if (flags & O_DIRECTORY) != 0 {
+                return Ok((None, Err(Errno::ENOTDIR)));
+            }
+            if !is_path && abs_path.starts_with(b"/dev/") {
+                return Ok((Some(abs_path), Err(Errno::ENOENT)));
+            }
+        }
+        if ms.kind == MemNodeKind::Symlink && (flags & O_NOFOLLOW) != 0 && !is_path {
+            return Ok((None, Err(Errno::ELOOP)));
+        }
+        let mut is_dir = ms.kind == MemNodeKind::Dir;
+        if is_tmpfile {
+            if !is_dir {
+                return Ok((None, Err(Errno::ENOTDIR)));
+            }
+            if is_path || !writable {
+                return Ok((None, Err(Errno::EINVAL)));
+            }
+            if !is_memfs_fstype(fstype) {
+                return Ok((None, Err(Errno::EOPNOTSUPP)));
+            }
+            ms = match state.memfs.create_tmpfile(
+                mount_id,
+                ms.ino,
+                (mode as u32) & 0o7777,
+                uid,
+                gid,
+                now,
+            ) {
+                Ok(tmp) => tmp,
+                Err(e) => return Ok((None, Err(e))),
+            };
+            is_dir = false;
+        } else {
+            if (flags & O_DIRECTORY) != 0 && !is_dir {
+                return Ok((None, Err(Errno::ENOTDIR)));
+            }
+            if is_dir && writable && !is_path {
+                return Ok((None, Err(Errno::EISDIR)));
+            }
+        }
+        if !is_path && writable && (flags & O_TRUNC) != 0 && ms.kind == MemNodeKind::File {
+            if let Err(e) = state.memfs.truncate(mount_id, ms.ino, 0, now) {
+                return Ok((None, Err(e)));
+            }
+        }
+        let dir_entries = if is_dir && !is_path {
+            match build_memfs_dir_entries(state, fstype, mount_id, ms.ino) {
+                Ok(list) => list,
+                Err(e) => return Ok((None, Err(e))),
+            }
+        } else {
+            Vec::new()
+        };
+        let Some((slot_idx, _)) = state.fds.iter().enumerate().find(|(_, e)| !e.live) else {
+            return Ok((None, Err(Errno::EMFILE)));
+        };
+        state.memfs.retain_fd(mount_id, ms.ino);
+        let generation = state.next_generation;
+        state.next_generation = state.next_generation.wrapping_add(1).max(1);
+        let mut owners = DirectProcessRefs::empty();
+        owners.init(owner, close_on_exec);
+        state.fds[slot_idx] = ProcSysFdEntry {
+            live: true,
+            is_dir,
+            generation,
+            alias_refs: 0,
+            owners,
+            mount_id,
+            fstype,
+            mem_ino: ms.ino,
+            readable,
+            writable,
+            append: !is_path && (flags & O_APPEND) != 0,
+            path_only: is_path,
+            abs_path,
+            rel_path,
+            offset: 0,
+            content: Vec::new(),
+            dir_entries,
+            last_mount_gen: state.mounts_gen,
+        };
+        return Ok((None, Ok(i64::from(PROC_SYS_FD_BASE + (slot_idx as i32)))));
+    }
+
+    let node = match virt_node_opt {
+        Some(n) => n,
+        None => match synthesize_virtual_node(
+            fstype,
+            &rel_path,
+            &state.mounts,
+            Some(&state.fds),
+            caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(n) => n,
+            Err(e) => return Ok((None, Err(e))),
+        },
+    };
+    let is_dir = matches!(node, VirtualNode::Directory(_));
+    if (flags & O_DIRECTORY) != 0 && !is_dir {
+        return Ok((None, Err(Errno::ENOTDIR)));
+    }
+    if let VirtualNode::Symlink(_) = &node
+        && (flags & O_NOFOLLOW) != 0
+        && !is_path
+    {
+        return Ok((None, Err(Errno::ELOOP)));
+    }
+    if !is_path && writable {
+        if fstype == FilesystemType::Sysfs
+            && super::step37_38_systemd_udev::is_sysfs_uevent_trigger_rel(&rel_path)
+        {
+            return Ok((Some(abs_path), Err(Errno::ENOENT)));
+        }
+        if is_cgroup_ctrl_writable(fstype, &rel_path).is_none() || is_dir {
+            return Ok((
+                None,
+                Err(if is_dir { Errno::EISDIR } else { Errno::EACCES }),
+            ));
+        }
+    }
+
+    let Some((slot_idx, _)) = state.fds.iter().enumerate().find(|(_, e)| !e.live) else {
+        return Ok((None, Err(Errno::EMFILE)));
+    };
+    let generation = state.next_generation;
+    state.next_generation = state.next_generation.wrapping_add(1).max(1);
+    let mut owners = DirectProcessRefs::empty();
+    owners.init(owner, close_on_exec);
+    let (content, dir_entries) = match node {
+        VirtualNode::Directory(entries) => (Vec::new(), entries),
+        VirtualNode::Regular(bytes) => (bytes, Vec::new()),
+        VirtualNode::Symlink(bytes) => (bytes, Vec::new()),
+    };
+    state.fds[slot_idx] = ProcSysFdEntry {
+        live: true,
+        is_dir,
+        generation,
+        alias_refs: 0,
+        owners,
+        mount_id,
         fstype,
+        mem_ino: 0,
+        readable,
+        writable,
+        append: false,
+        path_only: is_path,
+        abs_path,
         rel_path,
-        node,
-    } = target
-    else {
-        return Err(Errno::ENOENT);
+        offset: 0,
+        content,
+        dir_entries,
+        last_mount_gen: state.mounts_gen,
     };
-    let node = match node {
-        Some(node) => node,
-        None => synthesize_virtual_node(fstype, &rel_path, mounts, caller, hostname, boot_id_seed)?,
-    };
-    Ok((fstype, rel_path, node))
+    Ok((None, Ok(i64::from(PROC_SYS_FD_BASE + (slot_idx as i32)))))
+}
+
+fn finish_open_action(
+    owner: ObjectId,
+    action: (Option<Vec<u8>>, Result<i64, Errno>),
+    flags: u64,
+    mode: u64,
+) -> Result<SyscallReturn, ()> {
+    if let Some(host_path) = action.0 {
+        return delegate_host_open(owner, &host_path, flags, mode);
+    }
+    Ok(encode_result(action.1))
 }
 
 fn handle_openat_if_proc_or_sys(
@@ -2236,14 +3658,12 @@ fn handle_openat_if_proc_or_sys(
     mode: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
-    let close_on_exec = (flags & O_CLOEXEC) != 0;
-    let follow = (flags & O_NOFOLLOW) == 0;
+    let follow = (flags & O_NOFOLLOW) == 0 && ((flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL));
+    let stop_at_missing = (flags & O_CREAT) != 0 && (flags & O_PATH) == 0;
     let caller = CallerSnapshotData::capture();
-    enum OpenAction {
-        NotOwned,
-        HostAbsolute(Vec<u8>),
-        Handled(Result<i64, Errno>),
-    }
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
     let action = with_mount_state(|state| {
         state.ensure_initialized();
         let target = match resolve_virtual_path(
@@ -2252,95 +3672,51 @@ fn handle_openat_if_proc_or_sys(
             owner,
             dirfd,
             user_path,
+            cwd.as_deref(),
             false,
+            stop_at_missing,
             follow,
             &caller,
             &state.hostname[..state.hostname_len],
             state.boot_id_seed,
         ) {
             Ok(Some(v)) => v,
-            Ok(None) => return OpenAction::NotOwned,
-            Err(errno) => return OpenAction::Handled(Err(errno)),
+            Ok(None) => return Ok(None),
+            Err(errno) => return Ok(Some((None, Err(errno)))),
         };
-        if let ResolvedVirtualTarget::HostAbsolute(host_path) = target {
-            return OpenAction::HostAbsolute(host_path);
-        }
-        let (resolved_fs, resolved_rel, node) = match resolve_virtual_node_from_target(
-            target,
-            &state.mounts,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok(v) => v,
-            Err(errno) => return OpenAction::Handled(Err(errno)),
-        };
-
-        let rel = resolved_rel.as_slice();
-        if (flags & O_PATH) == 0 && (flags & O_ACCMODE) != O_RDONLY {
-            if resolved_fs == FilesystemType::Sysfs
-                && super::step37_38_systemd_udev::is_sysfs_uevent_trigger_rel(rel)
-            {
-                return OpenAction::NotOwned;
-            }
-            return OpenAction::Handled(Err(Errno::EACCES));
-        }
-        if let VirtualNode::Symlink(_) = &node
-            && (flags & O_NOFOLLOW) != 0
-            && (flags & O_PATH) == 0
-        {
-            return OpenAction::Handled(Err(Errno::ELOOP));
-        }
-        let is_dir = matches!(node, VirtualNode::Directory(_));
-        if (flags & O_DIRECTORY) != 0 && !is_dir {
-            return OpenAction::Handled(Err(Errno::ENOTDIR));
-        }
-
-        let Some((slot_idx, _)) = state.fds.iter().enumerate().find(|(_, e)| !e.live) else {
-            return OpenAction::Handled(Err(Errno::EMFILE));
-        };
-        let generation = state.next_generation;
-        state.next_generation = state.next_generation.wrapping_add(1).max(1);
-        let mut owners = DirectProcessRefs::empty();
-        owners.init(owner, close_on_exec);
-        let (content, dir_entries) = match node {
-            VirtualNode::Directory(entries) => (Vec::new(), entries),
-            VirtualNode::Regular(bytes) => (bytes, Vec::new()),
-            VirtualNode::Symlink(bytes) => (bytes, Vec::new()),
-        };
-        state.fds[slot_idx] = ProcSysFdEntry {
-            live: true,
-            is_dir,
-            generation,
-            alias_refs: 0,
-            owners,
-            fstype: resolved_fs,
-            rel_path: resolved_rel,
-            offset: 0,
-            content,
-            dir_entries,
-        };
-        OpenAction::Handled(Ok(i64::from(PROC_SYS_FD_BASE + (slot_idx as i32))))
+        Ok(Some(open_virtual_resolved(
+            state, owner, target, flags, mode, &caller, uid, gid, now,
+        )?))
     })?;
-    match action {
-        OpenAction::NotOwned => Ok(None),
-        OpenAction::HostAbsolute(host_path) => {
-            if host_path.starts_with(b"/dev/")
-                && let Some(ret) = super::step32_dev::try_open_dev_bytes(&host_path, flags)?
-            {
-                return Ok(Some(ret));
-            }
-            if let Some(ret) =
-                super::step33_ext4_vfs::try_open_host_path(owner, &host_path, flags, mode)?
-            {
-                return Ok(Some(ret));
-            }
-            Ok(Some(encode_result(super::step29_fd::openat_host_path(
-                owner, &host_path, flags, mode,
-            )?)))
-        }
-        OpenAction::Handled(res) => Ok(Some(encode_result(res))),
+    let Some(action) = action? else {
+        return Ok(None);
+    };
+    finish_open_action(owner, action, flags, mode).map(Some)
+}
+
+fn handle_openat2_if_proc_or_sys(
+    dirfd: u64,
+    user_path: u64,
+    user_how: u64,
+    size: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if size < 24 {
+        return Ok(None);
     }
+    if user_how == 0 {
+        return Ok(None);
+    }
+    let mut raw = [0u8; 24];
+    if copy_from_user(&mut raw, user_how).is_err() {
+        return Ok(None);
+    }
+    let flags = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let mode = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let resolve = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+    if (resolve & !0x3f) != 0 {
+        return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+    }
+    handle_openat_if_proc_or_sys(dirfd, user_path, flags, mode)
 }
 
 fn handle_close(raw_fd: u64) -> Result<Result<i64, Errno>, ()> {
@@ -2377,34 +3753,52 @@ fn handle_getdents64(
 
     let mut out = Vec::new();
     let prep = with_mount_state(|state| {
-        let Some(entry) = resolve_proc_sys_entry_mut(state, owner, idx, alias_gen) else {
-            return Err(Errno::EBADF);
+        let (is_dir, is_path_only, fstype, mount_id, mem_ino, cur_offset) = {
+            let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+                return Err(Errno::EBADF);
+            };
+            (
+                entry.is_dir,
+                entry.path_only,
+                entry.fstype,
+                entry.mount_id,
+                entry.mem_ino,
+                entry.offset,
+            )
         };
-        if !entry.is_dir {
+        if is_path_only {
+            return Err(Errno::EBADF);
+        }
+        if !is_dir {
             return Err(Errno::ENOTDIR);
         }
-        let start_offset = entry.offset;
-        while entry.offset < entry.dir_entries.len() {
-            let item = &entry.dir_entries[entry.offset];
+        if mem_ino != 0 {
+            let live_entries = build_memfs_dir_entries(state, fstype, mount_id, mem_ino)?;
+            state.fds[idx].dir_entries = live_entries;
+        }
+        let entries = &state.fds[idx].dir_entries;
+        let mut offset = cur_offset;
+        while offset < entries.len() {
+            let item = &entries[offset];
             let rec = super::step29_dirent::encode_parts_with_inode(
                 item.ino,
                 &item.name,
                 item.kind,
-                entry.offset + 1,
+                offset + 1,
             )
             .map_err(|_| Errno::EINVAL)?;
             let bytes = rec.as_bytes();
             if out.len() + bytes.len() > count {
                 if out.is_empty() {
-                    entry.offset = start_offset;
                     return Err(Errno::EINVAL);
                 }
                 break;
             }
             out.extend_from_slice(bytes);
-            entry.offset += 1;
+            offset += 1;
         }
-        Ok((out.len(), start_offset))
+        state.fds[idx].offset = offset;
+        Ok((out.len(), cur_offset))
     })?;
     let (written, old_offset) = match prep {
         Ok(v) => v,
@@ -2421,20 +3815,75 @@ fn handle_getdents64(
     Ok(Ok(written as i64))
 }
 
+fn is_live_mountinfo_proc_path(rel_path: &[u8]) -> bool {
+    rel_path == b"mounts" || rel_path == b"mountinfo" || rel_path.ends_with(b"/mountinfo")
+}
+
+fn refresh_procfs_fd_entry(state: &mut Step33MountState, idx: usize, caller: &CallerSnapshotData) {
+    let entry = &state.fds[idx];
+    if entry.mem_ino != 0
+        || entry.is_dir
+        || entry.fstype != FilesystemType::Procfs
+        || !is_live_mountinfo_proc_path(&entry.rel_path)
+        || entry.last_mount_gen == state.mounts_gen
+    {
+        return;
+    }
+    if let Ok(VirtualNode::Regular(bytes)) = synthesize_virtual_node(
+        entry.fstype,
+        &entry.rel_path,
+        &state.mounts,
+        Some(&state.fds),
+        caller,
+        &state.hostname[..state.hostname_len],
+        state.boot_id_seed,
+    ) {
+        state.fds[idx].content = bytes;
+        state.fds[idx].last_mount_gen = state.mounts_gen;
+    }
+}
+
 fn handle_lseek(raw_fd: u64, offset: i64, whence: i32) -> Result<Result<i64, Errno>, ()> {
     let owner = current_process_id()?;
     let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
         return Ok(Err(Errno::EBADF));
     };
+    let caller = CallerSnapshotData::capture();
     with_mount_state(|state| {
-        let Some(entry) = resolve_proc_sys_entry_mut(state, owner, idx, alias_gen) else {
+        if resolve_proc_sys_entry_mut(state, owner, idx, alias_gen).is_none() {
             return Err(Errno::EBADF);
+        }
+        if (whence == SEEK_SET && offset == 0) || whence == SEEK_END {
+            refresh_procfs_fd_entry(state, idx, &caller);
+        }
+        let (is_dir, is_path_only, mem_ino, mount_id, dir_len, content_len) = {
+            let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+                return Err(Errno::EBADF);
+            };
+            (
+                entry.is_dir,
+                entry.path_only,
+                entry.mem_ino,
+                entry.mount_id,
+                entry.dir_entries.len(),
+                entry.content.len(),
+            )
         };
-        let end_len = if entry.is_dir {
-            entry.dir_entries.len() as i64
+        if is_path_only {
+            return Err(Errno::EBADF);
+        }
+        let end_len = if is_dir {
+            dir_len as i64
+        } else if mem_ino != 0 {
+            let sz = state
+                .memfs
+                .stat_ino(mount_id, mem_ino)
+                .map_or(0, |s| s.size);
+            sz as i64
         } else {
-            entry.content.len() as i64
+            content_len as i64
         };
+        let entry = &mut state.fds[idx];
         let base: i64 = match whence {
             SEEK_SET => 0,
             SEEK_CUR => entry.offset as i64,
@@ -2450,33 +3899,66 @@ fn handle_lseek(raw_fd: u64, offset: i64, whence: i32) -> Result<Result<i64, Err
     })
 }
 
-fn handle_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Errno>, ()> {
+fn handle_read(
+    raw_fd: u64,
+    user_buf: u64,
+    count: u64,
+    explicit_offset: Option<i64>,
+) -> Result<Result<i64, Errno>, ()> {
     if count == 0 {
         return Ok(Ok(0));
     }
     if user_buf == 0 {
         return Ok(Err(Errno::EFAULT));
     }
+    if explicit_offset.is_some_and(|off| off < 0) {
+        return Ok(Err(Errno::EINVAL));
+    }
     let owner = current_process_id()?;
     let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
         return Ok(Err(Errno::EBADF));
     };
-    let mut temp = Vec::new();
+    let max_chunk = usize::try_from(count).unwrap_or(65536).min(65536);
+    let mut temp = vec![0u8; max_chunk];
+    let caller = CallerSnapshotData::capture();
     let copied = with_mount_state(|state| {
-        let Some(entry) = resolve_proc_sys_entry_mut(state, owner, idx, alias_gen) else {
-            return Err(Errno::EBADF);
+        let (read_off, old_offset, mem_ino, mount_id) = {
+            let Some(entry) = resolve_proc_sys_entry_mut(state, owner, idx, alias_gen) else {
+                return Err(Errno::EBADF);
+            };
+            if entry.path_only || !entry.readable {
+                return Err(Errno::EBADF);
+            }
+            if entry.is_dir {
+                return Err(Errno::EISDIR);
+            }
+            let read_off = match explicit_offset {
+                Some(off) => usize::try_from(off).map_err(|_| Errno::EINVAL)?,
+                None => entry.offset,
+            };
+            (read_off, entry.offset, entry.mem_ino, entry.mount_id)
         };
-        if entry.is_dir {
-            return Err(Errno::EISDIR);
+        if read_off == 0 {
+            refresh_procfs_fd_entry(state, idx, &caller);
         }
-        if entry.offset >= entry.content.len() {
-            return Ok((0usize, 0usize));
+        let take = if mem_ino != 0 {
+            state
+                .memfs
+                .read_at(mount_id, mem_ino, read_off, &mut temp)?
+        } else {
+            let content = &state.fds[idx].content;
+            if read_off >= content.len() {
+                0
+            } else {
+                let avail = content.len() - read_off;
+                let n = max_chunk.min(avail);
+                temp[..n].copy_from_slice(&content[read_off..read_off + n]);
+                n
+            }
+        };
+        if explicit_offset.is_none() {
+            state.fds[idx].offset += take;
         }
-        let avail = entry.content.len() - entry.offset;
-        let take = usize::try_from(count).unwrap_or(avail).min(avail);
-        temp.extend_from_slice(&entry.content[entry.offset..entry.offset + take]);
-        let old_offset = entry.offset;
-        entry.offset += take;
         Ok((take, old_offset))
     })?;
     let (take, old_offset) = match copied {
@@ -2487,12 +3969,192 @@ fn handle_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Err
         return Ok(Ok(0));
     }
     if let Err(errno) = copy_to_user(user_buf, &temp[..take]) {
-        with_mount_state(|state| {
-            state.fds[idx].offset = old_offset;
-        })?;
+        if explicit_offset.is_none() {
+            let _ = with_mount_state(|state| {
+                state.fds[idx].offset = old_offset;
+            });
+        }
         return Ok(Err(errno));
     }
     Ok(Ok(take as i64))
+}
+
+fn handle_readv(raw_fd: u64, user_iov: u64, raw_iovcnt: u64) -> Result<Result<i64, Errno>, ()> {
+    let iovcnt = linux_signed_int(raw_iovcnt);
+    if !(0..=1024).contains(&iovcnt) {
+        return Ok(Err(Errno::EINVAL));
+    }
+    let mut total = 0i64;
+    for i in 0..(iovcnt as usize) {
+        let (base, len) = match read_user_iovec(user_iov, i) {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
+        if len == 0 {
+            continue;
+        }
+        match handle_read(raw_fd, base, len as u64, None)? {
+            Ok(n) => {
+                total += n;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(e) => return Ok(if total > 0 { Ok(total) } else { Err(e) }),
+        }
+    }
+    Ok(Ok(total))
+}
+
+fn handle_write(
+    raw_fd: u64,
+    user_buf: u64,
+    count: u64,
+    explicit_offset: Option<i64>,
+) -> Result<Result<i64, Errno>, ()> {
+    if explicit_offset.is_some_and(|off| off < 0) {
+        return Ok(Err(Errno::EINVAL));
+    }
+    let owner = current_process_id()?;
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
+        return Ok(Err(Errno::EBADF));
+    };
+    let req_len = usize::try_from(count).unwrap_or(65536).min(65536);
+    if req_len > 0 && user_buf == 0 {
+        return Ok(Err(Errno::EFAULT));
+    }
+    let mut payload = vec![0u8; req_len];
+    if req_len > 0
+        && let Err(e) = copy_from_user(&mut payload, user_buf)
+    {
+        return Ok(Err(e));
+    }
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry_mut(state, owner, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.path_only || !entry.writable {
+            return Err(Errno::EBADF);
+        }
+        if entry.is_dir {
+            return Err(Errno::EISDIR);
+        }
+        let mount_id = entry.mount_id;
+        let fstype = entry.fstype;
+        let mem_ino = entry.mem_ino;
+        let append = entry.append;
+        let write_off = match explicit_offset {
+            Some(off) => usize::try_from(off).map_err(|_| Errno::EINVAL)?,
+            None => entry.offset,
+        };
+        if mem_ino != 0 {
+            let (written, end_off) = state.memfs.write_at(
+                mount_id,
+                mem_ino,
+                write_off,
+                &payload,
+                append && explicit_offset.is_none(),
+                now,
+            )?;
+            if explicit_offset.is_none() {
+                state.fds[idx].offset = end_off;
+            }
+            return Ok(written as i64);
+        }
+        if let Some(cg_rel) = is_cgroup_ctrl_writable(fstype, &entry.rel_path) {
+            super::step35_events_cgroup::write_cgroup_control_file(cg_rel, &payload)?;
+            return Ok(payload.len() as i64);
+        }
+        Err(Errno::EACCES)
+    })?;
+    Ok(res)
+}
+
+fn handle_writev(raw_fd: u64, user_iov: u64, raw_iovcnt: u64) -> Result<Result<i64, Errno>, ()> {
+    let iovcnt = linux_signed_int(raw_iovcnt);
+    if !(0..=1024).contains(&iovcnt) {
+        return Ok(Err(Errno::EINVAL));
+    }
+    let mut total = 0i64;
+    for i in 0..(iovcnt as usize) {
+        let (base, len) = match read_user_iovec(user_iov, i) {
+            Ok(v) => v,
+            Err(e) => return Ok(Err(e)),
+        };
+        if len == 0 {
+            continue;
+        }
+        match handle_write(raw_fd, base, len as u64, None)? {
+            Ok(n) => total += n,
+            Err(e) => return Ok(if total > 0 { Ok(total) } else { Err(e) }),
+        }
+    }
+    Ok(Ok(total))
+}
+
+fn virtual_target_stat_meta(
+    mount_id: u32,
+    is_mount_root: bool,
+    fstype: FilesystemType,
+    rel_path: &[u8],
+    mem_stat: Option<MemStat>,
+    node: Option<&VirtualNode>,
+    follow: bool,
+) -> super::step_fd_util::StatMeta {
+    let dev = fstype.st_dev(mount_id);
+    if let Some(ms) = mem_stat {
+        let mode = if !follow || ms.kind != MemNodeKind::Symlink {
+            ms.mode
+        } else {
+            S_IFREG_RW_MODE
+        };
+        return super::step_fd_util::StatMeta {
+            dev,
+            ino: ms.ino,
+            mode,
+            nlink: ms.nlink,
+            uid: ms.uid,
+            gid: ms.gid,
+            rdev: ms.rdev,
+            size: ms.size,
+            blksize: 4096,
+            blocks: ms.size.div_ceil(512),
+            atime_sec: i64::from(ms.atime),
+            atime_nsec: 0,
+            mtime_sec: i64::from(ms.mtime),
+            mtime_nsec: 0,
+            ctime_sec: i64::from(ms.ctime),
+            ctime_nsec: 0,
+            mnt_id: mount_id,
+            is_mount_root,
+        };
+    }
+    let ino = virtual_inode(fstype, rel_path);
+    let (mode, nlink, size) = match node {
+        Some(n) => virtual_node_mode_nlink_size(n, follow),
+        None => (S_IFDIR_RX_MODE, 2, 0),
+    };
+    super::step_fd_util::StatMeta {
+        dev,
+        ino,
+        mode,
+        nlink,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        size,
+        blksize: 4096,
+        blocks: size.div_ceil(512),
+        atime_sec: i64::from(EPOCH_BASE_SECONDS),
+        atime_nsec: 0,
+        mtime_sec: i64::from(EPOCH_BASE_SECONDS),
+        mtime_nsec: 0,
+        ctime_sec: i64::from(EPOCH_BASE_SECONDS),
+        ctime_nsec: 0,
+        mnt_id: mount_id,
+        is_mount_root,
+    }
 }
 
 fn virtual_node_mode_nlink_size(node: &VirtualNode, follow: bool) -> (u32, u32, u64) {
@@ -2521,12 +4183,7 @@ fn handle_readlinkat_if_proc_or_sys(
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
     let caller = CallerSnapshotData::capture();
-    enum ReadlinkAction {
-        NotOwned,
-        HostAbsolute(Vec<u8>),
-        Handled(Result<i64, Errno>),
-    }
-    let mut target_out = Vec::new();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
     let action = with_mount_state(|state| {
         state.ensure_initialized();
         let target = match resolve_virtual_path(
@@ -2535,6 +4192,8 @@ fn handle_readlinkat_if_proc_or_sys(
             owner,
             dirfd,
             user_path,
+            cwd.as_deref(),
+            false,
             false,
             false,
             &caller,
@@ -2542,36 +4201,63 @@ fn handle_readlinkat_if_proc_or_sys(
             state.boot_id_seed,
         ) {
             Ok(Some(v)) => v,
-            Ok(None) => return ReadlinkAction::NotOwned,
-            Err(errno) => return ReadlinkAction::Handled(Err(errno)),
+            Ok(None) => return ReadlinkRes::NotOwned,
+            Err(errno) => return ReadlinkRes::Handled(Err(errno)),
         };
         if (raw_bufsiz as i64) <= 0 {
-            return ReadlinkAction::Handled(Err(Errno::EINVAL));
+            return ReadlinkRes::Handled(Err(Errno::EINVAL));
         }
         if user_buf == 0 {
-            return ReadlinkAction::Handled(Err(Errno::EFAULT));
+            return ReadlinkRes::Handled(Err(Errno::EFAULT));
         }
-        if let ResolvedVirtualTarget::HostAbsolute(host_path) = target {
-            return ReadlinkAction::HostAbsolute(host_path);
-        }
-        match resolve_virtual_node_from_target(
-            target,
-            &state.mounts,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok((_, _, VirtualNode::Symlink(sym_target))) => {
-                target_out = sym_target;
-                ReadlinkAction::Handled(Ok(0))
-            }
-            Ok(_) => ReadlinkAction::Handled(Err(Errno::EINVAL)),
-            Err(errno) => ReadlinkAction::Handled(Err(errno)),
-        }
+        ReadlinkRes::from_resolved(state, target)
     })?;
+    finish_readlink_action(owner, action, user_buf, raw_bufsiz)
+}
+
+enum ReadlinkRes {
+    NotOwned,
+    HostAbsolute(Vec<u8>),
+    Handled(Result<Vec<u8>, Errno>),
+}
+
+impl ReadlinkRes {
+    fn from_resolved(state: &Step33MountState, target: ResolvedVirtualTarget) -> Self {
+        match target {
+            ResolvedVirtualTarget::HostAbsolute(host) => Self::HostAbsolute(host),
+            ResolvedVirtualTarget::MissingLeaf { .. } => Self::Handled(Err(Errno::ENOENT)),
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => {
+                if ms.kind == MemNodeKind::Symlink {
+                    match state.memfs.read_symlink(mount_id, ms.ino) {
+                        Some(t) => Self::Handled(Ok(t.to_vec())),
+                        None => Self::Handled(Err(Errno::ENOENT)),
+                    }
+                } else {
+                    Self::Handled(Err(Errno::EINVAL))
+                }
+            }
+            ResolvedVirtualTarget::Virtual {
+                node: Some(VirtualNode::Symlink(sym_target)),
+                ..
+            } => Self::Handled(Ok(sym_target)),
+            ResolvedVirtualTarget::Virtual { .. } => Self::Handled(Err(Errno::EINVAL)),
+        }
+    }
+}
+
+fn finish_readlink_action(
+    owner: ObjectId,
+    action: ReadlinkRes,
+    user_buf: u64,
+    raw_bufsiz: u64,
+) -> Result<Option<SyscallReturn>, ()> {
     match action {
-        ReadlinkAction::NotOwned => Ok(None),
-        ReadlinkAction::HostAbsolute(host_path) => {
+        ReadlinkRes::NotOwned => Ok(None),
+        ReadlinkRes::HostAbsolute(host_path) => {
             if let Some(ret) =
                 super::step33_ext4_vfs::try_readlink_host_path(&host_path, user_buf, raw_bufsiz)?
             {
@@ -2581,8 +4267,8 @@ fn handle_readlinkat_if_proc_or_sys(
                 owner, &host_path, user_buf, raw_bufsiz,
             )?)))
         }
-        ReadlinkAction::Handled(Err(errno)) => Ok(Some(SyscallReturn::error(errno))),
-        ReadlinkAction::Handled(Ok(_)) => {
+        ReadlinkRes::Handled(Err(errno)) => Ok(Some(SyscallReturn::error(errno))),
+        ReadlinkRes::Handled(Ok(target_out)) => {
             let max_len = usize::try_from(raw_bufsiz).unwrap_or(usize::MAX);
             let copy_len = target_out.len().min(max_len);
             if copy_len > 0
@@ -2595,68 +4281,93 @@ fn handle_readlinkat_if_proc_or_sys(
     }
 }
 
-fn handle_newfstatat_if_proc_or_sys(
-    dirfd: u64,
-    user_path: u64,
+enum StatRes {
+    NotOwned,
+    DevOrHost(Vec<u8>, Option<super::step_fd_util::StatMeta>),
+    Err(Errno),
+    Ok(super::step_fd_util::StatMeta),
+}
+
+fn stat_res_from_resolved(
+    state: &Step33MountState,
+    target: ResolvedVirtualTarget,
+    caller: &CallerSnapshotData,
+    follow: bool,
+) -> StatRes {
+    match target {
+        ResolvedVirtualTarget::HostAbsolute(host) => StatRes::DevOrHost(host, None),
+        ResolvedVirtualTarget::MissingLeaf { .. } => StatRes::Err(Errno::ENOENT),
+        ResolvedVirtualTarget::Virtual {
+            mount_id,
+            is_mount_root,
+            fstype,
+            abs_path,
+            rel_path,
+            node,
+            mem_stat,
+        } => {
+            if let Some(ms) = mem_stat {
+                let meta = virtual_target_stat_meta(
+                    mount_id,
+                    is_mount_root,
+                    fstype,
+                    &rel_path,
+                    Some(ms),
+                    None,
+                    follow,
+                );
+                if matches!(ms.kind, MemNodeKind::ChrDev(_) | MemNodeKind::BlkDev(_))
+                    && abs_path.starts_with(b"/dev/")
+                {
+                    return StatRes::DevOrHost(abs_path, Some(meta));
+                }
+                return StatRes::Ok(meta);
+            }
+            let node = match node {
+                Some(n) => n,
+                None => match synthesize_virtual_node(
+                    fstype,
+                    &rel_path,
+                    &state.mounts,
+                    Some(&state.fds),
+                    caller,
+                    &state.hostname[..state.hostname_len],
+                    state.boot_id_seed,
+                ) {
+                    Ok(n) => n,
+                    Err(e) => return StatRes::Err(e),
+                },
+            };
+            StatRes::Ok(virtual_target_stat_meta(
+                mount_id,
+                is_mount_root,
+                fstype,
+                &rel_path,
+                None,
+                Some(&node),
+                follow,
+            ))
+        }
+    }
+}
+
+fn finish_stat_res(
+    owner: ObjectId,
+    res: StatRes,
     user_statbuf: u64,
     flags: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
-    let owner = current_process_id()?;
-    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
-    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let caller = CallerSnapshotData::capture();
-    enum StatAction {
-        NotOwned,
-        HostAbsolute(Vec<u8>),
-        Err(Errno),
-        Ok([u8; ARM64_STAT_BYTES]),
-    }
-    let result = with_mount_state(|state| {
-        state.ensure_initialized();
-        let target = match resolve_virtual_path(
-            state,
-            &state.mounts,
-            owner,
-            dirfd,
-            user_path,
-            allow_empty,
-            follow,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok(Some(v)) => v,
-            Ok(None) => return StatAction::NotOwned,
-            Err(errno) => return StatAction::Err(errno),
-        };
-        if user_statbuf == 0 {
-            return StatAction::Err(Errno::EFAULT);
-        }
-        if let ResolvedVirtualTarget::HostAbsolute(host_path) = target {
-            return StatAction::HostAbsolute(host_path);
-        }
-        match resolve_virtual_node_from_target(
-            target,
-            &state.mounts,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok((rfs, rrel, node)) => {
-                let ino = virtual_inode(rfs, &rrel);
-                let (mode, nlink, size) = virtual_node_mode_nlink_size(&node, follow);
-                StatAction::Ok(encode_virtual_stat_with_ino_mode(ino, mode, nlink, size))
-            }
-            Err(errno) => StatAction::Err(errno),
-        }
-    })?;
-    match result {
-        StatAction::NotOwned => Ok(None),
-        StatAction::HostAbsolute(host_path) => {
-            if host_path.starts_with(b"/dev/")
-                && let Some(ret) = super::step32_dev::try_stat_dev_bytes(&host_path, user_statbuf)?
-            {
+    match res {
+        StatRes::NotOwned => Ok(None),
+        StatRes::DevOrHost(host_path, fallback_meta) => {
+            if let Some(ret) = try_delegate_dev_stat(&host_path, user_statbuf)? {
                 return Ok(Some(ret));
+            }
+            if let Some(meta) = fallback_meta {
+                return Ok(Some(encode_result(write_aarch64_stat_meta(
+                    user_statbuf,
+                    &meta,
+                ))));
             }
             if let Some(ret) =
                 super::step33_ext4_vfs::try_stat_host_path(&host_path, user_statbuf, flags)?
@@ -2670,84 +4381,30 @@ fn handle_newfstatat_if_proc_or_sys(
                 linux_unsigned_int(flags),
             )?)))
         }
-        StatAction::Err(errno) => Ok(Some(SyscallReturn::error(errno))),
-        StatAction::Ok(stat_bytes) => {
-            if let Err(errno) = copy_to_user(user_statbuf, &stat_bytes) {
-                return Ok(Some(SyscallReturn::error(errno)));
-            }
-            Ok(Some(SyscallReturn::success(0).ok_or(())?))
-        }
+        StatRes::Err(errno) => Ok(Some(SyscallReturn::error(errno))),
+        StatRes::Ok(meta) => Ok(Some(encode_result(write_aarch64_stat_meta(
+            user_statbuf,
+            &meta,
+        )))),
     }
 }
 
-fn handle_statx_if_proc_or_sys(
-    dirfd: u64,
-    user_path: u64,
-    flags: u64,
-    _mask: u64,
+fn finish_statx_res(
+    owner: ObjectId,
+    res: StatRes,
     user_statx: u64,
+    flags: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
-    let owner = current_process_id()?;
-    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
-    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let caller = CallerSnapshotData::capture();
-    enum StatxAction {
-        NotOwned,
-        HostAbsolute(Vec<u8>),
-        Err(Errno),
-        Ok([u8; ARM64_STATX_BYTES]),
-    }
-    let result = with_mount_state(|state| {
-        state.ensure_initialized();
-        let target = match resolve_virtual_path(
-            state,
-            &state.mounts,
-            owner,
-            dirfd,
-            user_path,
-            allow_empty,
-            follow,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok(Some(v)) => v,
-            Ok(None) => return StatxAction::NotOwned,
-            Err(errno) => return StatxAction::Err(errno),
-        };
-        let allowed_flags =
-            AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
-        if (flags & !allowed_flags) != 0 {
-            return StatxAction::Err(Errno::EINVAL);
-        }
-        if user_statx == 0 {
-            return StatxAction::Err(Errno::EFAULT);
-        }
-        if let ResolvedVirtualTarget::HostAbsolute(host_path) = target {
-            return StatxAction::HostAbsolute(host_path);
-        }
-        match resolve_virtual_node_from_target(
-            target,
-            &state.mounts,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok((rfs, rrel, node)) => {
-                let ino = virtual_inode(rfs, &rrel);
-                let (mode, nlink, size) = virtual_node_mode_nlink_size(&node, follow);
-                StatxAction::Ok(encode_virtual_statx(rfs, ino, mode, nlink, size))
-            }
-            Err(errno) => StatxAction::Err(errno),
-        }
-    })?;
-    match result {
-        StatxAction::NotOwned => Ok(None),
-        StatxAction::HostAbsolute(host_path) => {
-            if host_path.starts_with(b"/dev/")
-                && let Some(ret) = super::step32_dev::try_statx_dev_bytes(&host_path, user_statx)?
-            {
+    match res {
+        StatRes::NotOwned => Ok(None),
+        StatRes::DevOrHost(host_path, fallback_meta) => {
+            if let Some(ret) = try_delegate_dev_statx(&host_path, user_statx)? {
                 return Ok(Some(ret));
+            }
+            if let Some(meta) = fallback_meta {
+                return Ok(Some(encode_result(write_aarch64_statx_meta(
+                    user_statx, &meta,
+                ))));
             }
             if let Some(ret) =
                 super::step33_ext4_vfs::try_statx_host_path(&host_path, user_statx, flags)?
@@ -2761,13 +4418,151 @@ fn handle_statx_if_proc_or_sys(
                 user_statx,
             )?)))
         }
-        StatxAction::Err(errno) => Ok(Some(SyscallReturn::error(errno))),
-        StatxAction::Ok(statx_bytes) => {
-            if let Err(errno) = copy_to_user(user_statx, &statx_bytes) {
-                return Ok(Some(SyscallReturn::error(errno)));
-            }
-            Ok(Some(SyscallReturn::success(0).ok_or(())?))
+        StatRes::Err(errno) => Ok(Some(SyscallReturn::error(errno))),
+        StatRes::Ok(meta) => Ok(Some(encode_result(write_aarch64_statx_meta(
+            user_statx, &meta,
+        )))),
+    }
+}
+
+fn handle_newfstatat_if_proc_or_sys(
+    dirfd: u64,
+    user_path: u64,
+    user_statbuf: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_path(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            user_path,
+            cwd.as_deref(),
+            allow_empty,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return StatRes::NotOwned,
+            Err(errno) => return StatRes::Err(errno),
+        };
+        if user_statbuf == 0 {
+            return StatRes::Err(Errno::EFAULT);
         }
+        stat_res_from_resolved(state, target, &caller, follow)
+    })?;
+    finish_stat_res(owner, res, user_statbuf, flags)
+}
+
+fn handle_statx_if_proc_or_sys(
+    dirfd: u64,
+    user_path: u64,
+    flags: u64,
+    _mask: u64,
+    user_statx: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_path(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            user_path,
+            cwd.as_deref(),
+            allow_empty,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return StatRes::NotOwned,
+            Err(errno) => return StatRes::Err(errno),
+        };
+        let allowed_flags =
+            AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
+        if (flags & !allowed_flags) != 0 {
+            return StatRes::Err(Errno::EINVAL);
+        }
+        if user_statx == 0 {
+            return StatRes::Err(Errno::EFAULT);
+        }
+        stat_res_from_resolved(state, target, &caller, follow)
+    })?;
+    finish_statx_res(owner, res, user_statx, flags)
+}
+
+enum AccessRes {
+    NotOwned,
+    HostAbsolute(Vec<u8>),
+    Handled(Result<i64, Errno>),
+}
+
+fn access_res_from_resolved(
+    fstype: FilesystemType,
+    rel: &[u8],
+    has_mem_stat: bool,
+    mode: u64,
+) -> Result<i64, Errno> {
+    if (mode & W_OK) == 0 || has_mem_stat {
+        return Ok(0);
+    }
+    if fstype == FilesystemType::Cgroup2 && super::step35_events_cgroup::cgroup_has_dir(rel) {
+        return Ok(0);
+    }
+    if fstype == FilesystemType::Sysfs
+        && super::step37_38_systemd_udev::is_sysfs_uevent_trigger_rel(rel)
+    {
+        return Ok(0);
+    }
+    if is_cgroup_ctrl_writable(fstype, rel).is_some() {
+        return Ok(0);
+    }
+    Err(Errno::EACCES)
+}
+
+fn finish_access_res(
+    owner: ObjectId,
+    action: AccessRes,
+    mode: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    match action {
+        AccessRes::NotOwned => Ok(None),
+        AccessRes::HostAbsolute(host_path) => {
+            if host_path.starts_with(b"/dev/")
+                && super::step32_dev::try_open_dev_bytes(&host_path, O_PATH)
+                    .is_ok_and(|o| o.is_some())
+            {
+                return Ok(Some(encode_result(Ok(0))));
+            }
+            if let Some(ret) =
+                super::step33_ext4_vfs::try_access_host_path(owner, &host_path, mode, flags)?
+            {
+                return Ok(Some(ret));
+            }
+            Ok(Some(encode_result(super::step29_fd::faccessat_host_path(
+                owner, &host_path,
+            )?)))
+        }
+        AccessRes::Handled(res) => Ok(Some(encode_result(res))),
     }
 }
 
@@ -2778,13 +4573,10 @@ fn handle_faccessat_if_proc_or_sys(
     flags: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
+    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let caller = CallerSnapshotData::capture();
-    enum AccessAction {
-        NotOwned,
-        HostAbsolute(Vec<u8>),
-        Handled(Result<i64, Errno>),
-    }
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
     let action = with_mount_state(|state| {
         state.ensure_initialized();
         let target = match resolve_virtual_path(
@@ -2793,6 +4585,8 @@ fn handle_faccessat_if_proc_or_sys(
             owner,
             dirfd,
             user_path,
+            cwd.as_deref(),
+            allow_empty,
             false,
             follow,
             &caller,
@@ -2800,49 +4594,31 @@ fn handle_faccessat_if_proc_or_sys(
             state.boot_id_seed,
         ) {
             Ok(Some(v)) => v,
-            Ok(None) => return AccessAction::NotOwned,
-            Err(errno) => return AccessAction::Handled(Err(errno)),
+            Ok(None) => return AccessRes::NotOwned,
+            Err(errno) => return AccessRes::Handled(Err(errno)),
         };
-        if (mode & !ACCESS_MODE_MASK) != 0 || (flags & !(AT_SYMLINK_NOFOLLOW | 0x200)) != 0 {
-            return AccessAction::Handled(Err(Errno::EINVAL));
+        if (mode & !ACCESS_MODE_MASK) != 0
+            || (flags & !(AT_SYMLINK_NOFOLLOW | 0x200 | AT_EMPTY_PATH | AT_NO_AUTOMOUNT)) != 0
+        {
+            return AccessRes::Handled(Err(Errno::EINVAL));
         }
-        if let ResolvedVirtualTarget::HostAbsolute(host_path) = target {
-            return AccessAction::HostAbsolute(host_path);
-        }
-        match resolve_virtual_node_from_target(
-            target,
-            &state.mounts,
-            &caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok((rfs, rrel, _)) => {
-                if (mode & W_OK) != 0
-                    && !(rfs == FilesystemType::Sysfs
-                        && super::step37_38_systemd_udev::is_sysfs_uevent_trigger_rel(&rrel))
-                {
-                    AccessAction::Handled(Err(Errno::EACCES))
-                } else {
-                    AccessAction::Handled(Ok(0))
-                }
-            }
-            Err(errno) => AccessAction::Handled(Err(errno)),
+        match target {
+            ResolvedVirtualTarget::HostAbsolute(host_path) => AccessRes::HostAbsolute(host_path),
+            ResolvedVirtualTarget::MissingLeaf { .. } => AccessRes::Handled(Err(Errno::ENOENT)),
+            ResolvedVirtualTarget::Virtual {
+                fstype,
+                rel_path,
+                mem_stat,
+                ..
+            } => AccessRes::Handled(access_res_from_resolved(
+                fstype,
+                &rel_path,
+                mem_stat.is_some(),
+                mode,
+            )),
         }
     })?;
-    match action {
-        AccessAction::NotOwned => Ok(None),
-        AccessAction::HostAbsolute(host_path) => {
-            if let Some(ret) =
-                super::step33_ext4_vfs::try_access_host_path(owner, &host_path, mode, flags)?
-            {
-                return Ok(Some(ret));
-            }
-            Ok(Some(encode_result(super::step29_fd::faccessat_host_path(
-                owner, &host_path,
-            )?)))
-        }
-        AccessAction::Handled(res) => Ok(Some(encode_result(res))),
-    }
+    finish_access_res(owner, action, mode, flags)
 }
 
 fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()> {
@@ -2853,35 +4629,1726 @@ fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()
     let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
         return Ok(Err(Errno::EBADF));
     };
-    let stat_res = with_mount_state(|state| {
-        let Some(entry) = resolve_proc_sys_entry_mut(state, owner, idx, alias_gen) else {
+    let meta = with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
             return Err(Errno::EBADF);
         };
+        let is_mount_root = entry.rel_path.is_empty();
+        if entry.mem_ino != 0 {
+            let ms = state
+                .memfs
+                .stat_ino(entry.mount_id, entry.mem_ino)
+                .ok_or(Errno::EBADF)?;
+            return Ok(virtual_target_stat_meta(
+                entry.mount_id,
+                is_mount_root,
+                entry.fstype,
+                &entry.rel_path,
+                Some(ms),
+                None,
+                false,
+            ));
+        }
+        let dev = entry.fstype.st_dev(entry.mount_id);
         let ino = virtual_inode(entry.fstype, &entry.rel_path);
-        if entry.is_dir {
-            Ok(encode_virtual_stat_with_ino_mode(
-                ino,
-                S_IFDIR_RX_MODE,
-                2,
-                0,
-            ))
+        let (mode, nlink, size) = if entry.is_dir {
+            (S_IFDIR_RX_MODE, 2, 0)
         } else {
-            Ok(encode_virtual_stat_with_ino_mode(
-                ino,
-                S_IFREG_RO_MODE,
-                1,
-                entry.content.len() as u64,
-            ))
+            (S_IFREG_RO_MODE, 1, entry.content.len() as u64)
+        };
+        Ok(super::step_fd_util::StatMeta {
+            dev,
+            ino,
+            mode,
+            nlink,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            size,
+            blksize: 4096,
+            blocks: size.div_ceil(512),
+            atime_sec: i64::from(EPOCH_BASE_SECONDS),
+            atime_nsec: 0,
+            mtime_sec: i64::from(EPOCH_BASE_SECONDS),
+            mtime_nsec: 0,
+            ctime_sec: i64::from(EPOCH_BASE_SECONDS),
+            ctime_nsec: 0,
+            mnt_id: entry.mount_id,
+            is_mount_root,
+        })
+    })?;
+    match meta {
+        Ok(m) => Ok(write_aarch64_stat_meta(user_statbuf, &m)),
+        Err(errno) => Ok(Err(errno)),
+    }
+}
+
+fn read_user_path_vec(user_path: u64) -> Result<Vec<u8>, Errno> {
+    let mut buf = vec![0u8; LINUX_PATH_MAX];
+    let len = read_user_cstr(user_path, &mut buf)?;
+    buf.truncate(len);
+    Ok(buf)
+}
+
+fn mkdir_resolved(
+    state: &mut Step33MountState,
+    target: ResolvedVirtualTarget,
+    mode: u64,
+    uid: u32,
+    gid: u32,
+    now: u32,
+) -> Result<i64, Errno> {
+    match target {
+        ResolvedVirtualTarget::Virtual { .. } => Err(Errno::EEXIST),
+        ResolvedVirtualTarget::HostAbsolute(_) => Err(Errno::EROFS),
+        ResolvedVirtualTarget::MissingLeaf {
+            mount_id,
+            fstype,
+            parent_ino,
+            parent_rel,
+            leaf,
+            ..
+        } => {
+            if is_memfs_fstype(fstype) {
+                state.memfs.mkdir(
+                    mount_id,
+                    parent_ino,
+                    &leaf,
+                    (mode as u32) & 0o7777,
+                    uid,
+                    gid,
+                    now,
+                )?;
+                return Ok(0);
+            }
+            if fstype == FilesystemType::Cgroup2
+                || (fstype == FilesystemType::Sysfs
+                    && (parent_rel == b"fs/cgroup" || parent_rel.starts_with(b"fs/cgroup/")))
+            {
+                let sub_parent = parent_rel.strip_prefix(b"fs/cgroup").unwrap_or(&parent_rel);
+                let sub_clean = sub_parent.strip_prefix(b"/").unwrap_or(sub_parent);
+                let full_cg = join_rel(sub_clean, &leaf);
+                super::step35_events_cgroup::cgroup_mkdir_strict(&full_cg)?;
+                return Ok(0);
+            }
+            Err(Errno::EROFS)
+        }
+    }
+}
+
+fn handle_mkdirat_virtual(
+    dirfd: u64,
+    user_path: u64,
+    mode: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let Ok(raw) = read_user_path_vec(user_path) else {
+        return Ok(None);
+    };
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let trimmed = if raw.len() > 1 && raw.ends_with(b"/") {
+        let mut s = raw.as_slice();
+        while s.len() > 1 && s.ends_with(b"/") {
+            s = &s[..s.len() - 1];
+        }
+        s.to_vec()
+    } else {
+        raw
+    };
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            &trimmed,
+            cwd.as_deref(),
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(mkdir_resolved(state, target, mode, uid, gid, now))
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn unlink_resolved(
+    state: &mut Step33MountState,
+    target: ResolvedVirtualTarget,
+    remove_dir: bool,
+) -> Result<i64, Errno> {
+    match target {
+        ResolvedVirtualTarget::MissingLeaf { .. } => Err(Errno::ENOENT),
+        ResolvedVirtualTarget::HostAbsolute(_) => Err(Errno::EROFS),
+        ResolvedVirtualTarget::Virtual {
+            mount_id,
+            is_mount_root,
+            fstype,
+            rel_path,
+            mem_stat,
+            ..
+        } => {
+            if is_mount_root {
+                return Err(Errno::EBUSY);
+            }
+            if let Some(ms) = mem_stat {
+                let parent = state
+                    .memfs
+                    .parent_ino(mount_id, ms.ino)
+                    .ok_or(Errno::EBUSY)?;
+                let leaf = match rel_path.iter().rposition(|&b| b == b'/') {
+                    Some(pos) => &rel_path[pos + 1..],
+                    None => &rel_path,
+                };
+                state.memfs.unlink(mount_id, parent, leaf, remove_dir)?;
+                return Ok(0);
+            }
+            if remove_dir
+                && (fstype == FilesystemType::Cgroup2
+                    || (fstype == FilesystemType::Sysfs && rel_path.starts_with(b"fs/cgroup/")))
+            {
+                let cg_rel = rel_path.strip_prefix(b"fs/cgroup/").unwrap_or(&rel_path);
+                super::step35_events_cgroup::cgroup_rmdir(cg_rel)?;
+                return Ok(0);
+            }
+            Err(Errno::EPERM)
+        }
+    }
+}
+
+fn handle_unlinkat_virtual(
+    dirfd: u64,
+    user_path: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !AT_REMOVEDIR) != 0 {
+        return Ok(None);
+    }
+    let owner = current_process_id()?;
+    let Ok(raw) = read_user_path_vec(user_path) else {
+        return Ok(None);
+    };
+    let remove_dir = (flags & AT_REMOVEDIR) != 0;
+    let trimmed = if remove_dir && raw.len() > 1 && raw.ends_with(b"/") {
+        let mut s = raw.as_slice();
+        while s.len() > 1 && s.ends_with(b"/") {
+            s = &s[..s.len() - 1];
+        }
+        s.to_vec()
+    } else {
+        raw
+    };
+    let caller = CallerSnapshotData::capture();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            &trimmed,
+            cwd.as_deref(),
+            false,
+            false,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(unlink_resolved(state, target, remove_dir))
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn symlink_resolved(
+    state: &mut Step33MountState,
+    target: ResolvedVirtualTarget,
+    link_target: &[u8],
+    uid: u32,
+    gid: u32,
+    now: u32,
+) -> Result<i64, Errno> {
+    match target {
+        ResolvedVirtualTarget::Virtual { .. } => Err(Errno::EEXIST),
+        ResolvedVirtualTarget::HostAbsolute(_) => Err(Errno::EROFS),
+        ResolvedVirtualTarget::MissingLeaf {
+            mount_id,
+            fstype,
+            parent_ino,
+            leaf,
+            trailing_slash,
+            ..
+        } => {
+            if trailing_slash {
+                return Err(Errno::ENOENT);
+            }
+            if !is_memfs_fstype(fstype) {
+                return Err(Errno::EROFS);
+            }
+            state
+                .memfs
+                .symlink(mount_id, parent_ino, &leaf, link_target, uid, gid, now)?;
+            Ok(0)
+        }
+    }
+}
+
+fn parse_proc_fd_number(path: &[u8], caller_pid: u32) -> Option<u64> {
+    let rest = if let Some(r) = path.strip_prefix(b"/proc/self/fd/") {
+        r
+    } else if let Some(r) = path.strip_prefix(b"/proc/") {
+        let pid_end = r.iter().position(|&b| b == b'/')?;
+        let pid_val = parse_u32_decimal(&r[..pid_end])?;
+        if pid_val != caller_pid {
+            return None;
+        }
+        r[pid_end..].strip_prefix(b"/fd/")?
+    } else {
+        return None;
+    };
+    if rest.is_empty() || rest.contains(&b'/') {
+        return None;
+    }
+    parse_u32_decimal(rest).map(u64::from)
+}
+
+fn handle_linkat_virtual(
+    olddirfd: u64,
+    user_oldpath: u64,
+    newdirfd: u64,
+    user_newpath: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH)) != 0 {
+        return Ok(Some(encode_result(Err(Errno::EINVAL))));
+    }
+    let owner = current_process_id()?;
+    let Ok(oldpath) = read_user_path_vec(user_oldpath) else {
+        return Ok(None);
+    };
+    let Ok(newpath) = read_user_path_vec(user_newpath) else {
+        return Ok(None);
+    };
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let new_cwd = cwd_if_at_fdcwd(owner, newdirfd);
+    let proc_fd_opt = if oldpath.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        Some(olddirfd)
+    } else {
+        parse_proc_fd_number(&oldpath, caller.pid)
+    };
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let src_pair = if let Some(raw_fd) = proc_fd_opt {
+            if !is_proc_sys_fd(raw_fd) && !is_aliased_proc_sys_fd(raw_fd) {
+                return None;
+            }
+            let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
+                return Some(Err(Errno::EBADF));
+            };
+            let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+                return Some(Err(Errno::EBADF));
+            };
+            if entry.mem_ino == 0 {
+                return Some(Err(Errno::EPERM));
+            }
+            (entry.mount_id, entry.mem_ino)
+        } else {
+            return None;
+        };
+
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            newdirfd,
+            &newpath,
+            new_cwd.as_deref(),
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Some(Err(Errno::EXDEV)),
+            Err(e) => return Some(Err(e)),
+        };
+        match target {
+            ResolvedVirtualTarget::Virtual { .. } => Some(Err(Errno::EEXIST)),
+            ResolvedVirtualTarget::HostAbsolute(_) => Some(Err(Errno::EXDEV)),
+            ResolvedVirtualTarget::MissingLeaf {
+                mount_id,
+                fstype,
+                parent_ino,
+                leaf,
+                trailing_slash,
+                ..
+            } => {
+                if trailing_slash {
+                    return Some(Err(Errno::ENOENT));
+                }
+                if !is_memfs_fstype(fstype) {
+                    return Some(Err(Errno::EROFS));
+                }
+                if mount_id != src_pair.0 {
+                    return Some(Err(Errno::EXDEV));
+                }
+                Some(
+                    state
+                        .memfs
+                        .link_node(mount_id, src_pair.1, parent_ino, &leaf, now)
+                        .map(|()| 0),
+                )
+            }
         }
     })?;
-    let stat_bytes = match stat_res {
-        Ok(s) => s,
-        Err(errno) => return Ok(Err(errno)),
+    Ok(res.map(encode_result))
+}
+
+fn handle_symlinkat_virtual(
+    user_target: u64,
+    newdirfd: u64,
+    user_linkpath: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let Ok(linkpath) = read_user_path_vec(user_linkpath) else {
+        return Ok(None);
     };
-    if let Err(errno) = copy_to_user(user_statbuf, &stat_bytes) {
-        return Ok(Err(errno));
+    let Ok(link_target) = read_user_path_vec(user_target) else {
+        return Ok(None);
+    };
+    if link_target.is_empty() {
+        return Ok(None);
     }
-    Ok(Ok(0))
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, newdirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            newdirfd,
+            &linkpath,
+            cwd.as_deref(),
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(symlink_resolved(state, target, &link_target, uid, gid, now))
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn mknod_resolved(
+    state: &mut Step33MountState,
+    target: ResolvedVirtualTarget,
+    mode: u64,
+    dev: u64,
+    uid: u32,
+    gid: u32,
+    now: u32,
+) -> Result<i64, Errno> {
+    match target {
+        ResolvedVirtualTarget::Virtual { .. } => Err(Errno::EEXIST),
+        ResolvedVirtualTarget::HostAbsolute(_) => Err(Errno::EROFS),
+        ResolvedVirtualTarget::MissingLeaf {
+            mount_id,
+            fstype,
+            parent_ino,
+            leaf,
+            trailing_slash,
+            ..
+        } => {
+            if trailing_slash {
+                return Err(Errno::ENOENT);
+            }
+            if !is_memfs_fstype(fstype) {
+                return Err(Errno::EROFS);
+            }
+            state
+                .memfs
+                .mknod(mount_id, parent_ino, &leaf, mode as u32, dev, uid, gid, now)?;
+            Ok(0)
+        }
+    }
+}
+
+fn handle_mknodat_virtual(
+    dirfd: u64,
+    user_path: u64,
+    mode: u64,
+    dev: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let Ok(raw) = read_user_path_vec(user_path) else {
+        return Ok(None);
+    };
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            &raw,
+            cwd.as_deref(),
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(mknod_resolved(state, target, mode, dev, uid, gid, now))
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn trim_trailing_slash(raw: &[u8]) -> &[u8] {
+    let mut s = raw;
+    while s.len() > 1 && s.ends_with(b"/") {
+        s = &s[..s.len() - 1];
+    }
+    s
+}
+
+fn rename_resolved(
+    state: &mut Step33MountState,
+    old_t: Option<ResolvedVirtualTarget>,
+    new_t: Option<ResolvedVirtualTarget>,
+    noreplace: bool,
+    now: u32,
+) -> Option<Result<i64, Errno>> {
+    match (old_t, new_t) {
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => Some(Err(Errno::EXDEV)),
+        (Some(ot), Some(nt)) => {
+            let (old_mount, old_parent, old_leaf) = match ot {
+                ResolvedVirtualTarget::Virtual {
+                    mount_id,
+                    is_mount_root,
+                    rel_path,
+                    mem_stat: Some(ms),
+                    ..
+                } => {
+                    if is_mount_root {
+                        return Some(Err(Errno::EBUSY));
+                    }
+                    let Some(p) = state.memfs.parent_ino(mount_id, ms.ino) else {
+                        return Some(Err(Errno::EBUSY));
+                    };
+                    let leaf = match rel_path.iter().rposition(|&b| b == b'/') {
+                        Some(pos) => rel_path[pos + 1..].to_vec(),
+                        None => rel_path,
+                    };
+                    (mount_id, p, leaf)
+                }
+                ResolvedVirtualTarget::MissingLeaf { .. } => return Some(Err(Errno::ENOENT)),
+                _ => return Some(Err(Errno::EXDEV)),
+            };
+            let (new_mount, new_parent, new_leaf) = match nt {
+                ResolvedVirtualTarget::Virtual {
+                    mount_id,
+                    is_mount_root,
+                    rel_path,
+                    mem_stat: Some(ms),
+                    ..
+                } => {
+                    if is_mount_root {
+                        return Some(Err(Errno::EBUSY));
+                    }
+                    let Some(p) = state.memfs.parent_ino(mount_id, ms.ino) else {
+                        return Some(Err(Errno::EBUSY));
+                    };
+                    let leaf = match rel_path.iter().rposition(|&b| b == b'/') {
+                        Some(pos) => rel_path[pos + 1..].to_vec(),
+                        None => rel_path,
+                    };
+                    (mount_id, p, leaf)
+                }
+                ResolvedVirtualTarget::MissingLeaf {
+                    mount_id,
+                    fstype,
+                    parent_ino,
+                    leaf,
+                    ..
+                } => {
+                    if !is_memfs_fstype(fstype) {
+                        return Some(Err(Errno::EXDEV));
+                    }
+                    (mount_id, parent_ino, leaf)
+                }
+                _ => return Some(Err(Errno::EXDEV)),
+            };
+            if old_mount != new_mount {
+                return Some(Err(Errno::EXDEV));
+            }
+            Some(
+                state
+                    .memfs
+                    .rename(
+                        old_mount, old_parent, &old_leaf, new_parent, &new_leaf, noreplace, now,
+                    )
+                    .map(|()| 0),
+            )
+        }
+    }
+}
+
+fn handle_renameat_virtual(
+    olddirfd: u64,
+    user_oldpath: u64,
+    newdirfd: u64,
+    user_newpath: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !RENAME_NOREPLACE) != 0 {
+        return Ok(None);
+    }
+    let owner = current_process_id()?;
+    let Ok(old_raw) = read_user_path_vec(user_oldpath) else {
+        return Ok(None);
+    };
+    let Ok(new_raw) = read_user_path_vec(user_newpath) else {
+        return Ok(None);
+    };
+    let noreplace = (flags & RENAME_NOREPLACE) != 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let old_cwd = cwd_if_at_fdcwd(owner, olddirfd);
+    let new_cwd = cwd_if_at_fdcwd(owner, newdirfd);
+    let old_trimmed = trim_trailing_slash(&old_raw);
+    let new_trimmed = trim_trailing_slash(&new_raw);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let old_res = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            olddirfd,
+            old_trimmed,
+            old_cwd.as_deref(),
+            false,
+            false,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        );
+        let old_opt = match old_res {
+            Ok(o) => o,
+            Err(e) => return Some(Err(e)),
+        };
+        let new_res = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            newdirfd,
+            new_trimmed,
+            new_cwd.as_deref(),
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        );
+        let new_opt = match new_res {
+            Ok(o) => o,
+            Err(e) => {
+                if old_opt.is_none() {
+                    return None;
+                }
+                return Some(Err(e));
+            }
+        };
+        rename_resolved(state, old_opt, new_opt, noreplace, now)
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn handle_truncate_virtual(user_path: u64, length: i64) -> Result<Option<SyscallReturn>, ()> {
+    if length < 0 {
+        return Ok(None);
+    }
+    let owner = current_process_id()?;
+    let Ok(raw) = read_user_path_vec(user_path) else {
+        return Ok(None);
+    };
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, AT_FDCWD_I32 as u64);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            &raw,
+            cwd.as_deref(),
+            false,
+            false,
+            true,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => Some(
+                state
+                    .memfs
+                    .truncate(mount_id, ms.ino, length as usize, now)
+                    .map(|()| 0),
+            ),
+            ResolvedVirtualTarget::Virtual { .. } => Some(Err(Errno::EACCES)),
+            ResolvedVirtualTarget::MissingLeaf { .. } => Some(Err(Errno::ENOENT)),
+            ResolvedVirtualTarget::HostAbsolute(_) => None,
+        }
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn handle_ftruncate(raw_fd: u64, length: i64) -> Result<Result<i64, Errno>, ()> {
+    if length < 0 {
+        return Ok(Err(Errno::EINVAL));
+    }
+    let owner = current_process_id()?;
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
+        return Ok(Err(Errno::EBADF));
+    };
+    let now = current_epoch_now_secs();
+    with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.path_only || !entry.writable {
+            return Err(Errno::EINVAL);
+        }
+        if entry.is_dir {
+            return Err(Errno::EISDIR);
+        }
+        if entry.mem_ino != 0 {
+            state
+                .memfs
+                .truncate(entry.mount_id, entry.mem_ino, length as usize, now)?;
+            return Ok(0);
+        }
+        Err(Errno::EINVAL)
+    })
+}
+
+fn handle_fchmod(raw_fd: u64, raw_mode: u64) -> Result<Result<i64, Errno>, ()> {
+    let owner = current_process_id()?;
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
+        return Ok(Err(Errno::EBADF));
+    };
+    let now = current_epoch_now_secs();
+    with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.path_only {
+            return Err(Errno::EBADF);
+        }
+        if entry.mem_ino != 0 {
+            state
+                .memfs
+                .chmod(entry.mount_id, entry.mem_ino, raw_mode as u32, now)?;
+            return Ok(0);
+        }
+        Ok(0)
+    })
+}
+
+fn handle_fchmodat_virtual(
+    dirfd: u64,
+    user_path: u64,
+    raw_mode: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+        return Ok(None);
+    }
+    let owner = current_process_id()?;
+    let Ok(raw) = read_user_path_vec(user_path) else {
+        return Ok(None);
+    };
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            &raw,
+            cwd.as_deref(),
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => Some(
+                state
+                    .memfs
+                    .chmod(mount_id, ms.ino, raw_mode as u32, now)
+                    .map(|()| 0),
+            ),
+            ResolvedVirtualTarget::Virtual { .. } => Some(Ok(0)),
+            ResolvedVirtualTarget::MissingLeaf { .. } => Some(Err(Errno::ENOENT)),
+            ResolvedVirtualTarget::HostAbsolute(_) => None,
+        }
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn handle_fchown(raw_fd: u64, raw_uid: u64, raw_gid: u64) -> Result<Result<i64, Errno>, ()> {
+    let owner = current_process_id()?;
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
+        return Ok(Err(Errno::EBADF));
+    };
+    let now = current_epoch_now_secs();
+    with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.path_only {
+            return Err(Errno::EBADF);
+        }
+        if entry.mem_ino != 0 {
+            state.memfs.chown(
+                entry.mount_id,
+                entry.mem_ino,
+                decode_chown_id(raw_uid),
+                decode_chown_id(raw_gid),
+                now,
+            )?;
+        }
+        Ok(0)
+    })
+}
+
+fn handle_fchownat_virtual(
+    dirfd: u64,
+    user_path: u64,
+    raw_uid: u64,
+    raw_gid: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_path(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            user_path,
+            cwd.as_deref(),
+            allow_empty,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => Some(
+                state
+                    .memfs
+                    .chown(
+                        mount_id,
+                        ms.ino,
+                        decode_chown_id(raw_uid),
+                        decode_chown_id(raw_gid),
+                        now,
+                    )
+                    .map(|()| 0),
+            ),
+            ResolvedVirtualTarget::Virtual { .. } => Some(Ok(0)),
+            ResolvedVirtualTarget::MissingLeaf { .. } => Some(Err(Errno::ENOENT)),
+            ResolvedVirtualTarget::HostAbsolute(_) => None,
+        }
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn handle_utimensat_virtual(
+    dirfd: u64,
+    user_path: u64,
+    user_times: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let owner = current_process_id()?;
+    let now = current_epoch_now_secs();
+    if user_path == 0 {
+        if !is_proc_sys_fd(dirfd) && !is_aliased_proc_sys_fd(dirfd) {
+            return Ok(None);
+        }
+        let (atime, mtime) = match parse_utimens_pair(user_times, now) {
+            Ok(v) => v,
+            Err(e) => return Ok(Some(SyscallReturn::error(e))),
+        };
+        let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, dirfd) else {
+            return Ok(Some(SyscallReturn::error(Errno::EBADF)));
+        };
+        let res = with_mount_state(|state| {
+            let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+                return Err(Errno::EBADF);
+            };
+            if entry.mem_ino != 0 {
+                state
+                    .memfs
+                    .utimens(entry.mount_id, entry.mem_ino, atime, mtime, now)?;
+            }
+            Ok(0)
+        })?;
+        return Ok(Some(encode_result(res)));
+    }
+    let Ok(raw) = read_user_path_vec(user_path) else {
+        return Ok(None);
+    };
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            &raw,
+            cwd.as_deref(),
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return None,
+            Err(e) => return Some(Err(e)),
+        };
+        let (atime, mtime) = match parse_utimens_pair(user_times, now) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => Some(
+                state
+                    .memfs
+                    .utimens(mount_id, ms.ino, atime, mtime, now)
+                    .map(|()| 0),
+            ),
+            ResolvedVirtualTarget::Virtual { .. } => Some(Ok(0)),
+            ResolvedVirtualTarget::MissingLeaf { .. } => Some(Err(Errno::ENOENT)),
+            ResolvedVirtualTarget::HostAbsolute(_) => None,
+        }
+    })?;
+    Ok(res.map(encode_result))
+}
+
+fn handle_name_to_handle_at(
+    dirfd: u64,
+    user_path: u64,
+    user_handle: u64,
+    user_mnt_id: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW | 0x200)) != 0 {
+        return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+    }
+    let owner = current_process_id()?;
+    let allow_empty = (flags & AT_EMPTY_PATH) != 0;
+    let follow = (flags & AT_SYMLINK_FOLLOW) != 0;
+    let caller = CallerSnapshotData::capture();
+    let cwd = cwd_if_at_fdcwd(owner, dirfd);
+    enum HandleRes {
+        NotOwned,
+        Host(Vec<u8>),
+        Virtual(u64, u32),
+        Err(Errno),
+    }
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_path(
+            state,
+            &state.mounts,
+            owner,
+            dirfd,
+            user_path,
+            cwd.as_deref(),
+            allow_empty,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return HandleRes::NotOwned,
+            Err(e) => return HandleRes::Err(e),
+        };
+        match target {
+            ResolvedVirtualTarget::HostAbsolute(h) => HandleRes::Host(h),
+            ResolvedVirtualTarget::MissingLeaf { .. } => HandleRes::Err(Errno::ENOENT),
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                fstype,
+                rel_path,
+                mem_stat,
+                ..
+            } => {
+                let ino = match mem_stat {
+                    Some(ms) => ms.ino,
+                    None => virtual_inode(fstype, &rel_path),
+                };
+                HandleRes::Virtual(ino, mount_id)
+            }
+        }
+    })?;
+    match res {
+        HandleRes::NotOwned => Ok(None),
+        HandleRes::Err(e) => Ok(Some(SyscallReturn::error(e))),
+        HandleRes::Virtual(ino, mnt_id) => Ok(Some(encode_result(write_linux_file_handle(
+            user_handle,
+            user_mnt_id,
+            ino,
+            mnt_id,
+        )))),
+        HandleRes::Host(host_path) => {
+            if let Some(ret) = super::step33_ext4_vfs::try_name_to_handle_host_path(
+                owner,
+                &host_path,
+                user_handle,
+                user_mnt_id,
+                flags,
+            )? {
+                return Ok(Some(ret));
+            }
+            Ok(Some(encode_result(write_linux_file_handle(
+                user_handle,
+                user_mnt_id,
+                virtual_inode(FilesystemType::Initramfs, &host_path),
+                1,
+            ))))
+        }
+    }
+}
+
+pub(super) fn is_virtual_dir(owner: ObjectId, abs_path: &[u8]) -> Result<bool, Errno> {
+    let caller = CallerSnapshotData::capture();
+    with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            true,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mem_stat: Some(ms), ..
+            } => Ok(ms.kind == MemNodeKind::Dir),
+            ResolvedVirtualTarget::Virtual { node: Some(n), .. } => {
+                Ok(matches!(n, VirtualNode::Directory(_)))
+            }
+            ResolvedVirtualTarget::Virtual { node: None, .. } => Ok(true),
+            _ => Err(Errno::ENOENT),
+        }
+    })
+    .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn try_open_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    flags: u64,
+    mode: u64,
+) -> Result<SyscallReturn, ()> {
+    let Ok(_guard) = CrossFsDepthGuard::enter() else {
+        return Ok(SyscallReturn::error(Errno::ELOOP));
+    };
+    let follow = (flags & O_NOFOLLOW) == 0 && ((flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL));
+    let stop_at_missing = (flags & O_CREAT) != 0 && (flags & O_PATH) == 0;
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let action = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            stop_at_missing,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Ok((Some(abs_path.to_vec()), Err(Errno::ENOENT))),
+            Err(e) => return Ok((None, Err(e))),
+        };
+        open_virtual_resolved(state, owner, target, flags, mode, &caller, uid, gid, now)
+    })?;
+    finish_open_action(owner, action?, flags, mode)
+}
+
+pub(super) fn try_stat_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    flags: u64,
+    user_statbuf: u64,
+) -> Result<SyscallReturn, ()> {
+    let Ok(_guard) = CrossFsDepthGuard::enter() else {
+        return Ok(SyscallReturn::error(Errno::ELOOP));
+    };
+    if user_statbuf == 0 {
+        return Ok(SyscallReturn::error(Errno::EFAULT));
+    }
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => stat_res_from_resolved(state, v, &caller, follow),
+            Ok(None) => StatRes::DevOrHost(abs_path.to_vec(), None),
+            Err(e) => StatRes::Err(e),
+        }
+    })?;
+    Ok(finish_stat_res(owner, res, user_statbuf, flags)?
+        .unwrap_or(SyscallReturn::error(Errno::ENOENT)))
+}
+
+pub(super) fn try_statx_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    flags: u64,
+    user_statx: u64,
+) -> Result<SyscallReturn, ()> {
+    let Ok(_guard) = CrossFsDepthGuard::enter() else {
+        return Ok(SyscallReturn::error(Errno::ELOOP));
+    };
+    if user_statx == 0 {
+        return Ok(SyscallReturn::error(Errno::EFAULT));
+    }
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => stat_res_from_resolved(state, v, &caller, follow),
+            Ok(None) => StatRes::DevOrHost(abs_path.to_vec(), None),
+            Err(e) => StatRes::Err(e),
+        }
+    })?;
+    Ok(finish_statx_res(owner, res, user_statx, flags)?
+        .unwrap_or(SyscallReturn::error(Errno::ENOENT)))
+}
+
+pub(super) fn try_readlink_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    user_buf: u64,
+    raw_bufsiz: u64,
+) -> Result<SyscallReturn, ()> {
+    let Ok(_guard) = CrossFsDepthGuard::enter() else {
+        return Ok(SyscallReturn::error(Errno::ELOOP));
+    };
+    let caller = CallerSnapshotData::capture();
+    let action = with_mount_state(|state| {
+        state.ensure_initialized();
+        match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(v)) => ReadlinkRes::from_resolved(state, v),
+            Ok(None) => ReadlinkRes::Handled(Err(Errno::ENOENT)),
+            Err(e) => ReadlinkRes::Handled(Err(e)),
+        }
+    })?;
+    Ok(finish_readlink_action(owner, action, user_buf, raw_bufsiz)?
+        .unwrap_or(SyscallReturn::error(Errno::ENOENT)))
+}
+
+pub(super) fn try_access_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    mode: u64,
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    let Ok(_guard) = CrossFsDepthGuard::enter() else {
+        return Ok(SyscallReturn::error(Errno::ELOOP));
+    };
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let action = with_mount_state(|state| {
+        state.ensure_initialized();
+        match resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        ) {
+            Ok(Some(ResolvedVirtualTarget::HostAbsolute(h))) => AccessRes::HostAbsolute(h),
+            Ok(Some(ResolvedVirtualTarget::MissingLeaf { .. })) | Ok(None) => {
+                AccessRes::Handled(Err(Errno::ENOENT))
+            }
+            Ok(Some(ResolvedVirtualTarget::Virtual {
+                fstype,
+                rel_path,
+                mem_stat,
+                ..
+            })) => AccessRes::Handled(access_res_from_resolved(
+                fstype,
+                &rel_path,
+                mem_stat.is_some(),
+                mode,
+            )),
+            Err(e) => AccessRes::Handled(Err(e)),
+        }
+    })?;
+    Ok(finish_access_res(owner, action, mode, flags)?
+        .unwrap_or(SyscallReturn::error(Errno::ENOENT)))
+}
+
+pub(super) fn try_mkdir_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    mode: u64,
+) -> Result<SyscallReturn, ()> {
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            trim_trailing_slash(abs_path),
+            None,
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        mkdir_resolved(state, target, mode, uid, gid, now)
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_unlink_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    let remove_dir = (flags & AT_REMOVEDIR) != 0;
+    let path = if remove_dir {
+        trim_trailing_slash(abs_path)
+    } else {
+        abs_path
+    };
+    let caller = CallerSnapshotData::capture();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            path,
+            None,
+            false,
+            false,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        unlink_resolved(state, target, remove_dir)
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_symlink_virtual_abs(
+    owner: ObjectId,
+    link_target: &[u8],
+    abs_path: &[u8],
+) -> Result<SyscallReturn, ()> {
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        symlink_resolved(state, target, link_target, uid, gid, now)
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_mknod_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    mode: u64,
+    dev: u64,
+) -> Result<SyscallReturn, ()> {
+    let caller = CallerSnapshotData::capture();
+    let (uid, gid) = current_uid_gid();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        mknod_resolved(state, target, mode, dev, uid, gid, now)
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_rename_virtual_abs(
+    owner: ObjectId,
+    old_abs: &[u8],
+    new_abs: &[u8],
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    if (flags & !RENAME_NOREPLACE) != 0 {
+        return Ok(SyscallReturn::error(Errno::EINVAL));
+    }
+    let noreplace = (flags & RENAME_NOREPLACE) != 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let ot = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            trim_trailing_slash(old_abs),
+            None,
+            false,
+            false,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?;
+        let nt = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            trim_trailing_slash(new_abs),
+            None,
+            false,
+            true,
+            false,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?;
+        rename_resolved(state, ot, nt, noreplace, now).unwrap_or(Err(Errno::EXDEV))
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_truncate_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    length: i64,
+) -> Result<SyscallReturn, ()> {
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            true,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => state
+                .memfs
+                .truncate(mount_id, ms.ino, length as usize, now)
+                .map(|()| 0),
+            ResolvedVirtualTarget::Virtual { .. } => Err(Errno::EACCES),
+            _ => Err(Errno::ENOENT),
+        }
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_chmod_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    raw_mode: u64,
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => state
+                .memfs
+                .chmod(mount_id, ms.ino, raw_mode as u32, now)
+                .map(|()| 0),
+            ResolvedVirtualTarget::Virtual { .. } => Ok(0),
+            _ => Err(Errno::ENOENT),
+        }
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_chown_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    raw_uid: u64,
+    raw_gid: u64,
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => state
+                .memfs
+                .chown(
+                    mount_id,
+                    ms.ino,
+                    decode_chown_id(raw_uid),
+                    decode_chown_id(raw_gid),
+                    now,
+                )
+                .map(|()| 0),
+            ResolvedVirtualTarget::Virtual { .. } => Ok(0),
+            _ => Err(Errno::ENOENT),
+        }
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_utimens_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    atime: Option<u32>,
+    mtime: Option<u32>,
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let caller = CallerSnapshotData::capture();
+    let now = current_epoch_now_secs();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                mem_stat: Some(ms),
+                ..
+            } => state
+                .memfs
+                .utimens(mount_id, ms.ino, atime, mtime, now)
+                .map(|()| 0),
+            ResolvedVirtualTarget::Virtual { .. } => Ok(0),
+            _ => Err(Errno::ENOENT),
+        }
+    })?;
+    Ok(encode_result(res))
+}
+
+pub(super) fn try_name_to_handle_virtual_abs(
+    owner: ObjectId,
+    abs_path: &[u8],
+    user_handle: u64,
+    user_mnt_id: u64,
+    flags: u64,
+) -> Result<SyscallReturn, ()> {
+    let Ok(_guard) = CrossFsDepthGuard::enter() else {
+        return Ok(SyscallReturn::error(Errno::ELOOP));
+    };
+    let follow = (flags & AT_SYMLINK_FOLLOW) != 0;
+    let caller = CallerSnapshotData::capture();
+    let res = with_mount_state(|state| {
+        state.ensure_initialized();
+        let target = resolve_virtual_bytes(
+            state,
+            &state.mounts,
+            owner,
+            AT_FDCWD_I32 as u64,
+            abs_path,
+            None,
+            false,
+            false,
+            follow,
+            &caller,
+            &state.hostname[..state.hostname_len],
+            state.boot_id_seed,
+        )?
+        .ok_or(Errno::ENOENT)?;
+        match target {
+            ResolvedVirtualTarget::Virtual {
+                mount_id,
+                fstype,
+                rel_path,
+                mem_stat,
+                ..
+            } => Ok((
+                match mem_stat {
+                    Some(ms) => ms.ino,
+                    None => virtual_inode(fstype, &rel_path),
+                },
+                mount_id,
+            )),
+            _ => Err(Errno::ENOENT),
+        }
+    })?;
+    Ok(match res {
+        Ok((ino, mnt_id)) => encode_result(write_linux_file_handle(
+            user_handle,
+            user_mnt_id,
+            ino,
+            mnt_id,
+        )),
+        Err(e) => SyscallReturn::error(e),
+    })
 }
 
 fn build_proc_partitions() -> Vec<u8> {
@@ -2981,45 +6448,6 @@ fn handle_sethostname(user_name: u64, len: u64) -> Result<Result<i64, Errno>, ()
         state.hostname_len = n;
         Ok(0)
     })
-}
-
-fn encode_virtual_stat_with_ino_mode(
-    ino: u64,
-    mode: u32,
-    nlink: u32,
-    size: u64,
-) -> [u8; ARM64_STAT_BYTES] {
-    let mut buf = [0u8; ARM64_STAT_BYTES];
-    buf[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
-    buf[16..20].copy_from_slice(&mode.to_le_bytes()); // st_mode
-    buf[20..24].copy_from_slice(&nlink.to_le_bytes()); // st_nlink
-    buf[48..56].copy_from_slice(&(size as i64).to_le_bytes()); // st_size
-    buf[56..60].copy_from_slice(&4096i32.to_le_bytes()); // st_blksize
-    buf
-}
-
-fn encode_virtual_statx(
-    fstype: FilesystemType,
-    ino: u64,
-    mode: u32,
-    nlink: u32,
-    size: u64,
-) -> [u8; ARM64_STATX_BYTES] {
-    let mut buf = [0u8; ARM64_STATX_BYTES];
-    let dev_minor = match fstype {
-        FilesystemType::Procfs => 3u32,
-        _ => 4u32,
-    };
-    let blocks = size.div_ceil(512);
-    buf[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
-    buf[4..8].copy_from_slice(&4096u32.to_le_bytes());
-    buf[16..20].copy_from_slice(&nlink.to_le_bytes());
-    buf[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
-    buf[32..40].copy_from_slice(&ino.to_le_bytes());
-    buf[40..48].copy_from_slice(&size.to_le_bytes());
-    buf[48..56].copy_from_slice(&blocks.to_le_bytes());
-    buf[140..144].copy_from_slice(&dev_minor.to_le_bytes());
-    buf
 }
 
 fn encode_ext4_statfs(info: Ext4StatFsInfo, flags: u64, ro: bool) -> [u8; ARM64_STATFS_BYTES] {

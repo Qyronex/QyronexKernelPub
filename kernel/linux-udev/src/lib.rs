@@ -338,9 +338,21 @@ impl<const MAX_DEVS: usize> UdevDeviceRegistry<MAX_DEVS> {
                 self.require_live(b"eth0")?;
                 Ok(push_bytes(out, 0, b"up\n"))
             }
+            b"class/net/eth0/uevent" | b"devices/virtio1/net/eth0/uevent" => {
+                self.require_live(b"eth0")?;
+                Ok(push_bytes(out, 0, b"INTERFACE=eth0\nIFINDEX=2\n"))
+            }
             b"class/tty/ttyAMA0/dev" | b"devices/platform/pl011/tty/ttyAMA0/dev" => {
                 self.require_live(b"ttyAMA0")?;
                 Ok(push_bytes(out, 0, b"204:64\n"))
+            }
+            b"class/tty/ttyAMA0/uevent" | b"devices/platform/pl011/tty/ttyAMA0/uevent" => {
+                self.require_live(b"ttyAMA0")?;
+                Ok(push_bytes(
+                    out,
+                    0,
+                    b"MAJOR=204\nMINOR=64\nDEVNAME=ttyAMA0\n",
+                ))
             }
             b"kernel/uevent_seqnum" => {
                 let mut pos = push_u64(out, 0, self.seqnum);

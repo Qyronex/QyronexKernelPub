@@ -48,6 +48,7 @@ pub const SO_KEEPALIVE: u32 = 9;
 pub const SO_REUSEPORT: u32 = 15;
 pub const SO_PASSCRED: u32 = 16;
 pub const SO_PEERCRED: u32 = 17;
+pub const SO_ACCEPTCONN: u32 = 30;
 pub const SO_DOMAIN: u32 = 39;
 pub const SO_PROTOCOL: u32 = 38;
 pub const SO_RCVTIMEO_OLD: u32 = 20;
@@ -56,14 +57,19 @@ pub const SO_RCVTIMEO_NEW: u32 = 66;
 pub const SO_SNDTIMEO_NEW: u32 = 67;
 pub const TCP_NODELAY: u32 = 1;
 pub const IPV6_V6ONLY: u32 = 26;
+pub const SOL_NETLINK: u32 = 270;
+pub const NETLINK_ADD_MEMBERSHIP: u32 = 1;
+pub const NETLINK_DROP_MEMBERSHIP: u32 = 2;
 
 pub const MSG_PEEK: u32 = 0x02;
 pub const MSG_DONTWAIT: u32 = 0x40;
 pub const MSG_NOSIGNAL: u32 = 0x4000;
 
-/// `SCM_RIGHTS` ancillary control message type (`SOL_SOCKET = 1`, `SCM_RIGHTS = 1`).
+/// `SCM_RIGHTS` (`1`) and `SCM_CREDENTIALS` (`2`) ancillary control message types (`SOL_SOCKET = 1`).
 pub const SCM_RIGHTS: i32 = 1;
+pub const SCM_CREDENTIALS: i32 = 2;
 pub const MAX_SCM_RIGHTS_FDS: usize = 4;
+pub const MAX_DGRAM_PKTS: usize = 8;
 pub const MAX_UNIX_PATH: usize = 64;
 
 /// Netlink constants (`<linux/netlink.h>`, `<linux/rtnetlink.h>`).
@@ -80,10 +86,14 @@ pub const NLM_F_MATCH: u16 = 0x200;
 pub const NLM_F_DUMP: u16 = NLM_F_ROOT | NLM_F_MATCH;
 
 pub const RTM_NEWLINK: u16 = 16;
+pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
+pub const RTM_SETLINK: u16 = 19;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
 pub const RTM_NEWROUTE: u16 = 24;
+pub const RTM_DELROUTE: u16 = 25;
 pub const RTM_GETROUTE: u16 = 26;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -374,6 +384,23 @@ impl AncillaryRights {
 }
 
 #[derive(Clone, Copy)]
+struct RxPktMeta {
+    len: u16,
+    peer_addr: Option<SockAddr>,
+    rights: AncillaryRights,
+    cred: Option<Ucred>,
+}
+
+impl RxPktMeta {
+    const EMPTY: Self = Self {
+        len: 0,
+        peer_addr: None,
+        rights: AncillaryRights::EMPTY,
+        cred: None,
+    };
+}
+
+#[derive(Clone, Copy)]
 struct SocketSlot<const BUF_CAP: usize> {
     live: bool,
     family: AddressFamily,
@@ -396,6 +423,9 @@ struct SocketSlot<const BUF_CAP: usize> {
     rx_buf: [u8; BUF_CAP],
     rx_len: usize,
     rx_ancillary: AncillaryRights,
+    rx_cred: Option<Ucred>,
+    pkt_queue: [RxPktMeta; MAX_DGRAM_PKTS],
+    pkt_count: usize,
     peer_cred: Ucred,
 }
 
@@ -422,9 +452,22 @@ impl<const BUF_CAP: usize> SocketSlot<BUF_CAP> {
         rx_buf: [0u8; BUF_CAP],
         rx_len: 0,
         rx_ancillary: AncillaryRights::EMPTY,
+        rx_cred: None,
+        pkt_queue: [RxPktMeta::EMPTY; MAX_DGRAM_PKTS],
+        pkt_count: 0,
         peer_cred: Ucred::ROOT_INIT,
     };
 }
+
+/// Result tuple returned by [`SocketTable::recv_with_cred_peek`].
+pub type RecvCredPacket = (
+    usize,
+    usize,
+    Option<SockAddr>,
+    [i32; MAX_SCM_RIGHTS_FDS],
+    usize,
+    Option<Ucred>,
+);
 
 /// Bounded in-kernel socket table supporting `AF_UNIX`, `AF_INET`, `AF_INET6`, and `AF_NETLINK`.
 pub struct SocketTable<const MAX_SOCKETS: usize, const BUF_CAP: usize> {
@@ -714,6 +757,13 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         Ok((accepted_id, peer_addr))
     }
 
+    /// Records the process credentials associated with socket `id` (used for `SO_PEERCRED`).
+    pub fn set_peer_cred(&mut self, id: usize, cred: Ucred) -> Result<(), Errno> {
+        let slot = self.slot_mut(id)?;
+        slot.peer_cred = cred;
+        Ok(())
+    }
+
     /// Sends payload (and optional `SCM_RIGHTS` fds for `AF_UNIX`) on socket `id`.
     pub fn send(
         &mut self,
@@ -722,12 +772,56 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         dest: Option<SockAddr>,
         rights: &[i32],
     ) -> Result<usize, Errno> {
+        self.send_with_cred(id, payload, dest, rights, None)
+    }
+
+    fn push_dgram_packet(
+        peer: &mut SocketSlot<BUF_CAP>,
+        payload: &[u8],
+        peer_addr: Option<SockAddr>,
+        rights: AncillaryRights,
+        sender_cred: Option<Ucred>,
+    ) -> Result<usize, Errno> {
+        if peer.pkt_count >= MAX_DGRAM_PKTS {
+            return Err(Errno::EAGAIN);
+        }
+        let pkt_len = u16::try_from(payload.len()).map_err(|_| Errno::EMSGSIZE)?;
+        if BUF_CAP.saturating_sub(peer.rx_len) < payload.len() {
+            return Err(Errno::EAGAIN);
+        }
+        peer.rx_buf[peer.rx_len..peer.rx_len + payload.len()].copy_from_slice(payload);
+        peer.rx_len += payload.len();
+        let cred = if peer.passcred {
+            Some(sender_cred.unwrap_or(Ucred::ROOT_INIT))
+        } else {
+            sender_cred.filter(|_| false)
+        };
+        let q = peer.pkt_count;
+        peer.pkt_queue[q] = RxPktMeta {
+            len: pkt_len,
+            peer_addr,
+            rights,
+            cred,
+        };
+        peer.pkt_count = q + 1;
+        Ok(payload.len())
+    }
+
+    /// Sends payload, optional `SCM_RIGHTS` fds, and optional sender credentials on socket `id`.
+    pub fn send_with_cred(
+        &mut self,
+        id: usize,
+        payload: &[u8],
+        dest: Option<SockAddr>,
+        rights: &[i32],
+        sender_cred: Option<Ucred>,
+    ) -> Result<usize, Errno> {
         if rights.len() > MAX_SCM_RIGHTS_FDS {
             return Err(Errno::EINVAL);
         }
-        let (family, kind, shut_wr, peer_slot) = {
+        let (family, kind, netlink_protocol, shut_wr, peer_slot) = {
             let s = self.slot(id)?;
-            (s.family, s.kind, s.shut_wr, s.peer_slot)
+            (s.family, s.kind, s.netlink_protocol, s.shut_wr, s.peer_slot)
         };
         if shut_wr {
             return Err(Errno::EPIPE);
@@ -737,13 +831,41 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         }
 
         if family == AddressFamily::Netlink {
-            let slot = self.slot_mut(id)?;
-            if slot.netlink_protocol != NETLINK_ROUTE {
-                return Err(Errno::EOPNOTSUPP);
+            if netlink_protocol == NETLINK_ROUTE {
+                let slot = self.slot_mut(id)?;
+                let n = handle_netlink_route_request(payload, &mut slot.rx_buf)?;
+                slot.rx_len = n;
+                return Ok(payload.len());
             }
-            let n = handle_netlink_route_request(payload, &mut slot.rx_buf)?;
-            slot.rx_len = n;
-            return Ok(payload.len());
+            if netlink_protocol == NETLINK_KOBJECT_UEVENT {
+                let (dst_pid, dst_groups) = match dest {
+                    Some(SockAddr::Netlink { pid, groups }) => (pid, groups),
+                    Some(_) => return Err(Errno::EAFNOSUPPORT),
+                    None => match self.slots[id].peer_addr {
+                        Some(SockAddr::Netlink { pid, groups }) => (pid, groups),
+                        _ => (0, 0),
+                    },
+                };
+                let src_addr = match self.slots[id].local_addr {
+                    Some(SockAddr::Netlink { pid, groups }) => {
+                        Some(SockAddr::Netlink { pid, groups })
+                    }
+                    _ => Some(SockAddr::Netlink {
+                        pid: sender_cred.map_or(1, |c| c.pid),
+                        groups: 0,
+                    }),
+                };
+                self.broadcast_netlink_uevent_targeted(
+                    Some(id),
+                    payload,
+                    dst_pid,
+                    dst_groups,
+                    src_addr,
+                    sender_cred.or(Some(self.slots[id].peer_cred)),
+                );
+                return Ok(payload.len());
+            }
+            return Err(Errno::EOPNOTSUPP);
         }
 
         let target_peer = if let Some(peer) = peer_slot {
@@ -777,10 +899,30 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         };
 
         let sender_local = self.slots[id].local_addr;
+        let fallback_cred = self.slots[id].peer_cred;
+        let mut rights_arr = [-1i32; MAX_SCM_RIGHTS_FDS];
+        rights_arr[..rights.len()].copy_from_slice(rights);
+        let ancillary = AncillaryRights {
+            fds: rights_arr,
+            count: rights.len(),
+        };
+        let eff_cred = sender_cred.unwrap_or(fallback_cred);
+
         let peer = self.slots.get_mut(target_peer).ok_or(Errno::EPIPE)?;
         if !peer.live || peer.shut_rd {
             return Err(Errno::EPIPE);
         }
+        if peer.kind != SocketKind::Stream {
+            let explicit_or_peer_cred = if peer.passcred { Some(eff_cred) } else { None };
+            return Self::push_dgram_packet(
+                peer,
+                payload,
+                sender_local,
+                ancillary,
+                explicit_or_peer_cred,
+            );
+        }
+
         let avail = BUF_CAP.saturating_sub(peer.rx_len);
         if avail == 0 && !payload.is_empty() {
             return Err(Errno::EAGAIN);
@@ -792,12 +934,10 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
             peer.peer_addr = sender_local;
         }
         if !rights.is_empty() {
-            let mut fds = [-1i32; MAX_SCM_RIGHTS_FDS];
-            fds[..rights.len()].copy_from_slice(rights);
-            peer.rx_ancillary = AncillaryRights {
-                fds,
-                count: rights.len(),
-            };
+            peer.rx_ancillary = ancillary;
+        }
+        if peer.passcred {
+            peer.rx_cred = Some(eff_cred);
         }
         Ok(take)
     }
@@ -826,27 +966,67 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         out: &mut [u8],
         peek: bool,
     ) -> Result<(usize, Option<SockAddr>, [i32; MAX_SCM_RIGHTS_FDS], usize), Errno> {
-        let (peer_slot, rx_len, shut_rd) = {
+        let (take, _full_len, peer_addr, fds, fd_count, _cred) =
+            self.recv_with_cred_peek(id, out, peek)?;
+        Ok((take, peer_addr, fds, fd_count))
+    }
+
+    /// Receives data, full datagram length, peer address, `SCM_RIGHTS`, and optional `SCM_CREDENTIALS`.
+    pub fn recv_with_cred_peek(
+        &mut self,
+        id: usize,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Result<RecvCredPacket, Errno> {
+        let (peer_slot, rx_len, pkt_count, shut_rd) = {
             let s = self.slot(id)?;
-            (s.peer_slot, s.rx_len, s.shut_rd)
+            (s.peer_slot, s.rx_len, s.pkt_count, s.shut_rd)
         };
-        if rx_len == 0 {
+        if rx_len == 0 && pkt_count == 0 {
             if shut_rd {
-                return Ok((0, None, [-1; MAX_SCM_RIGHTS_FDS], 0));
+                return Ok((0, 0, None, [-1; MAX_SCM_RIGHTS_FDS], 0, None));
             }
             if let Some(peer_id) = peer_slot
                 && (!self.slots[peer_id].live || self.slots[peer_id].shut_wr)
             {
-                return Ok((0, None, [-1; MAX_SCM_RIGHTS_FDS], 0));
+                return Ok((0, 0, None, [-1; MAX_SCM_RIGHTS_FDS], 0, None));
             }
             return Err(Errno::EAGAIN);
         }
 
         let slot = self.slot_mut(id)?;
+        if slot.pkt_count > 0 {
+            let pkt = slot.pkt_queue[0];
+            let full_len = usize::from(pkt.len).min(slot.rx_len);
+            let take = out.len().min(full_len);
+            out[..take].copy_from_slice(&slot.rx_buf[..take]);
+            if !peek {
+                let remaining = slot.rx_len - full_len;
+                if remaining > 0 {
+                    slot.rx_buf.copy_within(full_len..slot.rx_len, 0);
+                }
+                slot.rx_len = remaining;
+                for i in 0..(slot.pkt_count - 1) {
+                    slot.pkt_queue[i] = slot.pkt_queue[i + 1];
+                }
+                slot.pkt_queue[slot.pkt_count - 1] = RxPktMeta::EMPTY;
+                slot.pkt_count -= 1;
+            }
+            return Ok((
+                take,
+                full_len,
+                pkt.peer_addr,
+                pkt.rights.fds,
+                pkt.rights.count,
+                pkt.cred,
+            ));
+        }
+
         let take = out.len().min(slot.rx_len);
         out[..take].copy_from_slice(&slot.rx_buf[..take]);
         let peer_addr = slot.peer_addr;
         let rights = slot.rx_ancillary;
+        let cred = slot.rx_cred;
         if !peek {
             let remaining = slot.rx_len - take;
             if remaining > 0 {
@@ -854,8 +1034,9 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
             }
             slot.rx_len = remaining;
             slot.rx_ancillary = AncillaryRights::EMPTY;
+            slot.rx_cred = None;
         }
-        Ok((take, peer_addr, rights.fds, rights.count))
+        Ok((take, take, peer_addr, rights.fds, rights.count, cred))
     }
 
     /// Shuts down part or all of a full-duplex connection (`shutdown(2)`).
@@ -873,37 +1054,68 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         Ok(())
     }
 
-    /// Broadcasts a kernel kobject uevent payload to bound `NETLINK_KOBJECT_UEVENT` sockets.
-    pub fn broadcast_netlink_uevent(&mut self, msg: &[u8]) -> usize {
+    fn broadcast_netlink_uevent_targeted(
+        &mut self,
+        sender_id: Option<usize>,
+        msg: &[u8],
+        dst_pid: u32,
+        dst_groups: u32,
+        src_addr: Option<SockAddr>,
+        sender_cred: Option<Ucred>,
+    ) -> usize {
         if msg.is_empty() {
             return 0;
         }
         let mut delivered = 0usize;
-        for slot in &mut self.slots {
-            if !slot.live
+        for (idx, slot) in self.slots.iter_mut().enumerate() {
+            if Some(idx) == sender_id
+                || !slot.live
                 || slot.shut_rd
                 || slot.family != AddressFamily::Netlink
                 || slot.netlink_protocol != NETLINK_KOBJECT_UEVENT
             {
                 continue;
             }
-            let subscribed = matches!(
-                slot.local_addr,
-                Some(SockAddr::Netlink { groups, .. }) if groups == 0 || (groups & 1) != 0
-            );
+            let subscribed = match slot.local_addr {
+                Some(SockAddr::Netlink { pid, groups }) => {
+                    if dst_pid != 0 {
+                        pid == dst_pid
+                    } else if dst_groups != 0 {
+                        (groups & dst_groups) != 0
+                    } else {
+                        groups == 0 || (groups & 1) != 0
+                    }
+                }
+                _ => false,
+            };
             if !subscribed {
                 continue;
             }
-            let avail = BUF_CAP.saturating_sub(slot.rx_len);
-            if avail < msg.len() {
-                continue;
+            let cred = if slot.passcred { sender_cred } else { None };
+            if Self::push_dgram_packet(slot, msg, src_addr, AncillaryRights::EMPTY, cred).is_ok() {
+                if slot.peer_addr.is_none() {
+                    slot.peer_addr = src_addr;
+                }
+                delivered += 1;
             }
-            slot.rx_buf[slot.rx_len..slot.rx_len + msg.len()].copy_from_slice(msg);
-            slot.rx_len += msg.len();
-            slot.peer_addr = Some(SockAddr::Netlink { pid: 0, groups: 1 });
-            delivered += 1;
         }
         delivered
+    }
+
+    /// Broadcasts a kernel kobject uevent payload to bound `NETLINK_KOBJECT_UEVENT` sockets.
+    pub fn broadcast_netlink_uevent(&mut self, msg: &[u8]) -> usize {
+        self.broadcast_netlink_uevent_targeted(
+            None,
+            msg,
+            0,
+            1,
+            Some(SockAddr::Netlink { pid: 0, groups: 1 }),
+            Some(Ucred {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            }),
+        )
     }
 
     /// Closes socket `id`.
@@ -956,6 +1168,30 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
             (SOL_SOCKET, SO_KEEPALIVE | SO_SNDBUF | SO_RCVBUF) => {}
             (IPPROTO_TCP, TCP_NODELAY) => s.tcp_nodelay = enabled,
             (IPPROTO_IPV6, IPV6_V6ONLY) => s.ipv6_v6only = enabled,
+            (SOL_NETLINK, NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP)
+                if s.family == AddressFamily::Netlink =>
+            {
+                if val == 0 || val > 32 {
+                    return Err(Errno::EINVAL);
+                }
+                let bit = 1u32 << (val - 1);
+                let (pid, groups) = match s.local_addr {
+                    Some(SockAddr::Netlink { pid, groups }) => (pid, groups),
+                    _ => (0, 0),
+                };
+                let new_groups = if optname == NETLINK_ADD_MEMBERSHIP {
+                    groups | bit
+                } else {
+                    groups & !bit
+                };
+                s.local_addr = Some(SockAddr::Netlink {
+                    pid,
+                    groups: new_groups,
+                });
+                if s.state == SocketState::Unbound {
+                    s.state = SocketState::Bound;
+                }
+            }
             _ => return Err(Errno::ENOPROTOOPT),
         }
         Ok(())
@@ -973,8 +1209,11 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
             (SOL_SOCKET, SO_ERROR) => write_u32_opt(0, out),
             (SOL_SOCKET, SO_TYPE) => write_u32_opt(s.kind.as_raw(), out),
             (SOL_SOCKET, SO_DOMAIN) => write_u32_opt(u32::from(s.family.as_raw()), out),
-            (SOL_SOCKET, SO_REUSEADDR) => write_u32_opt(u32::from(s.reuseaddr), out),
+            (SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT) => write_u32_opt(u32::from(s.reuseaddr), out),
             (SOL_SOCKET, SO_PASSCRED) => write_u32_opt(u32::from(s.passcred), out),
+            (SOL_SOCKET, SO_ACCEPTCONN) => {
+                write_u32_opt(u32::from(s.state == SocketState::Listening), out)
+            }
             (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => write_u32_opt(BUF_CAP as u32, out),
             (SOL_SOCKET, SO_PEERCRED) => {
                 if out.len() < 12 {
@@ -992,7 +1231,7 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
 
     pub fn has_readable_data(&self, id: usize) -> bool {
         if let Ok(s) = self.slot(id) {
-            s.rx_len > 0 || s.pending_count > 0
+            s.rx_len > 0 || s.pkt_count > 0 || s.pending_count > 0
         } else {
             false
         }
@@ -1012,7 +1251,7 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
                 mask |= u32::from(POLLHUP) | u32::from(POLLERR);
             }
             SocketState::Connected => {
-                if s.rx_len > 0 || s.shut_rd {
+                if s.rx_len > 0 || s.pkt_count > 0 || s.shut_rd {
                     mask |= u32::from(POLLIN);
                 }
                 let peer_opt = s.peer_slot.and_then(|pid| self.slots.get(pid));
@@ -1049,7 +1288,7 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
                 }
             }
             SocketState::Unbound | SocketState::Bound => {
-                if s.rx_len > 0 || s.shut_rd {
+                if s.rx_len > 0 || s.pkt_count > 0 || s.shut_rd {
                     mask |= u32::from(POLLIN);
                 }
                 if matches!(s.kind, SocketKind::Dgram | SocketKind::Raw) && !s.shut_wr {
@@ -1149,6 +1388,25 @@ fn addresses_match_loopback(bound: Option<SockAddr>, target: SockAddr) -> bool {
         }
         _ => false,
     }
+}
+
+fn write_nlmsg_ack_if_requested(
+    req: &[u8],
+    out: &mut [u8],
+    nlmsg_flags: u16,
+    nlmsg_seq: u32,
+    nlmsg_pid: u32,
+) -> Result<usize, Errno> {
+    if (nlmsg_flags & NLM_F_ACK) == 0 {
+        return Ok(0);
+    }
+    if out.len() < 36 || req.len() < 16 {
+        return Err(Errno::ENOBUFS);
+    }
+    write_nlmsghdr(&mut out[0..16], 36, NLMSG_ERROR, 0, nlmsg_seq, nlmsg_pid);
+    out[16..20].copy_from_slice(&0i32.to_le_bytes());
+    out[20..36].copy_from_slice(&req[0..16]);
+    Ok(36)
 }
 
 /// Validates and responds to `NETLINK_ROUTE` (`RTM_GETLINK`, `RTM_GETADDR`, `RTM_GETROUTE`)
@@ -1262,6 +1520,10 @@ pub fn handle_netlink_route_request(request: &[u8], out: &mut [u8]) -> Result<us
             out[16..20].copy_from_slice(&0i32.to_le_bytes());
             Ok(20)
         }
+        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE
+        | RTM_DELROUTE | NLMSG_NOOP => {
+            write_nlmsg_ack_if_requested(request, out, nlmsg_flags, nlmsg_seq, nlmsg_pid)
+        }
         _ => Err(Errno::EOPNOTSUPP),
     }
 }
@@ -1348,6 +1610,7 @@ pub fn handle_netlink_route_request_with_cfg(
     }
     let nlmsg_len = u32::from_le_bytes([req[0], req[1], req[2], req[3]]) as usize;
     let nlmsg_type = u16::from_le_bytes([req[4], req[5]]);
+    let nlmsg_flags = u16::from_le_bytes([req[6], req[7]]);
     let nlmsg_seq = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
     if nlmsg_len < 16 || nlmsg_len > req.len() {
         return Err(Errno::EINVAL);
@@ -1537,6 +1800,10 @@ pub fn handle_netlink_route_request_with_cfg(
                 }
             }
             write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+        }
+        RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE
+        | RTM_DELROUTE | NLMSG_NOOP => {
+            write_nlmsg_ack_if_requested(req, out, nlmsg_flags, nlmsg_seq, nlmsg_pid)
         }
         _ => Err(Errno::EOPNOTSUPP),
     }
@@ -1804,5 +2071,84 @@ mod tests {
         write_nlmsghdr(&mut req[0..16], 32, RTM_GETROUTE, 0x301, 3, 0);
         let n_rt = handle_netlink_route_request_with_cfg(&req, &mut out, 42, &cfg).unwrap();
         assert!(out[..n_rt].windows(4).any(|w| w == [10, 0, 2, 2]));
+    }
+
+    #[test]
+    fn af_unix_so_acceptconn_and_passcred_dgram_preserve_boundaries_and_creds() {
+        let mut table = SocketTable::<8, 256>::new();
+        let srv = table.socket(AF_UNIX, SOCK_STREAM, 0).unwrap();
+        let mut path = [0u8; MAX_UNIX_PATH];
+        path[..4].copy_from_slice(b"/tmp");
+        let addr = SockAddr::Unix {
+            abstract_ns: false,
+            path,
+            len: 4,
+        };
+        table.bind(srv, addr).unwrap();
+        let mut opt = [0u8; 4];
+        table
+            .getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, &mut opt)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(opt), 0);
+        table.listen(srv, 4).unwrap();
+        table
+            .getsockopt(srv, SOL_SOCKET, SO_ACCEPTCONN, &mut opt)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(opt), 1);
+
+        let notify_srv = table.socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        table
+            .setsockopt(notify_srv, SOL_SOCKET, SO_PASSCRED, 1)
+            .unwrap();
+        let mut npath = [0u8; MAX_UNIX_PATH];
+        npath[..7].copy_from_slice(b"/notify");
+        let naddr = SockAddr::Unix {
+            abstract_ns: false,
+            path: npath,
+            len: 7,
+        };
+        table.bind(notify_srv, naddr).unwrap();
+
+        let cli1 = table.socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        let cli2 = table.socket(AF_UNIX, SOCK_DGRAM, 0).unwrap();
+        table
+            .send_with_cred(
+                cli1,
+                b"READY=1\n",
+                Some(naddr),
+                &[],
+                Some(Ucred {
+                    pid: 19,
+                    uid: 0,
+                    gid: 0,
+                }),
+            )
+            .unwrap();
+        table
+            .send_with_cred(
+                cli2,
+                b"MAINPID=20\n",
+                Some(naddr),
+                &[],
+                Some(Ucred {
+                    pid: 20,
+                    uid: 0,
+                    gid: 0,
+                }),
+            )
+            .unwrap();
+
+        let mut rx = [0u8; 64];
+        let (n1, _, _, _, _, c1) = table
+            .recv_with_cred_peek(notify_srv, &mut rx, false)
+            .unwrap();
+        assert_eq!(&rx[..n1], b"READY=1\n");
+        assert_eq!(c1.unwrap().pid, 19);
+
+        let (n2, _, _, _, _, c2) = table
+            .recv_with_cred_peek(notify_srv, &mut rx, false)
+            .unwrap();
+        assert_eq!(&rx[..n2], b"MAINPID=20\n");
+        assert_eq!(c2.unwrap().pid, 20);
     }
 }

@@ -9,8 +9,9 @@ use kernal_vm::{Backing, PAGE_SIZE, USER_MAX_EXCLUSIVE, USER_MIN, VmPerms, Vma};
 mod step31_mmap;
 pub use step31_mmap::{
     DynamicPageBackend, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_FIXED, MAP_NONBLOCK, MAP_NORESERVE,
-    MAP_POPULATE, MAP_STACK, MmapFileBacking, PROT_NONE, STEP31_ALLOWED_MMAP_FLAGS, Step31MmapSpec,
-    mmap_step31_dynamic, mprotect_step31, parse_step31_perms, validate_step31_mmap_spec,
+    MAP_POPULATE, MAP_SHARED, MAP_SHARED_VALIDATE, MAP_STACK, MmapFileBacking, PROT_NONE,
+    STEP31_ALLOWED_MMAP_FLAGS, Step31MmapSpec, mmap_step31_dynamic, mprotect_step31,
+    parse_step31_perms, validate_step31_mmap_spec,
 };
 
 pub const PROT_READ: u64 = 0x1;

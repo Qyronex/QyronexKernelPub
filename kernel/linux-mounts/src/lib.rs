@@ -105,9 +105,33 @@ impl FilesystemType {
             Self::Overlay => 0x794c_7630,   // OVERLAYFS_SUPER_MAGIC
         }
     }
+
+    pub const fn st_dev_pair(self, mount_id: u32) -> (u32, u32) {
+        match self {
+            Self::Initramfs => (0, 1),
+            Self::Procfs => (0, 3),
+            Self::Sysfs => (0, 4),
+            Self::Devtmpfs => (0, 5),
+            Self::Devpts => (0, 6),
+            Self::Cgroup2 => (0, 12),
+            Self::Ext4 => (254, mount_id),
+            Self::Tmpfs => (0, 20 + mount_id),
+            Self::Overlay => (0, 40 + mount_id),
+        }
+    }
+
+    pub const fn st_dev(self, mount_id: u32) -> u64 {
+        let (maj, min) = self.st_dev_pair(mount_id);
+        let maj64 = maj as u64;
+        let min64 = min as u64;
+        ((maj64 & 0x0fff) << 8)
+            | ((maj64 & !0x0fff) << 32)
+            | (min64 & 0xff)
+            | ((min64 & !0xff) << 12)
+    }
 }
 
-pub const MAX_MOUNT_PATH: usize = 64;
+pub const MAX_MOUNT_PATH: usize = 256;
 pub const MAX_MOUNT_SOURCE: usize = 32;
 
 /// One active mount point in the kernel [`MountTable`].
@@ -262,7 +286,11 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
             return Ok(slot.mount_id);
         }
 
-        if (flags & MS_PROPAGATION_MASK) != 0 && fstype.is_none() && source.is_empty() {
+        if (flags & MS_PROPAGATION_MASK) != 0
+            && (flags & MS_BIND) == 0
+            && fstype.is_none_or(|f| f.is_empty())
+            && (source.is_empty() || source == b"none")
+        {
             let prop_bits = flags & MS_PROPAGATION_MASK;
             // Exactly one propagation mode may be requested at a time.
             if prop_bits.count_ones() != 1 {
@@ -479,6 +507,23 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
         Ok((chosen, rel))
     }
 
+    /// Invokes `f` for every live mount entry in the table.
+    pub fn for_each_live(&self, mut f: impl FnMut(&MountEntry)) {
+        for entry in &self.entries {
+            if entry.live {
+                f(entry);
+            }
+        }
+    }
+
+    /// Returns the live mount entry matching `mount_id`, if present.
+    pub fn entry_by_id(&self, mount_id: u32) -> Option<MountEntry> {
+        self.entries
+            .iter()
+            .copied()
+            .find(|entry| entry.live && entry.mount_id == mount_id)
+    }
+
     /// Formats `/proc/mounts` lines from the live mount table into `out`.
     pub fn format_proc_mounts(&self, out: &mut [u8]) -> usize {
         let mut cursor = 0usize;
@@ -507,6 +552,75 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
                 out[cursor..cursor + take].copy_from_slice(&part[..take]);
                 cursor += take;
             }
+        }
+        cursor
+    }
+
+    /// Formats Linux `/proc/self/mountinfo` lines (`<mnt_id> <parent_id> <maj>:<min> / <target> <opts> - <fstype> <source> rw`).
+    pub fn format_proc_mountinfo(&self, out: &mut [u8]) -> usize {
+        let mut cursor = 0usize;
+        for entry in &self.entries {
+            if !entry.live {
+                continue;
+            }
+            let tgt = entry.target();
+            let mut parent_id = 0u32;
+            let mut best_parent_len = 0usize;
+            if tgt != b"/" {
+                for cand in &self.entries {
+                    if !cand.live {
+                        continue;
+                    }
+                    let ctgt = cand.target();
+                    let is_parent = if ctgt == b"/" {
+                        true
+                    } else {
+                        tgt.len() > ctgt.len() && tgt.starts_with(ctgt) && tgt[ctgt.len()] == b'/'
+                    };
+                    if is_parent && ctgt.len() > best_parent_len {
+                        best_parent_len = ctgt.len();
+                        parent_id = cand.mount_id;
+                    }
+                }
+            }
+            let (maj, min) = entry.fstype.st_dev_pair(entry.mount_id);
+            let rw = if entry.is_readonly() {
+                &b"ro"[..]
+            } else {
+                &b"rw"[..]
+            };
+            cursor += write_u64_ascii(u64::from(entry.mount_id), &mut out[cursor..]);
+            cursor += copy_slice(&mut out[cursor..], b" ");
+            cursor += write_u64_ascii(u64::from(parent_id), &mut out[cursor..]);
+            cursor += copy_slice(&mut out[cursor..], b" ");
+            cursor += write_u64_ascii(u64::from(maj), &mut out[cursor..]);
+            cursor += copy_slice(&mut out[cursor..], b":");
+            cursor += write_u64_ascii(u64::from(min), &mut out[cursor..]);
+            cursor += copy_slice(&mut out[cursor..], b" / ");
+            cursor += copy_slice(&mut out[cursor..], tgt);
+            cursor += copy_slice(&mut out[cursor..], b" ");
+            cursor += copy_slice(&mut out[cursor..], rw);
+            if entry.flags & MS_NOSUID != 0 {
+                cursor += copy_slice(&mut out[cursor..], b",nosuid");
+            }
+            if entry.flags & MS_NODEV != 0 {
+                cursor += copy_slice(&mut out[cursor..], b",nodev");
+            }
+            if entry.flags & MS_NOEXEC != 0 {
+                cursor += copy_slice(&mut out[cursor..], b",noexec");
+            }
+            cursor += copy_slice(&mut out[cursor..], b" - ");
+            cursor += copy_slice(&mut out[cursor..], entry.fstype.as_bytes());
+            cursor += copy_slice(&mut out[cursor..], b" ");
+            let src = if entry.source().is_empty() {
+                entry.fstype.as_bytes()
+            } else {
+                entry.source()
+            };
+            cursor += copy_slice(&mut out[cursor..], src);
+            cursor += copy_slice(&mut out[cursor..], b" ");
+            cursor += copy_slice(&mut out[cursor..], rw);
+            cursor += copy_slice(&mut out[cursor..], b"\n");
         }
         cursor
     }
@@ -674,7 +788,8 @@ pub fn read_procfs_process_node<const MAX_MOUNTS: usize>(
     out: &mut [u8],
 ) -> Option<usize> {
     match subpath {
-        b"mounts" | b"mountinfo" => Some(mounts.format_proc_mounts(out)),
+        b"mounts" => Some(mounts.format_proc_mounts(out)),
+        b"mountinfo" => Some(mounts.format_proc_mountinfo(out)),
         b"status" => Some(format_pid_status(info, out)),
         b"stat" => Some(format_pid_stat(info, out)),
         b"cmdline" => Some(format_pid_cmdline(info, out)),
@@ -703,31 +818,34 @@ fn emit_sysfs_spec(spec: &[u8], mut emit: impl FnMut(&[u8], bool)) -> bool {
 /// Returns `false` if `rel_dir` is not a sysfs directory.
 pub fn enumerate_sysfs_dir(rel_dir: &[u8], emit: impl FnMut(&[u8], bool)) -> bool {
     let spec: &[u8] = match rel_dir {
-        b"" => b"kernel:D|devices:D|class:D|fs:D",
+        b"" => b"kernel:D|devices:D|class:D|dev:D|fs:D",
         b"kernel" => b"uevent_seqnum:R",
         b"fs" => b"cgroup:D",
+        b"dev" => b"block:D|char:D",
+        b"dev/block" => b"254:0:R",
+        b"dev/char" => b"5:1:R|204:64:R",
         b"devices" => b"system:D|virtio0:D|virtio1:D|platform:D",
         b"devices/system" => b"cpu:D",
         b"devices/system/cpu" => b"online:R|present:R",
         b"devices/virtio0" => b"block:D",
         b"devices/virtio0/block" => b"vda:D",
-        b"devices/virtio0/block/vda" => b"dev:R|size:R|uevent:R",
+        b"devices/virtio0/block/vda" => b"dev:R|size:R|uevent:R|subsystem:R",
         b"devices/virtio1" => b"net:D",
         b"devices/virtio1/net" => b"eth0:D",
-        b"devices/virtio1/net/eth0" => b"ifindex:R|address:R|operstate:R|uevent:R",
+        b"devices/virtio1/net/eth0" => b"ifindex:R|address:R|operstate:R|uevent:R|subsystem:R",
         b"devices/platform" => b"pl011:D",
         b"devices/platform/pl011" => b"tty:D",
         b"devices/platform/pl011/tty" => b"ttyAMA0:D",
-        b"devices/platform/pl011/tty/ttyAMA0" => b"dev:R",
+        b"devices/platform/pl011/tty/ttyAMA0" => b"dev:R|uevent:R|subsystem:R",
         b"class" => b"tty:D|net:D|block:D",
         b"class/tty" => b"console:D|ttyAMA0:D",
-        b"class/tty/console" => b"active:R",
-        b"class/tty/ttyAMA0" => b"dev:R",
+        b"class/tty/console" => b"active:R|dev:R|uevent:R|subsystem:R",
+        b"class/tty/ttyAMA0" => b"dev:R|uevent:R|subsystem:R",
         b"class/net" => b"lo:D|eth0:D",
-        b"class/net/lo" => b"operstate:R|mtu:R|ifindex:R",
-        b"class/net/eth0" => b"ifindex:R|address:R|operstate:R",
+        b"class/net/lo" => b"operstate:R|mtu:R|ifindex:R|uevent:R|subsystem:R",
+        b"class/net/eth0" => b"ifindex:R|address:R|operstate:R|uevent:R|subsystem:R",
         b"class/block" => b"vda:D",
-        b"class/block/vda" => b"dev:R|size:R|ro:R|uevent:R",
+        b"class/block/vda" => b"dev:R|size:R|ro:R|uevent:R|subsystem:R",
         _ => return false,
     };
     emit_sysfs_spec(spec, emit)
@@ -841,9 +959,14 @@ pub fn read_sysfs_node(
             }
         }
         b"class/tty/console/active" => Some(copy_slice(out, b"ttyAMA0\n")),
+        b"class/tty/console/dev" => Some(copy_slice(out, b"5:1\n")),
+        b"class/tty/console/uevent" => {
+            Some(copy_slice(out, b"MAJOR=5\nMINOR=1\nDEVNAME=console\n"))
+        }
         b"class/net/lo/operstate" => Some(copy_slice(out, b"unknown\n")),
         b"class/net/lo/mtu" => Some(copy_slice(out, b"65536\n")),
         b"class/net/lo/ifindex" => Some(copy_slice(out, b"1\n")),
+        b"class/net/lo/uevent" => Some(copy_slice(out, b"INTERFACE=lo\nIFINDEX=1\n")),
         b"class/block/vda/ro" => Some(copy_slice(out, b"0\n")),
         _ => None,
     }
@@ -1399,12 +1522,26 @@ mod tests {
         assert_eq!(&buf[..cmd_len], b"/bin/ps\0aux\0");
 
         let mut dirs = 0usize;
-        assert!(enumerate_sysfs_dir(b"", |_, is_dir| {
+        let mut saw_dev = false;
+        assert!(enumerate_sysfs_dir(b"", |name, is_dir| {
             if is_dir {
                 dirs += 1;
+                if name == b"dev" {
+                    saw_dev = true;
+                }
             }
         }));
-        assert_eq!(dirs, 4);
+        assert_eq!(dirs, 5);
+        assert!(saw_dev);
         assert!(!enumerate_sysfs_dir(b"does/not/exist", |_, _| {}));
+
+        let mi_len = read_procfs_process_node(b"mountinfo", &tbl, &info, &mut buf).unwrap();
+        let mi = core::str::from_utf8(&buf[..mi_len]).unwrap();
+        assert!(mi.contains(" / /proc ro,nosuid,nodev,noexec - proc proc "));
+        assert!(mi.contains(" / /sys ro,nosuid,nodev,noexec - sysfs sysfs "));
+        assert_ne!(
+            FilesystemType::Procfs.st_dev(4),
+            FilesystemType::Sysfs.st_dev(5)
+        );
     }
 }

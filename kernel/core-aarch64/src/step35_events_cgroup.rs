@@ -22,40 +22,39 @@ use kernal_linux_pipe::End as PipeEnd;
 use kernal_linux_signal::SignalSet;
 
 use super::step_fd_util::{
-    SUBSYS_EVENT, current_process_object, lookup_aliased_subsystem,
-    lookup_aliased_subsystem_current,
+    DirectProcessRefs, SUBSYS_EVENT, current_process_object, fd_in_close_range,
+    lookup_aliased_subsystem, lookup_aliased_subsystem_current,
 };
 
 /// Dedicated file-descriptor base for Step-35 event/memfd/pidfd descriptors (`160..192`),
 /// partitioned cleanly above `SOCK_FD_BASE` (`128..160`).
 pub(super) const EVENT_FD_BASE: i32 = 160;
 const MAX_EVENT_FDS: usize = 32;
-const MEMFD_CAP: usize = 4096;
-const MAX_CGROUPS: usize = 8;
+const MEMFD_CAP: usize = 32768;
+const MAX_CGROUPS: usize = 64;
 const ARM64_STAT_BYTES: usize = 128;
 const S_IFREG_MODE: u32 = 0o100_600;
 const EVENT_CLOEXEC_FLAG: u32 = 0x0008_0000;
 const EVENT_NONBLOCK_FLAG: u32 = 0x0000_0800;
 const MFD_CLOEXEC_FLAG: u32 = 0x0001;
+const MFD_NOEXEC_SEAL_FLAG: u32 = 0x0008;
 const O_RDWR_U64: u64 = 2;
 
 #[derive(Clone, Copy)]
 struct EventMeta {
     live: bool,
-    native_open: bool,
     generation: u64,
+    owners: DirectProcessRefs<{ super::step29_runtime::STEP29_RUNTIME_PROCESS_VIEWS }>,
     alias_refs: usize,
-    cloexec: bool,
     nonblocking: bool,
 }
 
 impl EventMeta {
     const EMPTY: Self = Self {
         live: false,
-        native_open: false,
         generation: 0,
+        owners: DirectProcessRefs::empty(),
         alias_refs: 0,
-        cloexec: false,
         nonblocking: false,
     };
 }
@@ -79,20 +78,26 @@ impl Step35State {
         }
     }
 
-    fn init_slot(&mut self, idx: usize, cloexec: bool, nonblocking: bool) {
+    fn init_slot(&mut self, idx: usize, owner: ObjectId, cloexec: bool, nonblocking: bool) {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let mut owners = DirectProcessRefs::empty();
+        owners.init(owner, cloexec);
         self.meta[idx] = EventMeta {
             live: true,
-            native_open: true,
             generation,
+            owners,
             alias_refs: 0,
-            cloexec,
             nonblocking,
         };
     }
 
-    fn check_slot(&self, idx: usize, alias_gen: Option<u64>) -> Result<(), Errno> {
+    fn check_slot(
+        &self,
+        process: ObjectId,
+        idx: usize,
+        alias_gen: Option<u64>,
+    ) -> Result<(), Errno> {
         let Some(m) = self.meta.get(idx) else {
             return Err(Errno::EBADF);
         };
@@ -102,7 +107,7 @@ impl Step35State {
         match alias_gen {
             Some(expected_gen) if m.generation == expected_gen && m.alias_refs > 0 => Ok(()),
             Some(_) => Err(Errno::EBADF),
-            None if m.native_open => Ok(()),
+            None if m.owners.has_owner(process) => Ok(()),
             None => Err(Errno::EBADF),
         }
     }
@@ -110,7 +115,7 @@ impl Step35State {
     fn retire_if_unused(&mut self, idx: usize) {
         if let Some(m) = self.meta.get_mut(idx)
             && m.live
-            && !m.native_open
+            && m.owners.is_empty()
             && m.alias_refs == 0
         {
             let _ = self.events.close(idx);
@@ -118,17 +123,20 @@ impl Step35State {
         }
     }
 
-    fn close_native_slot(&mut self, idx: usize) -> Result<(), Errno> {
+    fn close_native_slot(&mut self, process: ObjectId, idx: usize) -> Result<(), Errno> {
         let Some(m) = self.meta.get_mut(idx) else {
             return Err(Errno::EBADF);
         };
-        if !m.live || !m.native_open {
+        if !m.live || !m.owners.close_owner(process) {
             return Err(Errno::EBADF);
         }
-        m.native_open = false;
         self.retire_if_unused(idx);
         Ok(())
     }
+}
+
+fn slot_process_id() -> ObjectId {
+    current_process_object().unwrap_or(ObjectId(1))
 }
 
 fn event_status_flags(nonblocking: bool) -> u64 {
@@ -143,11 +151,14 @@ fn is_aliased_event_fd(raw_fd: u64) -> bool {
     lookup_aliased_subsystem_current(raw_fd).is_some_and(|h| h.kind == SUBSYS_EVENT)
 }
 
-fn resolve_event_target(raw_fd: u64) -> Result<(usize, Option<u64>), Errno> {
+fn resolve_event_target_for_process(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<(usize, Option<u64>), Errno> {
     if is_event_fd(raw_fd) {
         return Ok(((linux_signed_int(raw_fd) - EVENT_FD_BASE) as usize, None));
     }
-    if let Some(handle) = lookup_aliased_subsystem_current(raw_fd)
+    if let Some(handle) = lookup_aliased_subsystem(process, raw_fd)
         && handle.kind == SUBSYS_EVENT
     {
         return Ok((handle.slot as usize, Some(handle.generation)));
@@ -155,8 +166,12 @@ fn resolve_event_target(raw_fd: u64) -> Result<(usize, Option<u64>), Errno> {
     Err(Errno::EBADF)
 }
 
+fn resolve_event_target(raw_fd: u64) -> Result<(usize, Option<u64>), Errno> {
+    resolve_event_target_for_process(slot_process_id(), raw_fd)
+}
+
 pub(super) fn retain_alias_handle(
-    _process: ObjectId,
+    process: ObjectId,
     raw_fd: u64,
 ) -> Result<(SubsystemHandle, u64), Errno> {
     if !is_event_fd(raw_fd) {
@@ -167,7 +182,7 @@ pub(super) fn retain_alias_handle(
         let Some(m) = state.meta.get_mut(idx) else {
             return Err(Errno::EBADF);
         };
-        if !m.live || !m.native_open {
+        if !m.live || !m.owners.has_owner(process) {
             return Err(Errno::EBADF);
         }
         m.alias_refs += 1;
@@ -219,14 +234,16 @@ pub(super) fn handle_native_fcntl(
         return None;
     };
     let res = with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         let Some(m) = state.meta.get_mut(idx) else {
             return Err(Errno::EBADF);
         };
         match cmd {
-            1 => Ok(i64::from(i32::from(m.cloexec))),
+            1 => Ok(i64::from(i32::from(
+                m.owners.get_cloexec(process).unwrap_or(false),
+            ))),
             2 => {
-                m.cloexec = (argi & 1) != 0;
+                let _ = m.owners.set_cloexec(process, (argi & 1) != 0);
                 Ok(0)
             }
             3 => Ok(event_status_flags(m.nonblocking) as i64),
@@ -277,6 +294,124 @@ pub(super) const fn is_event_fd(raw_fd: u64) -> bool {
     fd >= EVENT_FD_BASE && fd < EVENT_FD_BASE + (MAX_EVENT_FDS as i32)
 }
 
+pub(super) fn is_open_event_fd(process: ObjectId, raw_fd: u64) -> bool {
+    if !is_event_fd(raw_fd) {
+        return false;
+    }
+    let idx = (linux_signed_int(raw_fd) - EVENT_FD_BASE) as usize;
+    with_step35_state(|state| {
+        state
+            .meta
+            .get(idx)
+            .is_some_and(|m| m.live && m.owners.has_owner(process))
+    })
+    .unwrap_or(false)
+}
+
+pub(super) fn append_open_event_fds(process: ObjectId, out: &mut alloc::vec::Vec<i32>) {
+    let _ = with_step35_state(|state| {
+        for (idx, m) in state.meta.iter().enumerate() {
+            if m.live && m.owners.has_owner(process) {
+                out.push(EVENT_FD_BASE + (idx as i32));
+            }
+        }
+    });
+}
+
+pub(super) fn on_process_fork(parent: ObjectId, child: ObjectId) {
+    let _ = with_step35_state(|state| {
+        for m in &mut state.meta {
+            if m.live {
+                m.owners.on_fork(parent, child);
+            }
+        }
+    });
+}
+
+pub(super) fn on_process_exec(process: ObjectId) {
+    let _ = with_step35_state(|state| {
+        for idx in 0..MAX_EVENT_FDS {
+            if state.meta[idx].live {
+                state.meta[idx].owners.close_cloexec_for(process);
+                state.retire_if_unused(idx);
+            }
+        }
+    });
+}
+
+pub(super) fn on_process_exit(process: ObjectId) {
+    let _ = with_step35_state(|state| {
+        for idx in 0..MAX_EVENT_FDS {
+            if state.meta[idx].live {
+                let _ = state.meta[idx].owners.close_owner(process);
+                state.retire_if_unused(idx);
+            }
+        }
+    });
+}
+
+pub(super) fn on_child_process_exited(parent_process: ObjectId, child_pid: u32, child_uid: u32) {
+    let _ = with_step35_state(|state| {
+        for idx in 0..MAX_EVENT_FDS {
+            if !state.meta[idx].live {
+                continue;
+            }
+            if state.events.pidfd_target(idx) == Ok(child_pid) {
+                state.events.mark_slot_pidfd_exited(idx);
+            }
+            if state.meta[idx].owners.has_owner(parent_process) {
+                state
+                    .events
+                    .notify_signal_slot(idx, 17, child_pid, child_uid);
+            }
+        }
+    });
+}
+
+pub(super) fn pidfd_target_for_process_fd(process: ObjectId, raw_fd: i32) -> Option<u32> {
+    if raw_fd < 0 {
+        return None;
+    }
+    let (idx, alias_gen) = resolve_event_target_for_process(process, raw_fd as u64).ok()?;
+    with_step35_state(|state| {
+        state.check_slot(process, idx, alias_gen).ok()?;
+        state.events.pidfd_target(idx).ok()
+    })
+    .ok()
+    .flatten()
+}
+
+pub(super) fn pidfd_target_for_current(raw_fd: u64) -> Result<u32, Errno> {
+    let process = slot_process_id();
+    let (idx, alias_gen) = resolve_event_target_for_process(process, raw_fd)?;
+    with_step35_state(|state| {
+        state.check_slot(process, idx, alias_gen)?;
+        state.events.pidfd_target(idx)
+    })
+    .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let _ = with_step35_state(|state| {
+        for idx in 0..MAX_EVENT_FDS {
+            let fd = EVENT_FD_BASE + (idx as i32);
+            if fd_in_close_range(fd, first, last)
+                && state.meta[idx].live
+                && state.meta[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
+                state.retire_if_unused(idx);
+            }
+        }
+    });
+}
+
 /// Reads a cgroup v2 control file under `/sys/fs/cgroup/<rel>` (Step 36/41).
 pub(super) fn read_cgroup_control_file(rel: &[u8], out: &mut [u8]) -> Result<usize, Errno> {
     with_step35_state(|state| state.cgroups.read_control_file(rel, out)).map_err(|()| Errno::EIO)?
@@ -288,11 +423,38 @@ pub(super) fn write_cgroup_control_file(rel: &[u8], val: &[u8]) -> Result<(), Er
         .map_err(|()| Errno::EIO)?
 }
 
-/// Creates a cgroup v2 subdirectory `/sys/fs/cgroup/<rel>` (Step 41).
-pub(super) fn cgroup_mkdir(rel: &[u8]) -> Result<(), Errno> {
-    with_step35_state(|state| state.cgroups.mkdir(rel))
+/// Creates a cgroup v2 subdirectory `/sys/fs/cgroup/<rel>` with POSIX parent checks.
+pub(super) fn cgroup_mkdir_strict(rel: &[u8]) -> Result<(), Errno> {
+    with_step35_state(|state| state.cgroups.mkdir_strict(rel))
         .map_err(|()| Errno::EIO)?
         .map(|_| ())
+}
+
+/// Removes an empty cgroup v2 subdirectory `/sys/fs/cgroup/<rel>`.
+pub(super) fn cgroup_rmdir(rel: &[u8]) -> Result<(), Errno> {
+    with_step35_state(|state| state.cgroups.rmdir(rel)).map_err(|()| Errno::EIO)?
+}
+
+/// Returns `true` if `/sys/fs/cgroup/<rel>` is a live cgroup directory.
+pub(super) fn cgroup_has_dir(rel: &[u8]) -> bool {
+    with_step35_state(|state| state.cgroups.has_dir(rel)).unwrap_or(false)
+}
+
+/// Lists immediate entries under `/sys/fs/cgroup/<rel>`, calling `emit(name, is_dir)`.
+pub(super) fn cgroup_list_dir(rel: &[u8], emit: impl FnMut(&[u8], bool)) -> bool {
+    with_step35_state(|state| state.cgroups.list_dir(rel, emit)).unwrap_or(false)
+}
+
+/// Formats the relative cgroup v2 path (`"/"` or `"/system.slice/..."`) for `pid`.
+pub(super) fn pid_cgroup_path(pid: u32, out: &mut [u8]) -> usize {
+    with_step35_state(|state| state.cgroups.pid_cgroup_path(pid, out)).unwrap_or_else(|()| {
+        if !out.is_empty() {
+            out[0] = b'/';
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Mutates the shared process security state (userns maps, seccomp policy, unshare) for Step 41.
@@ -355,7 +517,12 @@ pub(super) fn try_handle_syscall(
             frame.as_deref_mut(),
         )?)?)),
         // fcntl(fd, cmd, arg) for Step-35 memfd sealing
-        25 if is_event_fd(request.args[0]) || is_aliased_event_fd(request.args[0]) => {
+        25 if (is_event_fd(request.args[0]) || is_aliased_event_fd(request.args[0]))
+            && matches!(
+                linux_unsigned_int(request.args[1]),
+                F_ADD_SEALS | F_GET_SEALS
+            ) =>
+        {
             Ok(Some(encode_result(handle_event_fcntl(
                 request.args[0],
                 request.args[1],
@@ -544,10 +711,12 @@ fn encode_result(res: Result<i64, Errno>) -> SyscallReturn {
 fn handle_eventfd2(raw_initval: u64, raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
     let initval = linux_unsigned_int(raw_initval);
     let flags = linux_unsigned_int(raw_flags);
+    let process = slot_process_id();
     with_step35_state(|state| {
         let idx = state.events.eventfd2(initval, flags)?;
         state.init_slot(
             idx,
+            process,
             (flags & EVENT_CLOEXEC_FLAG) != 0,
             (flags & EVENT_NONBLOCK_FLAG) != 0,
         );
@@ -557,9 +726,10 @@ fn handle_eventfd2(raw_initval: u64, raw_flags: u64) -> Result<Result<i64, Errno
 
 fn handle_epoll_create1(raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
     let flags = linux_unsigned_int(raw_flags);
+    let process = slot_process_id();
     with_step35_state(|state| {
         let idx = state.events.epoll_create1(flags)?;
-        state.init_slot(idx, (flags & EVENT_CLOEXEC_FLAG) != 0, false);
+        state.init_slot(idx, process, (flags & EVENT_CLOEXEC_FLAG) != 0, false);
         Ok(i64::from(EVENT_FD_BASE + (idx as i32)))
     })
 }
@@ -585,8 +755,9 @@ fn handle_epoll_ctl(
     } else {
         None
     };
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(ep_idx, alias_gen)?;
+        state.check_slot(process, ep_idx, alias_gen)?;
         state
             .events
             .epoll_ctl(ep_idx, op, target_fd, ev)
@@ -816,27 +987,71 @@ fn probe_external_fd_readiness(process: ObjectId, raw_fd: u64) -> Result<u32, Er
     }
 }
 
+fn probe_epoll_external_fds_snapshot(
+    process: ObjectId,
+    ep_idx: usize,
+    alias_gen: Option<u64>,
+) -> Result<([i32; 64], [u32; 64], usize), Errno> {
+    let mut ext_fds = [-1i32; 64];
+    let ext_n = with_step35_state(|state| {
+        state.check_slot(process, ep_idx, alias_gen)?;
+        Ok::<usize, Errno>(state.events.collect_epoll_external_fds(
+            ep_idx,
+            EVENT_FD_BASE,
+            &mut ext_fds,
+        ))
+    })
+    .map_err(|()| Errno::EIO)??;
+    let mut ext_masks = [0u32; 64];
+    for i in 0..ext_n {
+        let fd = ext_fds[i];
+        if fd >= 0 {
+            ext_masks[i] = probe_external_fd_readiness(process, fd as u64).unwrap_or(0);
+        }
+    }
+    Ok((ext_fds, ext_masks, ext_n))
+}
+
+fn lookup_snapshot_mask(ext_fds: &[i32], ext_masks: &[u32], fd: i32) -> u32 {
+    ext_fds
+        .iter()
+        .position(|&f| f == fd)
+        .map_or(0, |i| ext_masks[i])
+}
+
+fn probe_event_slot_readiness(
+    process: ObjectId,
+    idx: usize,
+    alias_gen: Option<u64>,
+) -> Result<u32, Errno> {
+    let (ext_fds, ext_masks, ext_n) = probe_epoll_external_fds_snapshot(process, idx, alias_gen)?;
+    let (mono_ns, real_ns) = timerfd_clocks_now_ns();
+    with_step35_state(|state| {
+        state.events.refresh_timers(mono_ns, real_ns);
+        state.check_slot(process, idx, alias_gen)?;
+        state.events.poll_readiness_with(idx, EVENT_FD_BASE, |fd| {
+            lookup_snapshot_mask(&ext_fds[..ext_n], &ext_masks[..ext_n], fd)
+        })
+    })
+    .map_err(|()| Errno::EIO)?
+}
+
 fn probe_fd_readiness(process: ObjectId, raw_fd: u64) -> Result<u32, Errno> {
     if linux_signed_int(raw_fd) < 0 {
         return Err(Errno::EBADF);
     }
     if is_event_fd(raw_fd) {
         let idx = (linux_signed_int(raw_fd) - EVENT_FD_BASE) as usize;
-        return with_step35_state(|state| {
-            state.check_slot(idx, None)?;
-            state.events.poll_readiness(idx)
-        })
-        .map_err(|()| Errno::EIO)?;
+        return probe_event_slot_readiness(process, idx, None);
     }
     if let Some(handle) = lookup_aliased_subsystem(process, raw_fd)
         && handle.kind == SUBSYS_EVENT
     {
-        let idx = usize::from(handle.slot);
-        return with_step35_state(|state| {
-            state.check_slot(idx, Some(handle.generation))?;
-            state.events.poll_readiness(idx)
-        })
-        .map_err(|()| Errno::EIO)?;
+        return probe_event_slot_readiness(
+            process,
+            usize::from(handle.slot),
+            Some(handle.generation),
+        );
     }
     probe_external_fd_readiness(process, raw_fd)
 }
@@ -870,25 +1085,31 @@ fn handle_epoll_pwait(
     };
     let deadline = deadline_from_relative_ns(rel_ns)?;
     let process = current_process_object().ok_or(())?;
-    let cap = (maxevents as usize).min(8);
-    let mut ready = [EpollEvent { events: 0, data: 0 }; 8];
+    let cap = (maxevents as usize).min(32);
+    let mut ready = [EpollEvent { events: 0, data: 0 }; 32];
+    let mut ready_fds = [-1i32; 32];
     let old_sigmask = apply_optional_sigmask(temp_mask)?;
 
     let count = loop {
         super::step32_dev::poll_console_rx_and_deliver_signals();
+        let (mono_ns, real_ns) = timerfd_clocks_now_ns();
+        let (ext_fds, ext_masks, ext_n) =
+            match probe_epoll_external_fds_snapshot(process, ep_idx, alias_gen) {
+                Ok(snap) => snap,
+                Err(e) => {
+                    restore_optional_sigmask(old_sigmask);
+                    return Ok(BlockingCallResult::Err(e));
+                }
+            };
         let n = with_step35_state(|state| {
-            state.check_slot(ep_idx, alias_gen)?;
-            state.events.epoll_wait(
+            state.events.refresh_timers(mono_ns, real_ns);
+            state.check_slot(process, ep_idx, alias_gen)?;
+            state.events.epoll_wait_with_fds(
                 ep_idx,
                 EVENT_FD_BASE,
-                |fd| {
-                    if fd < 0 {
-                        0
-                    } else {
-                        probe_external_fd_readiness(process, fd as u64).unwrap_or(0)
-                    }
-                },
+                |fd| lookup_snapshot_mask(&ext_fds[..ext_n], &ext_masks[..ext_n], fd),
                 &mut ready[..cap],
+                &mut ready_fds[..cap],
             )
         })?;
         match n {
@@ -896,7 +1117,33 @@ fn handle_epoll_pwait(
                 restore_optional_sigmask(old_sigmask);
                 return Ok(BlockingCallResult::Err(e));
             }
-            Ok(c) if c > 0 || deadline == Some(0) => break c,
+            Ok(c) if c > 0 => {
+                let mut pri_fds = [-1i32; 32];
+                let mut pri_n = 0usize;
+                for i in 0..c {
+                    if (ready[i].events & u32::from(POLLPRI)) != 0 && ready_fds[i] >= 0 {
+                        super::step33_mounts::ack_mountinfo_poll_change(
+                            process,
+                            ready_fds[i] as u64,
+                        );
+                        pri_fds[pri_n] = ready_fds[i];
+                        pri_n += 1;
+                    }
+                }
+                if pri_n > 0 {
+                    let _ = with_step35_state(|state| {
+                        for &pfd in &pri_fds[..pri_n] {
+                            state.events.clear_watch_edge_bits(
+                                ep_idx,
+                                pfd,
+                                u32::from(POLLPRI) | u32::from(POLLERR),
+                            );
+                        }
+                    });
+                }
+                break c;
+            }
+            Ok(0) if deadline == Some(0) => break 0,
             Ok(0) => {
                 if let Some(dl) = deadline
                     && kernal_timer_aarch64::monotonic_now_ns().map_err(|_| ())? >= dl
@@ -1000,6 +1247,13 @@ fn handle_ppoll(
             }
         }
         if ready > 0 || deadline == Some(0) {
+            if ready > 0 {
+                for (i, &(fd, _)) in entries.iter().enumerate() {
+                    if fd >= 0 && (revents_out[i] & POLLPRI) != 0 {
+                        super::step33_mounts::ack_mountinfo_poll_change(process, fd as u64);
+                    }
+                }
+            }
             break ready;
         }
         if let Some(dl) = deadline
@@ -1333,8 +1587,9 @@ fn handle_event_fcntl(raw_fd: u64, raw_cmd: u64, raw_arg: u64) -> Result<Result<
     };
     let cmd = linux_unsigned_int(raw_cmd);
     let arg = linux_unsigned_int(raw_arg);
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         match cmd {
             F_ADD_SEALS => state.events.memfd_add_seals(idx, arg).map(|()| 0),
             F_GET_SEALS => state.events.memfd_get_seals(idx).map(i64::from),
@@ -1345,10 +1600,12 @@ fn handle_event_fcntl(raw_fd: u64, raw_cmd: u64, raw_arg: u64) -> Result<Result<
 
 fn handle_inotify_init1(raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
     let flags = linux_unsigned_int(raw_flags);
+    let process = slot_process_id();
     with_step35_state(|state| {
         let idx = state.events.inotify_init1(flags)?;
         state.init_slot(
             idx,
+            process,
             (flags & EVENT_CLOEXEC_FLAG) != 0,
             (flags & EVENT_NONBLOCK_FLAG) != 0,
         );
@@ -1365,14 +1622,15 @@ fn handle_inotify_add_watch(
         Ok(pair) => pair,
         Err(e) => return Ok(Err(e)),
     };
-    let mut path = [0u8; 64];
+    let mut path = [0u8; kernal_linux_events::INOTIFY_PATH_CAP];
     let len = match read_user_cstr(user_path, &mut path) {
         Ok(n) => n,
         Err(e) => return Ok(Err(e)),
     };
     let mask = linux_unsigned_int(raw_mask);
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         state
             .events
             .inotify_add_watch(idx, &path[..len], mask)
@@ -1386,22 +1644,29 @@ fn handle_inotify_rm_watch(raw_fd: u64, raw_wd: u64) -> Result<Result<i64, Errno
         Err(e) => return Ok(Err(e)),
     };
     let wd = linux_signed_int(raw_wd);
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         state.events.inotify_rm_watch(idx, wd).map(|()| 0)
     })
 }
 
 fn handle_memfd_create(user_name: u64, raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
-    let mut name = [0u8; 64];
+    let mut name = [0u8; 250];
     let len = match read_user_cstr(user_name, &mut name) {
         Ok(n) => n,
         Err(e) => return Ok(Err(e)),
     };
     let flags = linux_unsigned_int(raw_flags);
+    let process = slot_process_id();
     with_step35_state(|state| {
         let idx = state.events.memfd_create(&name[..len], flags)?;
-        state.init_slot(idx, (flags & MFD_CLOEXEC_FLAG) != 0, false);
+        state.init_slot(
+            idx,
+            process,
+            (flags & (MFD_CLOEXEC_FLAG | MFD_NOEXEC_SEAL_FLAG)) != 0,
+            false,
+        );
         Ok(i64::from(EVENT_FD_BASE + (idx as i32)))
     })
 }
@@ -1414,8 +1679,9 @@ fn handle_memfd_truncate(raw_fd: u64, raw_len: u64) -> Result<Result<i64, Errno>
     let Ok(new_len) = usize::try_from(raw_len) else {
         return Ok(Err(Errno::EINVAL));
     };
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         state.events.memfd_truncate(idx, new_len).map(|()| 0)
     })
 }
@@ -1444,9 +1710,10 @@ fn handle_signalfd4(
         }
     };
     let flags = linux_unsigned_int(raw_flags);
+    let process = slot_process_id();
     with_step35_state(|state| {
         if let Some((idx, alias_gen)) = existing {
-            state.check_slot(idx, alias_gen)?;
+            state.check_slot(process, idx, alias_gen)?;
         }
         let idx = state
             .events
@@ -1454,6 +1721,7 @@ fn handle_signalfd4(
         if existing.is_none() {
             state.init_slot(
                 idx,
+                process,
                 (flags & EVENT_CLOEXEC_FLAG) != 0,
                 (flags & EVENT_NONBLOCK_FLAG) != 0,
             );
@@ -1465,15 +1733,26 @@ fn handle_signalfd4(
 fn handle_timerfd_create(raw_clockid: u64, raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
     let clock_id = linux_unsigned_int(raw_clockid);
     let flags = linux_unsigned_int(raw_flags);
+    let process = slot_process_id();
     with_step35_state(|state| {
         let idx = state.events.timerfd_create(clock_id, flags)?;
         state.init_slot(
             idx,
+            process,
             (flags & EVENT_CLOEXEC_FLAG) != 0,
             (flags & EVENT_NONBLOCK_FLAG) != 0,
         );
         Ok(i64::from(EVENT_FD_BASE + (idx as i32)))
     })
+}
+
+fn timerfd_clocks_now_ns() -> (u64, u64) {
+    let mono_ns = kernal_timer_aarch64::monotonic_now_ns().unwrap_or(0);
+    let base_secs = super::step42_hardware::rtc_epoch_base_seconds();
+    let real_ns = base_secs
+        .saturating_mul(1_000_000_000)
+        .saturating_add(mono_ns);
+    (mono_ns, real_ns)
 }
 
 fn handle_timerfd_settime(
@@ -1512,9 +1791,14 @@ fn handle_timerfd_settime(
         .saturating_mul(1_000_000_000)
         .saturating_add(val_nsec as u64);
     let flags = linux_unsigned_int(raw_flags);
+    let (mono_ns, real_ns) = timerfd_clocks_now_ns();
+    let process = slot_process_id();
     let old = with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
-        state.events.timerfd_settime(idx, flags, new_int, new_val)
+        state.events.refresh_timers(mono_ns, real_ns);
+        state.check_slot(process, idx, alias_gen)?;
+        state
+            .events
+            .timerfd_settime_clocks(idx, flags, new_int, new_val, mono_ns, real_ns)
     })?;
     let (old_int, old_val) = match old {
         Ok(pair) => pair,
@@ -1537,9 +1821,12 @@ fn handle_timerfd_gettime(raw_ufd: u64, user_curr: u64) -> Result<Result<i64, Er
     if user_curr == 0 {
         return Ok(Err(Errno::EFAULT));
     }
+    let (mono_ns, real_ns) = timerfd_clocks_now_ns();
+    let process = slot_process_id();
     let res = with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
-        state.events.timerfd_gettime(idx)
+        state.events.refresh_timers(mono_ns, real_ns);
+        state.check_slot(process, idx, alias_gen)?;
+        state.events.timerfd_gettime_live(idx, mono_ns, real_ns)
     })?;
     let (int_ns, val_ns) = match res {
         Ok(pair) => pair,
@@ -1563,7 +1850,8 @@ fn encode_itimerspec(int_ns: u64, val_ns: u64) -> [u8; 32] {
 
 fn handle_close(raw_fd: u64) -> Result<Result<i64, Errno>, ()> {
     let idx = (linux_signed_int(raw_fd) - EVENT_FD_BASE) as usize;
-    with_step35_state(|state| state.close_native_slot(idx).map(|()| 0))
+    let process = slot_process_id();
+    with_step35_state(|state| state.close_native_slot(process, idx).map(|()| 0))
 }
 
 fn handle_lseek(raw_fd: u64, offset: i64, whence: i32) -> Result<Result<i64, Errno>, ()> {
@@ -1571,8 +1859,9 @@ fn handle_lseek(raw_fd: u64, offset: i64, whence: i32) -> Result<Result<i64, Err
         Ok(pair) => pair,
         Err(e) => return Ok(Err(e)),
     };
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         state.events.lseek(idx, offset, whence)
     })
 }
@@ -1590,8 +1879,11 @@ fn handle_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Err
         return Ok(Err(Errno::EFAULT));
     }
     let mut buf = vec![0u8; take];
+    let (mono_ns, real_ns) = timerfd_clocks_now_ns();
+    let process = slot_process_id();
     let res = with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.events.refresh_timers(mono_ns, real_ns);
+        state.check_slot(process, idx, alias_gen)?;
         state.events.read(idx, &mut buf[..take])
     })?;
     let n = match res {
@@ -1622,8 +1914,9 @@ fn handle_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Er
     if let Err(e) = copy_from_user(&mut buf[..take], user_buf) {
         return Ok(Err(e));
     }
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         state.events.write(idx, &buf[..take]).map(|w| w as i64)
     })
 }
@@ -1633,22 +1926,107 @@ fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()
         Ok(pair) => pair,
         Err(e) => return Ok(Err(e)),
     };
-    let valid = with_step35_state(|state| state.check_slot(idx, alias_gen).is_ok())?;
-    if !valid {
-        return Ok(Err(Errno::EBADF));
-    }
+    let process = slot_process_id();
+    let st_size = with_step35_state(|state| {
+        state.check_slot(process, idx, alias_gen)?;
+        Ok(state.events.memfd_len(idx) as i64)
+    })?;
+    let st_size = match st_size {
+        Ok(sz) => sz,
+        Err(e) => return Ok(Err(e)),
+    };
     if user_statbuf == 0 {
         return Ok(Err(Errno::EFAULT));
     }
     let mut stat = [0u8; ARM64_STAT_BYTES];
-    stat[8..16].copy_from_slice(&2000u64.to_le_bytes()); // st_ino
+    stat[8..16].copy_from_slice(&(2000u64 + idx as u64).to_le_bytes()); // st_ino
     stat[16..20].copy_from_slice(&S_IFREG_MODE.to_le_bytes());
     stat[20..24].copy_from_slice(&1u32.to_le_bytes());
+    stat[48..56].copy_from_slice(&st_size.to_le_bytes());
     stat[56..60].copy_from_slice(&4096i32.to_le_bytes());
     if let Err(e) = copy_to_user(user_statbuf, &stat) {
         return Ok(Err(e));
     }
     Ok(Ok(0))
+}
+
+pub(super) fn try_read_memfd_for_mmap(
+    process: ObjectId,
+    raw_fd: u64,
+    require_writable: bool,
+) -> Result<Option<(alloc::vec::Vec<u8>, usize, u64)>, Errno> {
+    let is_ev = is_event_fd(raw_fd)
+        || lookup_aliased_subsystem(process, raw_fd).is_some_and(|h| h.kind == SUBSYS_EVENT);
+    if !is_ev {
+        return Ok(None);
+    }
+    let (idx, alias_gen) = resolve_event_target(raw_fd)?;
+    let res = with_step35_state(|state| {
+        state.check_slot(process, idx, alias_gen)?;
+        let (slice, seals) = state.events.memfd_snapshot(idx)?;
+        if require_writable
+            && (seals
+                & (kernal_linux_events::F_SEAL_WRITE | kernal_linux_events::F_SEAL_FUTURE_WRITE))
+                != 0
+        {
+            return Err(Errno::EPERM);
+        }
+        let gen_id = state.meta[idx].generation;
+        Ok((slice.to_vec(), idx, gen_id))
+    })
+    .map_err(|()| Errno::EIO)?;
+    res.map(Some)
+}
+
+pub(super) fn write_back_memfd_mmap(
+    idx: usize,
+    expected_gen: u64,
+    file_offset: usize,
+    data: &[u8],
+) {
+    let _ = with_step35_state(|state| {
+        if state
+            .meta
+            .get(idx)
+            .is_some_and(|m| m.live && m.generation == expected_gen)
+        {
+            let _ = state.events.memfd_write_at(idx, file_offset, data);
+        }
+    });
+}
+
+pub(super) fn open_pidfd_for_process(process: ObjectId, pid: u32) -> Result<i32, Errno> {
+    alloc_pidfd_for_process(process, pid, 0)
+}
+
+fn alloc_pidfd_for_process(process: ObjectId, pid: u32, flags: u32) -> Result<i32, Errno> {
+    let Some(nz_pid) = core::num::NonZeroU32::new(pid) else {
+        return Err(Errno::EINVAL);
+    };
+    let idx = with_step35_state(|state| {
+        let idx = state.events.pidfd_open(pid, flags)?;
+        state.init_slot(idx, process, true, (flags & EVENT_NONBLOCK_FLAG) != 0);
+        Ok(idx)
+    })
+    .map_err(|()| Errno::EIO)??;
+    // Verify target existence and zombie status after slot insertion so a concurrent exit cannot
+    // race between the runtime check and PidFd publication without nesting runtime <- step35 locks.
+    match super::runtime::with_linux_runtime(|state| state.proc_snapshot_by_pid(nz_pid)) {
+        Ok(None) => {
+            let _ = with_step35_state(|state| {
+                let _ = state.meta[idx].owners.close_owner(process);
+                state.retire_if_unused(idx);
+            });
+            return Err(Errno::ESRCH);
+        }
+        Ok(Some(snap)) if snap.state_char == b'Z' => {
+            let _ = with_step35_state(|state| {
+                state.events.mark_slot_pidfd_exited(idx);
+            });
+        }
+        Ok(Some(_)) | Err(_) => {}
+    }
+    Ok(EVENT_FD_BASE + (idx as i32))
 }
 
 fn handle_pidfd_open(raw_pid: u64, raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
@@ -1657,11 +2035,7 @@ fn handle_pidfd_open(raw_pid: u64, raw_flags: u64) -> Result<Result<i64, Errno>,
         return Ok(Err(Errno::EINVAL));
     }
     let flags = linux_unsigned_int(raw_flags);
-    with_step35_state(|state| {
-        let idx = state.events.pidfd_open(pid as u32, flags)?;
-        state.init_slot(idx, true, (flags & EVENT_NONBLOCK_FLAG) != 0);
-        Ok(i64::from(EVENT_FD_BASE + (idx as i32)))
-    })
+    Ok(alloc_pidfd_for_process(slot_process_id(), pid as u32, flags).map(i64::from))
 }
 
 fn handle_pidfd_send_signal(
@@ -1680,8 +2054,9 @@ fn handle_pidfd_send_signal(
     if !(0..=64).contains(&sig) {
         return Ok(Err(Errno::EINVAL));
     }
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.check_slot(idx, alias_gen)?;
+        state.check_slot(process, idx, alias_gen)?;
         let target_pid = state.events.pidfd_target(idx)?;
         if sig > 0 {
             state.events.notify_signal(sig as u32, target_pid, 0);
@@ -1701,16 +2076,11 @@ fn handle_close_range(
     if first > last || (flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC)) != 0 {
         return Ok(Err(Errno::EINVAL));
     }
-    if (flags & CLOSE_RANGE_CLOEXEC) == 0 {
-        with_step35_state(|state| {
-            for idx in 0..MAX_EVENT_FDS {
-                let fd = (EVENT_FD_BASE as u32) + (idx as u32);
-                if fd >= first && fd <= last {
-                    let _ = state.close_native_slot(idx);
-                }
-            }
-        })?;
-    }
+    super::step_fd_util::close_range_for_all_subsystems(
+        first,
+        last,
+        (flags & CLOSE_RANGE_CLOEXEC) != 0,
+    )?;
     Ok(Ok(0))
 }
 

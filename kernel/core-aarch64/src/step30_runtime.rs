@@ -253,7 +253,17 @@ pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Res
             options,
             rusage,
         } => {
-            let plan = match waitid_observation_plan(which, id, options, rusage) {
+            let (effective_which, effective_id) =
+                if decode_waitid_type(which) == Some(WaitIdType::PidFd) {
+                    match super::step35_events_cgroup::pidfd_target_for_current(id) {
+                        Ok(target_pid) => (1u64, u64::from(target_pid)),
+                        Err(errno) => return Ok(Outcome::Return(SyscallReturn::error(errno))),
+                    }
+                } else {
+                    (which, id)
+                };
+            let plan = match waitid_observation_plan(effective_which, effective_id, options, rusage)
+            {
                 Ok(Some(plan)) => plan,
                 Ok(None) => return Ok(Outcome::NotHandled),
                 Err(errno) => return Ok(Outcome::Return(SyscallReturn::error(errno))),

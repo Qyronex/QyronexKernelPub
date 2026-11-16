@@ -30,11 +30,6 @@ enum ContainerFileKind {
     GidMap,
     Setgroups,
     Ns(NamespaceFd),
-    CgroupCtrl {
-        rel: [u8; 48],
-        rel_len: usize,
-        writable: bool,
-    },
     OverlayFile {
         path: [u8; 64],
         path_len: usize,
@@ -120,6 +115,13 @@ pub(super) const fn is_container_fd(raw_fd: u64) -> bool {
     fd >= CONTAINER_FD_BASE && fd < CONTAINER_FD_BASE + (MAX_CONTAINER_FDS as i32)
 }
 
+pub(super) fn is_open_container_fd(raw_fd: u64) -> bool {
+    let Ok(idx) = container_idx(raw_fd) else {
+        return false;
+    };
+    with_step41_state(|state| state.fds[idx].kind != ContainerFileKind::None).unwrap_or(false)
+}
+
 fn container_idx(raw_fd: u64) -> Result<usize, Errno> {
     if !is_container_fd(raw_fd) {
         return Err(Errno::EBADF);
@@ -129,8 +131,6 @@ fn container_idx(raw_fd: u64) -> Result<usize, Errno> {
 
 pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<SyscallReturn>, ()> {
     match request.number {
-        // mkdirat(dirfd, pathname, mode) on `/sys/fs/cgroup/...`
-        34 => handle_mkdirat_if_cgroup(request.args[1]),
         // openat(dirfd, pathname, flags, mode)
         56 => handle_openat_if_container(request.args[1], request.args[2]),
         // close(fd)
@@ -183,18 +183,6 @@ fn encode_result(res: Result<i64, Errno>) -> SyscallReturn {
         Ok(val) => SyscallReturn::success(val).unwrap_or(SyscallReturn::error(Errno::EINVAL)),
         Err(errno) => SyscallReturn::error(errno),
     }
-}
-
-fn handle_mkdirat_if_cgroup(user_path: u64) -> Result<Option<SyscallReturn>, ()> {
-    let mut path_buf = [0u8; 96];
-    let Ok(len) = read_user_cstr(user_path, &mut path_buf) else {
-        return Ok(None);
-    };
-    let Some(rel) = path_buf[..len].strip_prefix(b"/sys/fs/cgroup/") else {
-        return Ok(None);
-    };
-    let res = super::step35_events_cgroup::cgroup_mkdir(rel).map(|()| 0i64);
-    Ok(Some(encode_result(res)))
 }
 
 fn parse_proc_container_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
@@ -268,17 +256,6 @@ fn handle_openat_if_container(user_path: u64, flags: u64) -> Result<Option<Sysca
         } else {
             None
         }
-    } else if writable && let Some(cg_rel) = path.strip_prefix(b"/sys/fs/cgroup/") {
-        if cg_rel.len() > 48 {
-            return Ok(Some(SyscallReturn::error(Errno::ENAMETOOLONG)));
-        }
-        let mut rel = [0u8; 48];
-        rel[..cg_rel.len()].copy_from_slice(cg_rel);
-        Some(ContainerFileKind::CgroupCtrl {
-            rel,
-            rel_len: cg_rel.len(),
-            writable: true,
-        })
     } else if let Some(ov_rel) = path.strip_prefix(b"/container/rootfs") {
         let norm = if ov_rel.is_empty() { b"/" } else { ov_rel };
         if norm.len() > 64 {
@@ -351,13 +328,6 @@ fn handle_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Err
                 Err(()) => return Err(()),
             }
         }
-        ContainerFileKind::CgroupCtrl { rel, rel_len, .. } => {
-            match super::step35_events_cgroup::read_cgroup_control_file(&rel[..rel_len], &mut data)
-            {
-                Ok(n) => n,
-                Err(e) => return Ok(Err(e)),
-            }
-        }
         ContainerFileKind::OverlayFile { path, path_len, .. } => {
             match with_step41_state(|state| {
                 let (_, content) = state
@@ -412,10 +382,6 @@ fn handle_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Er
         }
         ContainerFileKind::Setgroups => {
             super::step35_events_cgroup::with_security_state(|sec| sec.write_setgroups(payload))?
-                .map(|()| write_len as i64)
-        }
-        ContainerFileKind::CgroupCtrl { rel, rel_len, .. } => {
-            super::step35_events_cgroup::write_cgroup_control_file(&rel[..rel_len], payload)
                 .map(|()| write_len as i64)
         }
         ContainerFileKind::OverlayFile {

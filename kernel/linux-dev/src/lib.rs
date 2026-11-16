@@ -176,7 +176,7 @@ fn classify_dev_subpath(subpath: &[u8]) -> Option<DeviceNodeKind> {
         b"random" => Some(DeviceNodeKind::Random),
         b"urandom" => Some(DeviceNodeKind::Urandom),
         b"tty" => Some(DeviceNodeKind::Tty),
-        b"console" => Some(DeviceNodeKind::Console),
+        b"console" | b"ttyAMA0" => Some(DeviceNodeKind::Console),
         b"ptmx" | b"pts/ptmx" => Some(DeviceNodeKind::Ptmx),
         _ => {
             let digits = subpath.strip_prefix(b"pts/")?;
@@ -1201,6 +1201,10 @@ mod tests {
         assert_eq!(classify_dev_path(b"/dev/tty"), Some(DeviceNodeKind::Tty));
         assert_eq!(
             classify_dev_path(b"/dev/console"),
+            Some(DeviceNodeKind::Console)
+        );
+        assert_eq!(
+            classify_dev_path(b"/dev/ttyAMA0"),
             Some(DeviceNodeKind::Console)
         );
         assert_eq!(classify_dev_path(b"/dev/ptmx"), Some(DeviceNodeKind::Ptmx));

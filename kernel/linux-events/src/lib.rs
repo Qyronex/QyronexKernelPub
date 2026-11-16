@@ -38,6 +38,7 @@ pub const CLOCK_REALTIME: u32 = 0;
 pub const CLOCK_MONOTONIC: u32 = 1;
 pub const CLOCK_BOOTTIME: u32 = 7;
 pub const TFD_TIMER_ABSTIME: u32 = 1;
+pub const TFD_TIMER_CANCEL_ON_SET: u32 = 2;
 pub const TFD_NONBLOCK: u32 = O_NONBLOCK;
 pub const TFD_CLOEXEC: u32 = O_CLOEXEC;
 
@@ -59,6 +60,8 @@ pub const IN_DELETE: u32 = 0x0000_0200;
 pub const IN_DELETE_SELF: u32 = 0x0000_0400;
 pub const IN_MOVE_SELF: u32 = 0x0000_0800;
 pub const IN_ALL_EVENTS: u32 = 0x0000_0fff;
+pub const INOTIFY_PATH_CAP: usize = 256;
+pub const MAX_INOTIFY_WATCHES: usize = 64;
 
 /// `memfd_create` and sealing constants (`<linux/memfd.h>`, `<linux/fcntl.h>`).
 pub const MFD_CLOEXEC: u32 = 0x0001;
@@ -125,6 +128,7 @@ pub struct EpollWatch {
     events: u32,
     data: u64,
     armed: bool,
+    last_edge_mask: u32,
 }
 
 impl EpollWatch {
@@ -134,6 +138,7 @@ impl EpollWatch {
         events: 0,
         data: 0,
         armed: false,
+        last_edge_mask: 0,
     };
 }
 
@@ -142,7 +147,7 @@ pub struct InotifyWatch {
     live: bool,
     wd: i32,
     mask: u32,
-    path: [u8; 64],
+    path: [u8; INOTIFY_PATH_CAP],
     path_len: usize,
 }
 
@@ -151,7 +156,7 @@ impl InotifyWatch {
         live: false,
         wd: 0,
         mask: 0,
-        path: [0u8; 64],
+        path: [0u8; INOTIFY_PATH_CAP],
         path_len: 0,
     };
 }
@@ -162,7 +167,7 @@ pub enum EventObject<const MEMFD_CAP: usize> {
     Empty,
     Epoll {
         cloexec: bool,
-        watches: [EpollWatch; 8],
+        watches: [EpollWatch; 32],
     },
     EventFd {
         counter: u64,
@@ -177,6 +182,7 @@ pub enum EventObject<const MEMFD_CAP: usize> {
         interval_ns: u64,
         value_ns: u64,
         expirations: u64,
+        deadline_ns: Option<u64>,
     },
     SignalFd {
         mask: u64,
@@ -190,8 +196,8 @@ pub enum EventObject<const MEMFD_CAP: usize> {
         nonblocking: bool,
         cloexec: bool,
         next_wd: i32,
-        watches: [InotifyWatch; 8],
-        queue: [u8; 256],
+        watches: [InotifyWatch; MAX_INOTIFY_WATCHES],
+        queue: [u8; 1024],
         queue_len: usize,
     },
     MemFd {
@@ -255,8 +261,20 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         }
         self.alloc_slot(EventObject::Epoll {
             cloexec: (flags & EPOLL_CLOEXEC) != 0,
-            watches: [EpollWatch::EMPTY; 8],
+            watches: [EpollWatch::EMPTY; 32],
         })
+    }
+
+    pub fn epoll_watch_targets(&self, epfd_idx: usize) -> [Option<(i32, u32)>; 32] {
+        let mut out = [None; 32];
+        if let Some(EventObject::Epoll { watches, .. }) = self.slots.get(epfd_idx) {
+            for (i, w) in watches.iter().enumerate() {
+                if w.live && w.armed {
+                    out[i] = Some((w.target_fd, w.events));
+                }
+            }
+        }
+        out
     }
 
     /// Adds, modifies, or deletes an interest in an `epoll` instance (`epoll_ctl(2)`).
@@ -287,6 +305,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
                     events: ev.events,
                     data: ev.data,
                     armed: true,
+                    last_edge_mask: 0,
                 };
                 Ok(())
             }
@@ -299,6 +318,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
                 existing.events = ev.events;
                 existing.data = ev.data;
                 existing.armed = true;
+                existing.last_edge_mask = 0;
                 Ok(())
             }
             EPOLL_CTL_DEL => {
@@ -313,17 +333,150 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         }
     }
 
+    fn collect_external_fds_inner(
+        &self,
+        epfd_idx: usize,
+        fd_base: i32,
+        depth: usize,
+        visited_mask: &mut u64,
+        out: &mut [i32],
+        out_len: &mut usize,
+    ) {
+        if depth >= 4 || epfd_idx >= MAX_FDS {
+            return;
+        }
+        if epfd_idx < 64 {
+            let bit = 1u64 << epfd_idx;
+            if (*visited_mask & bit) != 0 {
+                return;
+            }
+            *visited_mask |= bit;
+        }
+        let Some(EventObject::Epoll { watches, .. }) = self.slots.get(epfd_idx) else {
+            return;
+        };
+        for w in watches {
+            if !w.live || !w.armed {
+                continue;
+            }
+            let fd = w.target_fd;
+            if fd >= fd_base && (fd - fd_base) < (MAX_FDS as i32) {
+                let target_idx = (fd - fd_base) as usize;
+                if matches!(self.slots.get(target_idx), Some(EventObject::Epoll { .. })) {
+                    self.collect_external_fds_inner(
+                        target_idx,
+                        fd_base,
+                        depth + 1,
+                        visited_mask,
+                        out,
+                        out_len,
+                    );
+                }
+            } else if !out[..*out_len].contains(&fd) && *out_len < out.len() {
+                out[*out_len] = fd;
+                *out_len += 1;
+            }
+        }
+    }
+
+    /// Collects all unique external (non-event-table) target FDs watched by `epfd_idx`
+    /// and any nested `epoll` instances up to depth 4, enabling external readiness probing
+    /// without holding the event table lock.
+    pub fn collect_epoll_external_fds(
+        &self,
+        epfd_idx: usize,
+        fd_base: i32,
+        out: &mut [i32],
+    ) -> usize {
+        let mut visited_mask = 0u64;
+        let mut count = 0usize;
+        self.collect_external_fds_inner(epfd_idx, fd_base, 0, &mut visited_mask, out, &mut count);
+        count
+    }
+
+    fn eval_watch_match<F>(
+        &self,
+        w: &EpollWatch,
+        fd_base: i32,
+        depth: usize,
+        external_readiness: &F,
+    ) -> (u32, bool)
+    where
+        F: Fn(i32) -> u32,
+    {
+        let ready_mask = if w.target_fd >= fd_base && (w.target_fd - fd_base) < (MAX_FDS as i32) {
+            let target_idx = (w.target_fd - fd_base) as usize;
+            self.slot_readiness_with(target_idx, fd_base, depth, external_readiness)
+        } else {
+            external_readiness(w.target_fd)
+        };
+        let interest = (w.events & !(EPOLLET | EPOLLONESHOT)) | EPOLLERR | EPOLLHUP;
+        let matched = ready_mask & interest;
+        let trigger = if (w.events & EPOLLET) != 0 {
+            (matched & !w.last_edge_mask) != 0
+        } else {
+            matched != 0
+        };
+        (matched, trigger)
+    }
+
+    fn slot_readiness_with<F>(
+        &self,
+        idx: usize,
+        fd_base: i32,
+        depth: usize,
+        external_readiness: &F,
+    ) -> u32
+    where
+        F: Fn(i32) -> u32,
+    {
+        match self.slots.get(idx) {
+            Some(EventObject::Epoll { watches, .. }) => {
+                if depth >= 4 {
+                    return 0;
+                }
+                for w in watches {
+                    if !w.live || !w.armed {
+                        continue;
+                    }
+                    let (_, triggered) =
+                        self.eval_watch_match(w, fd_base, depth + 1, external_readiness);
+                    if triggered {
+                        return EPOLLIN;
+                    }
+                }
+                0
+            }
+            _ => self.internal_readiness(idx),
+        }
+    }
+
     /// Polls an `epoll` instance (`epoll_pwait(2)`), evaluating readiness across internal
-    /// event descriptors and an external readiness predicate (e.g. sockets/pipes/PTYS).
+    /// event descriptors (including nested `epoll` instances) and an external readiness predicate.
     pub fn epoll_wait<F>(
         &mut self,
         epfd_idx: usize,
         fd_base: i32,
-        mut external_readiness: F,
+        external_readiness: F,
         out: &mut [EpollEvent],
     ) -> Result<usize, Errno>
     where
-        F: FnMut(i32) -> u32,
+        F: Fn(i32) -> u32,
+    {
+        self.epoll_wait_with_fds(epfd_idx, fd_base, external_readiness, out, &mut [])
+    }
+
+    /// Polls `epfd_idx`, writing matched events to `out` and (when non-empty) target FDs to `out_fds`.
+    pub fn epoll_wait_with_fds<F>(
+        &mut self,
+        epfd_idx: usize,
+        fd_base: i32,
+        external_readiness: F,
+        out: &mut [EpollEvent],
+        out_fds: &mut [i32],
+    ) -> Result<usize, Errno>
+    where
+        F: Fn(i32) -> u32,
     {
         if out.is_empty() {
             return Err(Errno::EINVAL);
@@ -339,20 +492,18 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             if !w.live || !w.armed || count >= out.len() {
                 continue;
             }
-            let ready_mask = if w.target_fd >= fd_base && (w.target_fd - fd_base) < (MAX_FDS as i32)
-            {
-                let target_idx = (w.target_fd - fd_base) as usize;
-                self.internal_readiness(target_idx)
-            } else {
-                external_readiness(w.target_fd)
-            };
-
-            let matched = ready_mask & (w.events | EPOLLERR | EPOLLHUP);
-            if matched != 0 {
+            let (matched, trigger) = self.eval_watch_match(w, fd_base, 0, &external_readiness);
+            if (w.events & EPOLLET) != 0 {
+                w.last_edge_mask = matched;
+            }
+            if trigger {
                 out[count] = EpollEvent {
                     events: matched,
                     data: w.data,
                 };
+                if count < out_fds.len() {
+                    out_fds[count] = w.target_fd;
+                }
                 count += 1;
                 if (w.events & EPOLLONESHOT) != 0 {
                     w.armed = false;
@@ -369,13 +520,39 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         Ok(count)
     }
 
-    /// Returns the Linux `POLL*`/`EPOLL*` readiness bitmask for an event/timer/signal/inotify/memfd/pidfd slot.
-    pub fn poll_readiness(&self, idx: usize) -> Result<u32, Errno> {
+    /// Clears specific edge-detection bits in `epfd_idx` for `target_fd` after a one-shot
+    /// readiness change (such as `/proc/self/mountinfo` generation bump) has been consumed.
+    pub fn clear_watch_edge_bits(&mut self, epfd_idx: usize, target_fd: i32, bits: u32) {
+        if let Some(EventObject::Epoll { watches, .. }) = self.slots.get_mut(epfd_idx) {
+            for w in watches {
+                if w.live && w.target_fd == target_fd {
+                    w.last_edge_mask &= !bits;
+                }
+            }
+        }
+    }
+
+    /// Returns the Linux `POLL*`/`EPOLL*` readiness bitmask for an internal slot, supporting
+    /// nested `epoll` instances via `external_readiness`.
+    pub fn poll_readiness_with<F>(
+        &self,
+        idx: usize,
+        fd_base: i32,
+        external_readiness: F,
+    ) -> Result<u32, Errno>
+    where
+        F: Fn(i32) -> u32,
+    {
         let slot = self.slots.get(idx).ok_or(Errno::EBADF)?;
         if matches!(slot, EventObject::Empty) {
             return Err(Errno::EBADF);
         }
-        Ok(self.internal_readiness(idx))
+        Ok(self.slot_readiness_with(idx, fd_base, 0, &external_readiness))
+    }
+
+    /// Returns the Linux `POLL*`/`EPOLL*` readiness bitmask for an event/timer/signal/inotify/memfd/pidfd slot.
+    pub fn poll_readiness(&self, idx: usize) -> Result<u32, Errno> {
+        self.poll_readiness_with(idx, 0, |_| 0)
     }
 
     fn internal_readiness(&self, idx: usize) -> u32 {
@@ -430,7 +607,55 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             interval_ns: 0,
             value_ns: 0,
             expirations: 0,
+            deadline_ns: None,
         })
+    }
+
+    fn clock_now_for(clock_id: u32, now_mono_ns: u64, now_real_ns: u64) -> u64 {
+        if clock_id == CLOCK_REALTIME {
+            now_real_ns
+        } else {
+            now_mono_ns
+        }
+    }
+
+    fn advance_timer(
+        interval_ns: u64,
+        expirations: &mut u64,
+        deadline_ns: &mut Option<u64>,
+        now_ns: u64,
+    ) {
+        let Some(dl) = *deadline_ns else {
+            return;
+        };
+        if now_ns < dl {
+            return;
+        }
+        let elapsed = now_ns - dl;
+        if let Some(extra) = elapsed.checked_div(interval_ns) {
+            *expirations = expirations.saturating_add(1).saturating_add(extra);
+            *deadline_ns = Some(dl.saturating_add((extra + 1).saturating_mul(interval_ns)));
+        } else {
+            *expirations = expirations.saturating_add(1);
+            *deadline_ns = None;
+        }
+    }
+
+    /// Refreshes all armed timers against the current monotonic and realtime clocks.
+    pub fn refresh_timers(&mut self, now_mono_ns: u64, now_real_ns: u64) {
+        for slot in &mut self.slots {
+            if let EventObject::TimerFd {
+                clock_id,
+                interval_ns,
+                expirations,
+                deadline_ns,
+                ..
+            } = slot
+            {
+                let now = Self::clock_now_for(*clock_id, now_mono_ns, now_real_ns);
+                Self::advance_timer(*interval_ns, expirations, deadline_ns, now);
+            }
+        }
     }
 
     /// Arms or disarms a `timerfd` (`timerfd_settime(2)`), returning `(old_interval_ns, old_value_ns)`.
@@ -441,39 +666,123 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         new_interval_ns: u64,
         new_value_ns: u64,
     ) -> Result<(u64, u64), Errno> {
-        if flags & !TFD_TIMER_ABSTIME != 0 {
+        self.timerfd_settime_inner(idx, flags, new_interval_ns, new_value_ns, None)
+    }
+
+    /// Arms or disarms a `timerfd` against live monotonic/realtime clocks.
+    pub fn timerfd_settime_clocks(
+        &mut self,
+        idx: usize,
+        flags: u32,
+        new_interval_ns: u64,
+        new_value_ns: u64,
+        now_mono_ns: u64,
+        now_real_ns: u64,
+    ) -> Result<(u64, u64), Errno> {
+        self.timerfd_settime_inner(
+            idx,
+            flags,
+            new_interval_ns,
+            new_value_ns,
+            Some((now_mono_ns, now_real_ns)),
+        )
+    }
+
+    fn timerfd_settime_inner(
+        &mut self,
+        idx: usize,
+        flags: u32,
+        new_interval_ns: u64,
+        new_value_ns: u64,
+        now_clocks: Option<(u64, u64)>,
+    ) -> Result<(u64, u64), Errno> {
+        if flags & !(TFD_TIMER_ABSTIME | TFD_TIMER_CANCEL_ON_SET) != 0 {
             return Err(Errno::EINVAL);
         }
         let slot = self.slots.get_mut(idx).ok_or(Errno::EBADF)?;
         let EventObject::TimerFd {
+            clock_id,
             interval_ns,
             value_ns,
             expirations,
+            deadline_ns,
             ..
         } = slot
         else {
             return Err(Errno::EINVAL);
         };
-        let old = (*interval_ns, *value_ns);
+        if (flags & TFD_TIMER_CANCEL_ON_SET) != 0 && (flags & TFD_TIMER_ABSTIME) == 0 {
+            return Err(Errno::EINVAL);
+        }
+        let old = if let Some((mono, real)) = now_clocks {
+            let now = Self::clock_now_for(*clock_id, mono, real);
+            Self::advance_timer(*interval_ns, expirations, deadline_ns, now);
+            let rem = deadline_ns.map_or(0, |dl| dl.saturating_sub(now));
+            (*interval_ns, rem)
+        } else {
+            (*interval_ns, *value_ns)
+        };
         *interval_ns = new_interval_ns;
         *value_ns = new_value_ns;
-        // When armed with a positive timer value, mark 1 expiration ready so non-blocking event loops
-        // can observe timer completion deterministically without hanging.
-        *expirations = u64::from(new_value_ns > 0);
+        if let Some((mono, real)) = now_clocks {
+            let now = Self::clock_now_for(*clock_id, mono, real);
+            *expirations = 0;
+            if new_value_ns == 0 {
+                *deadline_ns = None;
+            } else {
+                let dl = if (flags & TFD_TIMER_ABSTIME) != 0 {
+                    new_value_ns
+                } else {
+                    now.saturating_add(new_value_ns)
+                };
+                *deadline_ns = Some(dl);
+                Self::advance_timer(new_interval_ns, expirations, deadline_ns, now);
+            }
+        } else {
+            *deadline_ns = None;
+            *expirations = u64::from(new_value_ns > 0);
+        }
         Ok(old)
     }
 
     pub fn timerfd_gettime(&self, idx: usize) -> Result<(u64, u64), Errno> {
+        self.timerfd_gettime_clocks(idx, 0, 0, false)
+    }
+
+    pub fn timerfd_gettime_live(
+        &self,
+        idx: usize,
+        now_mono_ns: u64,
+        now_real_ns: u64,
+    ) -> Result<(u64, u64), Errno> {
+        self.timerfd_gettime_clocks(idx, now_mono_ns, now_real_ns, true)
+    }
+
+    fn timerfd_gettime_clocks(
+        &self,
+        idx: usize,
+        now_mono_ns: u64,
+        now_real_ns: u64,
+        use_live_clocks: bool,
+    ) -> Result<(u64, u64), Errno> {
         let slot = self.slots.get(idx).ok_or(Errno::EBADF)?;
         let EventObject::TimerFd {
+            clock_id,
             interval_ns,
             value_ns,
+            deadline_ns,
             ..
         } = slot
         else {
             return Err(Errno::EINVAL);
         };
-        Ok((*interval_ns, *value_ns))
+        let rem = if use_live_clocks {
+            let now = Self::clock_now_for(*clock_id, now_mono_ns, now_real_ns);
+            deadline_ns.map_or(0, |dl| dl.saturating_sub(now))
+        } else {
+            *value_ns
+        };
+        Ok((*interval_ns, rem))
     }
 
     /// Creates or updates a `signalfd4(2)` descriptor (`fd == -1` creates a new one).
@@ -509,24 +818,28 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
 
     /// Queues a signal bit (`1..=64`) into all matching `SignalFd` descriptors.
     pub fn notify_signal(&mut self, signo: u32, sender_pid: u32, sender_uid: u32) {
+        for idx in 0..self.slots.len() {
+            self.notify_signal_slot(idx, signo, sender_pid, sender_uid);
+        }
+    }
+
+    pub fn notify_signal_slot(&mut self, idx: usize, signo: u32, sender_pid: u32, sender_uid: u32) {
         if !(1..=64).contains(&signo) {
             return;
         }
         let bit = 1u64 << (signo - 1);
-        for slot in &mut self.slots {
-            if let EventObject::SignalFd {
-                mask,
-                pending_mask,
-                last_sender_pid,
-                last_sender_uid,
-                ..
-            } = slot
-                && (*mask & bit) != 0
-            {
-                *pending_mask |= bit;
-                *last_sender_pid = sender_pid;
-                *last_sender_uid = sender_uid;
-            }
+        if let Some(EventObject::SignalFd {
+            mask,
+            pending_mask,
+            last_sender_pid,
+            last_sender_uid,
+            ..
+        }) = self.slots.get_mut(idx)
+            && (*mask & bit) != 0
+        {
+            *pending_mask |= bit;
+            *last_sender_pid = sender_pid;
+            *last_sender_uid = sender_uid;
         }
     }
 
@@ -539,8 +852,8 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             nonblocking: (flags & IN_NONBLOCK) != 0,
             cloexec: (flags & IN_CLOEXEC) != 0,
             next_wd: 1,
-            watches: [InotifyWatch::EMPTY; 8],
-            queue: [0u8; 256],
+            watches: [InotifyWatch::EMPTY; MAX_INOTIFY_WATCHES],
+            queue: [0u8; 1024],
             queue_len: 0,
         })
     }
@@ -550,7 +863,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         if path.is_empty() || (mask & IN_ALL_EVENTS) == 0 {
             return Err(Errno::EINVAL);
         }
-        if path.len() > 64 {
+        if path.len() > INOTIFY_PATH_CAP {
             return Err(Errno::ENAMETOOLONG);
         }
         let slot = self.slots.get_mut(idx).ok_or(Errno::EBADF)?;
@@ -570,7 +883,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         let free = watches.iter_mut().find(|w| !w.live).ok_or(Errno::ENOSPC)?;
         let wd = *next_wd;
         *next_wd = next_wd.saturating_add(1);
-        let mut p = [0u8; 64];
+        let mut p = [0u8; INOTIFY_PATH_CAP];
         p[..path.len()].copy_from_slice(path);
         *free = InotifyWatch {
             live: true,
@@ -695,6 +1008,51 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         Ok(*seals)
     }
 
+    /// Returns the current byte length of a `memfd`, or `0` for non-memfd descriptors.
+    pub fn memfd_len(&self, idx: usize) -> usize {
+        match self.slots.get(idx) {
+            Some(EventObject::MemFd { len, .. }) => *len,
+            _ => 0,
+        }
+    }
+
+    /// Returns a read-only view of a `memfd`'s contents and active seals (`F_SEAL_*`).
+    pub fn memfd_snapshot(&self, idx: usize) -> Result<(&[u8], u32), Errno> {
+        let slot = self.slots.get(idx).ok_or(Errno::EBADF)?;
+        let EventObject::MemFd {
+            seals, len, data, ..
+        } = slot
+        else {
+            return Err(Errno::EINVAL);
+        };
+        Ok((&data[..*len], *seals))
+    }
+
+    /// Writes `input` into an existing `memfd` at explicit `file_offset` without mutating its cursor.
+    pub fn memfd_write_at(
+        &mut self,
+        idx: usize,
+        file_offset: usize,
+        input: &[u8],
+    ) -> Result<usize, Errno> {
+        let slot = self.slots.get_mut(idx).ok_or(Errno::EBADF)?;
+        let EventObject::MemFd {
+            seals, len, data, ..
+        } = slot
+        else {
+            return Err(Errno::EINVAL);
+        };
+        if (*seals & (F_SEAL_WRITE | F_SEAL_FUTURE_WRITE)) != 0 {
+            return Err(Errno::EPERM);
+        }
+        if file_offset >= *len || input.is_empty() {
+            return Ok(0);
+        }
+        let take = (*len - file_offset).min(input.len());
+        data[file_offset..file_offset + take].copy_from_slice(&input[..take]);
+        Ok(take)
+    }
+
     /// Truncates or extends a `memfd` (`ftruncate(2)`), enforcing `F_SEAL_SHRINK` and `F_SEAL_GROW`.
     pub fn memfd_truncate(&mut self, idx: usize, new_len: usize) -> Result<(), Errno> {
         if new_len > MEMFD_CAP {
@@ -744,6 +1102,24 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             return Err(Errno::EBADF);
         };
         Ok(*target_pid)
+    }
+
+    pub fn mark_slot_pidfd_exited(&mut self, idx: usize) {
+        if let Some(EventObject::PidFd { exited, .. }) = self.slots.get_mut(idx) {
+            *exited = true;
+        }
+    }
+
+    pub fn mark_pidfd_exited(&mut self, pid: u32) {
+        for slot in &mut self.slots {
+            if let EventObject::PidFd {
+                target_pid, exited, ..
+            } = slot
+                && *target_pid == pid
+            {
+                *exited = true;
+            }
+        }
     }
 
     /// Reads from an `eventfd`, `timerfd`, `signalfd`, `inotify`, or `memfd` descriptor.
@@ -1049,5 +1425,71 @@ mod tests {
 
         table.close(efd).unwrap();
         assert_eq!(table.poll_readiness(efd), Err(Errno::EBADF));
+    }
+
+    #[test]
+    fn nested_epoll_surfaces_epollet_epollpri_without_consuming_inner_edge() {
+        let mut table = EventTable::<8, 64>::new();
+        let outer = table.epoll_create1(0).unwrap();
+        let inner = table.epoll_create1(0).unwrap();
+        let fd_base = 160;
+        let mountinfo_fd = 416;
+
+        table
+            .epoll_ctl(
+                inner,
+                EPOLL_CTL_ADD,
+                mountinfo_fd,
+                Some(EpollEvent {
+                    events: EPOLLPRI | EPOLLET,
+                    data: 11,
+                }),
+            )
+            .unwrap();
+        table
+            .epoll_ctl(
+                outer,
+                EPOLL_CTL_ADD,
+                fd_base + (inner as i32),
+                Some(EpollEvent {
+                    events: EPOLLIN,
+                    data: 22,
+                }),
+            )
+            .unwrap();
+
+        let mut ext = [0i32; 8];
+        let ext_n = table.collect_epoll_external_fds(outer, fd_base, &mut ext);
+        assert_eq!(&ext[..ext_n], &[mountinfo_fd]);
+
+        // Initial check: no change -> neither outer nor inner is ready.
+        let mut evs = [EpollEvent { events: 0, data: 0 }; 4];
+        let mut fds = [0i32; 4];
+        assert_eq!(
+            table
+                .epoll_wait_with_fds(outer, fd_base, |_| 0, &mut evs, &mut fds)
+                .unwrap(),
+            0
+        );
+
+        // Mount table changes -> mountinfo_fd raises POLLPRI | POLLERR.
+        assert_eq!(
+            table
+                .epoll_wait_with_fds(outer, fd_base, |_| EPOLLPRI | EPOLLERR, &mut evs, &mut fds)
+                .unwrap(),
+            1
+        );
+        assert_eq!(evs[0].data, 22);
+        assert_eq!(evs[0].events, EPOLLIN);
+
+        // Inner epoll still fires when libmount calls epoll_wait(inner) because outer peek didn't consume edge.
+        assert_eq!(
+            table
+                .epoll_wait_with_fds(inner, fd_base, |_| EPOLLPRI | EPOLLERR, &mut evs, &mut fds)
+                .unwrap(),
+            1
+        );
+        assert_eq!(evs[0].data, 11);
+        assert_eq!(fds[0], mountinfo_fd);
     }
 }

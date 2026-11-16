@@ -102,6 +102,13 @@ pub(super) const fn is_boot_fd(raw_fd: u64) -> bool {
     fd >= BOOT_FD_BASE && fd < BOOT_FD_BASE + (MAX_BOOT_FDS as i32)
 }
 
+pub(super) fn is_open_boot_fd(raw_fd: u64) -> bool {
+    let Ok(idx) = boot_fd_idx(raw_fd) else {
+        return false;
+    };
+    with_step40_state(|state| state.fds[idx].kind != BootFileKind::None).unwrap_or(false)
+}
+
 fn boot_fd_idx(raw_fd: u64) -> Result<usize, Errno> {
     if !is_boot_fd(raw_fd) {
         return Err(Errno::EBADF);
@@ -196,6 +203,11 @@ fn handle_openat_if_boot_file(user_path: u64, flags: u64) -> Result<Option<Sysca
     let Some(kind) = match_boot_path(&path_buf[..len]) else {
         return Ok(None);
     };
+    let mut boot_buf = [0u8; 256];
+    if kind == BootFileKind::ProcCmdline && super::step42_hardware::copy_bootargs(&mut boot_buf) > 0
+    {
+        return Ok(None);
+    }
     let write_or_create = (flags & 0x3) != 0 || (flags & 0x40) != 0 || (flags & 0x200) != 0;
     if matches!(
         kind,
@@ -312,6 +324,11 @@ fn handle_newfstatat_if_boot_file(
     let Some(kind) = match_boot_path(&path_buf[..len]) else {
         return Ok(None);
     };
+    let mut boot_buf = [0u8; 256];
+    if kind == BootFileKind::ProcCmdline && super::step42_hardware::copy_bootargs(&mut boot_buf) > 0
+    {
+        return Ok(None);
+    }
     if matches!(
         kind,
         BootFileKind::EtcResolvConf | BootFileKind::EtcHostname

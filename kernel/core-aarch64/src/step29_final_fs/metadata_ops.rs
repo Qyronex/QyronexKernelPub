@@ -273,6 +273,12 @@ fn fchmod(process: kernal_capability::ObjectId, raw_fd: u64, raw_mode: u64) -> R
     let fd = linux_signed_int(raw_fd);
     let mode = linux_unsigned_int(raw_mode);
     super::super::super::step29_runtime::with_process(process, |runtime| {
+        if matches!(
+            runtime.fds().object_kind(fd),
+            Ok(kernal_linux_fd::OpenObjectKind::External(_))
+        ) {
+            return Ok(0);
+        }
         let retained = match runtime.fds().writable_regular(fd) {
             Ok(retained) => retained,
             Err(_) if runtime.fds().retained_readonly(fd).is_ok() => {
@@ -343,6 +349,12 @@ fn fchown(
     let owner = optional_uid_gid(raw_owner);
     let group = optional_uid_gid(raw_group);
     super::super::super::step29_runtime::with_process(process, |runtime| {
+        if matches!(
+            runtime.fds().object_kind(fd),
+            Ok(kernal_linux_fd::OpenObjectKind::External(_))
+        ) {
+            return Ok(0);
+        }
         let retained = match runtime.fds().writable_regular(fd) {
             Ok(retained) => retained,
             Err(_) if runtime.fds().retained_readonly(fd).is_ok() => {

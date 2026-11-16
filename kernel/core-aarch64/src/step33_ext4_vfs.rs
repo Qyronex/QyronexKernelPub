@@ -9,14 +9,15 @@ use kernal_linux_abi::{
     Errno, SyscallRequest, SyscallReturn, linux_signed_int, linux_unsigned_int,
 };
 use kernal_linux_fd::SubsystemHandle;
-use kernal_linux_mounts::{Ext4CreateAttr, Ext4InodeStat};
+use kernal_linux_mounts::{Ext4CreateAttr, Ext4InodeStat, FilesystemType};
 use kernal_linux_vfs::LINUX_PATH_MAX;
 use kernal_usercopy::MAX_USERCOPY_BYTES;
 
 use super::step_fd_util::{
-    DirectProcessRefs, SUBSYS_EXT4, StatMeta, copy_from_user, copy_to_user, current_process_object,
-    lookup_aliased_subsystem, lookup_aliased_subsystem_current, read_user_cstr, read_user_iovec,
-    write_aarch64_stat_meta, write_aarch64_statx_meta,
+    DirectProcessRefs, SUBSYS_EXT4, StatMeta, copy_from_user, copy_to_user, current_epoch_now_secs,
+    current_process_object, current_uid_gid, decode_chown_id, lookup_aliased_subsystem,
+    lookup_aliased_subsystem_current, parse_utimens_pair, read_user_cstr, read_user_iovec,
+    write_aarch64_stat_meta, write_aarch64_statx_meta, write_linux_file_handle,
 };
 
 fn current_process_id() -> Result<ObjectId, ()> {
@@ -31,7 +32,6 @@ const MAX_PROCS: usize = super::step29_runtime::STEP29_RUNTIME_PROCESS_VIEWS;
 const MAX_VFS_PATH: usize = LINUX_PATH_MAX;
 const MAX_EXT4_RW_BYTES: usize = 1024 * 1024;
 const MAX_SYMLINK_DEPTH: usize = 40;
-const EPOCH_BASE_SECONDS: u32 = 1_760_000_000;
 
 const AT_FDCWD_I32: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -73,8 +73,6 @@ const DT_LNK: u8 = 10;
 const DT_SOCK: u8 = 12;
 
 const S_IFLNK: u16 = 0o120_000;
-const UTIME_NOW: i64 = 0x3fff_ffff;
-const UTIME_OMIT: i64 = 0x3fff_fffe;
 
 #[derive(Clone, Copy)]
 pub(super) struct Ext4ExecFile {
@@ -252,32 +250,23 @@ fn encode_result(res: Result<i64, Errno>) -> SyscallReturn {
     }
 }
 
-fn current_epoch_now_secs() -> u32 {
-    let mono_secs = kernal_timer_aarch64::monotonic_now_ns().map_or(0u32, |ns| {
-        (ns / 1_000_000_000).min(u64::from(u32::MAX / 2)) as u32
-    });
-    EPOCH_BASE_SECONDS.saturating_add(mono_secs)
-}
-
-fn current_uid_gid() -> (u32, u32) {
-    let mut uid = 0u32;
-    let mut gid = 0u32;
-    if let Some(current) = super::step_fd_util::current_scheduler_thread() {
-        let _ = super::runtime::with_linux_runtime(|state| {
-            let _ = state.with_current_process_credentials(current, |proc_ref, creds| {
-                if let Ok(c) = creds.credentials(proc_ref) {
-                    uid = c.euid();
-                    gid = c.egid();
-                }
-            });
-        });
-    }
-    (uid, gid)
-}
-
 pub(super) const fn is_ext4_fd(raw_fd: u64) -> bool {
     let fd = linux_signed_int(raw_fd);
     fd >= EXT4_FD_BASE && fd < EXT4_FD_BASE + (MAX_EXT4_FDS as i32)
+}
+
+pub(super) fn is_open_ext4_fd(process: ObjectId, raw_fd: u64) -> bool {
+    if !is_ext4_fd(raw_fd) {
+        return false;
+    }
+    let idx = (linux_signed_int(raw_fd) - EXT4_FD_BASE) as usize;
+    with_vfs_state(|state| {
+        state
+            .fds
+            .get(idx)
+            .is_some_and(|entry| entry_matches(entry, process, idx, None))
+    })
+    .unwrap_or(false)
 }
 
 fn retire_slot_if_unused(state: &mut Ext4VfsState, idx: usize) -> Option<u64> {
@@ -381,7 +370,7 @@ pub(super) fn handle_native_fcntl(
     if alias_gen.is_some() && !matches!(cmd, 3 | 4) {
         return None;
     }
-    if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW) {
+    if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW | 36 | 37 | 38) {
         return None;
     }
     let res = with_vfs_state(|state| {
@@ -537,6 +526,34 @@ pub(super) fn on_process_exit(process: ObjectId) {
     });
     for ofd in retired {
         super::step39_dpkg::on_retire_ext4_ofd(ofd);
+    }
+}
+
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let mut closed = Vec::new();
+    let _ = with_vfs_state(|state| {
+        for idx in 0..MAX_EXT4_FDS {
+            let fd = EXT4_FD_BASE + (idx as i32);
+            if super::step_fd_util::fd_in_close_range(fd, first, last)
+                && state.fds[idx].live
+                && state.fds[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
+                let mount_id = state.fds[idx].mount_id;
+                let ino = state.fds[idx].ino;
+                let retired = retire_slot_if_unused(state, idx);
+                closed.push((mount_id, ino, retired));
+            }
+        }
+    });
+    for (mount_id, ino, retired) in closed {
+        super::step39_dpkg::on_close_ext4_fd(mount_id, ino, retired);
     }
 }
 
@@ -1147,8 +1164,16 @@ pub(super) fn resolve_abs_for_current_following(
     raw_path: &[u8],
     out: &mut [u8],
 ) -> Result<usize, Errno> {
+    resolve_abs_for_current_with_follow(raw_path, true, out)
+}
+
+pub(super) fn resolve_abs_for_current_with_follow(
+    raw_path: &[u8],
+    follow_last_symlink: bool,
+    out: &mut [u8],
+) -> Result<usize, Errno> {
     let process = current_process_id().map_err(|()| Errno::EIO)?;
-    let resolved = resolve_path(process, AT_FDCWD_I32, raw_path, true)?;
+    let resolved = resolve_path(process, AT_FDCWD_I32, raw_path, follow_last_symlink)?;
     let abs = match resolved {
         ResolvedPath::Virtual { abs_path }
         | ResolvedPath::Ext4Existing { abs_path, .. }
@@ -1202,23 +1227,39 @@ pub(super) fn try_select_ext4_exec(
         return Ok(None);
     }
 
-    match resolve_path(process, dirfd, raw_path, follow_last) {
-        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
-            if stat.is_dir() || !stat.is_reg() {
+    let mut cur_dirfd = dirfd;
+    let mut cur_path = raw_path.to_vec();
+    for _ in 0..8 {
+        match resolve_path(process, cur_dirfd, &cur_path, follow_last) {
+            Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
+                if stat.is_dir() || !stat.is_reg() {
+                    return Err(Errno::EACCES);
+                }
+                return Ok(Some(Ext4ExecFile {
+                    mount_id,
+                    ino: stat.ino,
+                    mode: stat.mode,
+                    size: stat.size,
+                }));
+            }
+            Ok(ResolvedPath::Ext4MissingParent { .. }) => return Err(Errno::ENOENT),
+            Ok(ResolvedPath::Virtual { abs_path }) => {
+                if let Some(host) = super::step33_mounts::resolve_virtual_host_target_once(
+                    process,
+                    &abs_path,
+                    follow_last,
+                )? {
+                    cur_dirfd = -100;
+                    cur_path = host;
+                    continue;
+                }
                 return Err(Errno::EACCES);
             }
-            Ok(Some(Ext4ExecFile {
-                mount_id,
-                ino: stat.ino,
-                mode: stat.mode,
-                size: stat.size,
-            }))
+            Ok(ResolvedPath::Initramfs { .. }) => return Ok(None),
+            Err(e) => return Err(e),
         }
-        Ok(ResolvedPath::Ext4MissingParent { .. }) => Err(Errno::ENOENT),
-        Ok(ResolvedPath::Virtual { .. }) => Err(Errno::EACCES),
-        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
-        Err(e) => Err(e),
     }
+    Err(Errno::ELOOP)
 }
 
 pub(super) fn read_ext4_file_all(mount_id: u32, ino: u32, size: u64) -> Result<Vec<u8>, Errno> {
@@ -1248,10 +1289,18 @@ pub(super) fn try_read_ext4_fd_for_mmap(
     process: ObjectId,
     raw_fd: u64,
 ) -> Result<Option<Vec<u8>>, Errno> {
+    Ok(try_read_ext4_fd_for_mmap_with_meta(process, raw_fd, false)?.map(|(bytes, _, _)| bytes))
+}
+
+pub(super) fn try_read_ext4_fd_for_mmap_with_meta(
+    process: ObjectId,
+    raw_fd: u64,
+    require_writable: bool,
+) -> Result<Option<(Vec<u8>, u32, u32)>, Errno> {
     let Some((idx, alias_gen)) = resolve_ext4_slot_idx(process, raw_fd) else {
         return Ok(None);
     };
-    let (mount_id, ino, is_dir, is_path_only, readable) = match with_vfs_state(|state| {
+    let (mount_id, ino, is_dir, is_path_only, readable, writable) = match with_vfs_state(|state| {
         let Some(entry) = state.fds.get(idx) else {
             return Err(Errno::EBADF);
         };
@@ -1264,16 +1313,14 @@ pub(super) fn try_read_ext4_fd_for_mmap(
             entry.is_dir,
             entry.is_path_only,
             entry.readable,
+            entry.writable,
         ))
     }) {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return Err(e),
         Err(()) => return Err(Errno::EIO),
     };
-    if is_path_only || !readable {
-        return Err(Errno::EACCES);
-    }
-    if is_dir {
+    if is_path_only || !readable || is_dir || (require_writable && !writable) {
         return Err(Errno::EACCES);
     }
     let stat =
@@ -1281,12 +1328,27 @@ pub(super) fn try_read_ext4_fd_for_mmap(
     if !stat.is_reg() {
         return Err(Errno::EACCES);
     }
-    read_ext4_file_all(mount_id, ino, stat.size).map(Some)
+    let bytes = read_ext4_file_all(mount_id, ino, stat.size)?;
+    Ok(Some((bytes, mount_id, ino)))
+}
+
+pub(super) fn write_back_ext4_mmap(mount_id: u32, ino: u32, file_offset: u64, data: &[u8]) {
+    let now = current_epoch_now_secs();
+    let _ = super::step33_mounts::with_ext4_volume(mount_id, |vol, dev, _| {
+        let stat = vol.stat_inode(dev, ino)?;
+        let take = usize::try_from(stat.size.saturating_sub(file_offset))
+            .unwrap_or(0)
+            .min(data.len());
+        if take > 0 {
+            let _ = vol.write_file(dev, ino, file_offset, &data[..take], now)?;
+        }
+        Ok(())
+    });
 }
 
 fn stat_to_meta(mount_id: u32, stat: &Ext4InodeStat) -> StatMeta {
     StatMeta {
-        dev: 0x00fe_0000u64 | u64::from(mount_id),
+        dev: FilesystemType::Ext4.st_dev(mount_id),
         ino: u64::from(stat.ino),
         mode: u32::from(stat.mode),
         nlink: u32::from(stat.nlink),
@@ -1302,6 +1364,8 @@ fn stat_to_meta(mount_id: u32, stat: &Ext4InodeStat) -> StatMeta {
         mtime_nsec: 0,
         ctime_sec: stat.ctime,
         ctime_nsec: 0,
+        mnt_id: super::step33_mounts::ext4_table_mount_id(mount_id),
+        is_mount_root: stat.ino == 2,
     }
 }
 
@@ -1474,14 +1538,18 @@ pub(super) fn try_open_host_path(
         return Ok(None);
     }
     let follow = (flags & O_NOFOLLOW) == 0 && ((flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL));
-    let res = match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
+    match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
         Ok(
             target @ (ResolvedPath::Ext4Existing { .. } | ResolvedPath::Ext4MissingParent { .. }),
-        ) => open_ext4_target(process, target, flags, mode),
-        Ok(_) => return Ok(None),
-        Err(e) => Err(e),
-    };
-    Ok(Some(encode_result(res)))
+        ) => Ok(Some(encode_result(open_ext4_target(
+            process, target, flags, mode,
+        )))),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_open_virtual_abs(process, &abs_path, flags, mode)?,
+        )),
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
 }
 
 pub(super) fn try_readlink_host_path(
@@ -1493,15 +1561,19 @@ pub(super) fn try_readlink_host_path(
         return Ok(None);
     }
     let process = current_process_id()?;
-    let res = match resolve_path(process, AT_FDCWD_I32, host_path, false) {
-        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
-            readlink_ext4_inode(mount_id, stat.ino, user_buf, raw_bufsiz)
+    match resolve_path(process, AT_FDCWD_I32, host_path, false) {
+        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => Ok(Some(encode_result(
+            readlink_ext4_inode(mount_id, stat.ino, user_buf, raw_bufsiz),
+        ))),
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
+        Ok(ResolvedPath::Virtual { abs_path }) => {
+            Ok(Some(super::step33_mounts::try_readlink_virtual_abs(
+                process, &abs_path, user_buf, raw_bufsiz,
+            )?))
         }
-        Ok(ResolvedPath::Ext4MissingParent { .. }) => Err(Errno::ENOENT),
-        Ok(_) => return Ok(None),
-        Err(e) => Err(e),
-    };
-    Ok(Some(encode_result(res)))
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
 }
 
 pub(super) fn ext4_path_exists(raw_path: &[u8]) -> bool {
@@ -1524,16 +1596,21 @@ pub(super) fn try_stat_host_path(
     }
     let process = current_process_id()?;
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let res = match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
+    match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
         Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
             let meta = stat_to_meta(mount_id, &stat);
-            write_aarch64_stat_meta(user_statbuf, &meta)
+            Ok(Some(encode_result(write_aarch64_stat_meta(
+                user_statbuf,
+                &meta,
+            ))))
         }
-        Ok(ResolvedPath::Ext4MissingParent { .. }) => Err(Errno::ENOENT),
-        Ok(_) => return Ok(None),
-        Err(e) => Err(e),
-    };
-    Ok(Some(encode_result(res)))
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_stat_virtual_abs(process, &abs_path, flags, user_statbuf)?,
+        )),
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
 }
 
 pub(super) fn try_statx_host_path(
@@ -1546,16 +1623,55 @@ pub(super) fn try_statx_host_path(
     }
     let process = current_process_id()?;
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let res = match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
+    match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
         Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
             let meta = stat_to_meta(mount_id, &stat);
-            write_aarch64_statx_meta(user_statx, &meta)
+            Ok(Some(encode_result(write_aarch64_statx_meta(
+                user_statx, &meta,
+            ))))
         }
-        Ok(ResolvedPath::Ext4MissingParent { .. }) => Err(Errno::ENOENT),
-        Ok(_) => return Ok(None),
-        Err(e) => Err(e),
-    };
-    Ok(Some(encode_result(res)))
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_statx_virtual_abs(process, &abs_path, flags, user_statx)?,
+        )),
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
+}
+
+pub(super) fn try_name_to_handle_host_path(
+    process: ObjectId,
+    host_path: &[u8],
+    user_handle: u64,
+    user_mnt_id: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if super::step33_mounts::resolve_ext4_mount(host_path).is_none() {
+        return Ok(None);
+    }
+    let follow = (flags & AT_SYMLINK_FOLLOW) != 0;
+    match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
+        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
+            Ok(Some(encode_result(write_linux_file_handle(
+                user_handle,
+                user_mnt_id,
+                u64::from(stat.ino),
+                super::step33_mounts::ext4_table_mount_id(mount_id),
+            ))))
+        }
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
+        Ok(ResolvedPath::Virtual { abs_path }) => {
+            Ok(Some(super::step33_mounts::try_name_to_handle_virtual_abs(
+                process,
+                &abs_path,
+                user_handle,
+                user_mnt_id,
+                flags,
+            )?))
+        }
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
 }
 
 pub(super) fn try_access_host_path(
@@ -1568,15 +1684,17 @@ pub(super) fn try_access_host_path(
         return Ok(None);
     }
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let res = match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
-        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
-            check_ext4_access(mount_id, &stat, mode)
-        }
-        Ok(ResolvedPath::Ext4MissingParent { .. }) => Err(Errno::ENOENT),
-        Ok(_) => return Ok(None),
-        Err(e) => Err(e),
-    };
-    Ok(Some(encode_result(res)))
+    match resolve_path(process, AT_FDCWD_I32, host_path, follow) {
+        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => Ok(Some(encode_result(
+            check_ext4_access(mount_id, &stat, mode),
+        ))),
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_access_virtual_abs(process, &abs_path, mode, flags)?,
+        )),
+        Ok(_) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
 }
 
 fn check_ext4_access(mount_id: u32, stat: &Ext4InodeStat, mode: u64) -> Result<i64, Errno> {
@@ -1643,6 +1761,13 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
         29 if is_ext4_fd_or_alias_current(request.args[0]) => {
             Ok(Some(SyscallReturn::error(Errno::ENOTTY)))
         }
+        // mknodat(dirfd, pathname, mode, dev)
+        33 => handle_mknodat(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+        ),
         // mkdirat(dirfd, pathname, mode)
         34 => handle_mkdirat(request.args[0], request.args[1], request.args[2]),
         // unlinkat(dirfd, pathname, flags)
@@ -1790,6 +1915,14 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[1],
             request.args[2],
             request.args[3],
+        ),
+        // name_to_handle_at(dirfd, pathname, handle, mount_id, flags)
+        264 => handle_name_to_handle_at(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
         ),
         // renameat2(olddirfd, oldpath, newdirfd, newpath, flags)
         276 => handle_renameat(
@@ -1945,15 +2078,21 @@ fn handle_chdir(user_path: u64) -> Result<Option<SyscallReturn>, ()> {
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
         Ok(ResolvedPath::Virtual { abs_path }) => {
-            let _ = with_vfs_state(|state| {
-                if let Some(p) = state.ensure_proc_mut(process) {
-                    copy_into_path_buf(&mut p.cwd, &mut p.cwd_len, &abs_path);
-                    p.cwd_on_ext4 = true;
-                    p.cwd_mount_id = 0;
-                    p.cwd_ino = 0;
+            match super::step33_mounts::is_virtual_dir(process, &abs_path) {
+                Ok(true) => {
+                    let _ = with_vfs_state(|state| {
+                        if let Some(p) = state.ensure_proc_mut(process) {
+                            copy_into_path_buf(&mut p.cwd, &mut p.cwd_len, &abs_path);
+                            p.cwd_on_ext4 = true;
+                            p.cwd_mount_id = 0;
+                            p.cwd_ino = 0;
+                        }
+                    });
+                    Ok(Some(encode_result(Ok(0))))
                 }
-            });
-            Ok(Some(encode_result(Ok(0))))
+                Ok(false) => Ok(Some(SyscallReturn::error(Errno::ENOTDIR))),
+                Err(e) => Ok(Some(SyscallReturn::error(e))),
+            }
         }
         Ok(ResolvedPath::Initramfs { abs_path }) => {
             let Ok(host_path) = translate_host_path_vec(&abs_path) else {
@@ -1999,6 +2138,22 @@ fn handle_fchdir(raw_fd: u64) -> Result<Option<SyscallReturn>, ()> {
             Ok(0i64)
         });
         return Ok(Some(encode_result(info.unwrap_or(Err(Errno::EIO)))));
+    }
+    if let Some(virt_res) = super::step33_mounts::fd_dir_abs_path(process, raw_fd) {
+        return Ok(Some(encode_result(match virt_res {
+            Ok(abs_path) => {
+                let _ = with_vfs_state(|state| {
+                    if let Some(p) = state.ensure_proc_mut(process) {
+                        copy_into_path_buf(&mut p.cwd, &mut p.cwd_len, &abs_path);
+                        p.cwd_on_ext4 = true;
+                        p.cwd_mount_id = 0;
+                        p.cwd_ino = 0;
+                    }
+                });
+                Ok(0)
+            }
+            Err(e) => Err(e),
+        })));
     }
     if !proc_uses_custom_vfs(process) {
         return Ok(None);
@@ -2101,7 +2256,9 @@ fn handle_openat(
                     return Ok(Some(hw));
                 }
             }
-            Ok(None)
+            Ok(Some(super::step33_mounts::try_open_virtual_abs(
+                process, &abs_path, flags, mode,
+            )?))
         }
         Ok(ResolvedPath::Initramfs { abs_path }) => {
             let host_path =
@@ -2162,7 +2319,10 @@ fn handle_openat2(
         ) => Ok(Some(encode_result(open_ext4_target(
             process, target, flags, mode,
         )))),
-        Ok(ResolvedPath::Virtual { .. }) | Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_open_virtual_abs(process, &abs_path, flags, mode)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
 }
@@ -2646,7 +2806,9 @@ fn handle_newfstatat(
             {
                 return Ok(Some(ret));
             }
-            Ok(None)
+            Ok(Some(super::step33_mounts::try_stat_virtual_abs(
+                process, &abs_path, flags, user_stat,
+            )?))
         }
         Ok(ResolvedPath::Initramfs { abs_path }) => {
             let host_path =
@@ -2727,7 +2889,9 @@ fn handle_statx(
             {
                 return Ok(Some(ret));
             }
-            Ok(None)
+            Ok(Some(super::step33_mounts::try_statx_virtual_abs(
+                process, &abs_path, flags, user_statx,
+            )?))
         }
         Ok(ResolvedPath::Initramfs { abs_path }) => {
             let host_path =
@@ -2796,7 +2960,11 @@ fn handle_readlinkat(
             ))))
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(ResolvedPath::Virtual { .. }) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => {
+            Ok(Some(super::step33_mounts::try_readlink_virtual_abs(
+                process, &abs_path, user_buf, raw_bufsiz,
+            )?))
+        }
         Ok(ResolvedPath::Initramfs { abs_path }) => {
             let host_path =
                 match resolve_initramfs_for_dispatch(process, dirfd, raw_dirfd, &raw, &abs_path) {
@@ -2818,28 +2986,61 @@ fn handle_faccessat(
     mode: u64,
     flags: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EACCESS | AT_EMPTY_PATH | AT_NO_AUTOMOUNT)) != 0 {
+        return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+    }
     let process = current_process_id()?;
+    let empty_flag = (flags & AT_EMPTY_PATH) != 0;
     let raw = match read_user_path_opt_empty(user_path) {
         Ok(p) => p,
         Err(e) => {
-            if !needs_ext4_path_interception(process, raw_dirfd, b"") {
+            if empty_flag && user_path == 0 && is_ext4_fd_or_alias_current(raw_dirfd) {
+                Vec::new()
+            } else if !needs_ext4_path_interception(process, raw_dirfd, b"") {
                 return Ok(None);
+            } else {
+                return Ok(Some(SyscallReturn::error(e)));
             }
-            return Ok(Some(SyscallReturn::error(e)));
         }
     };
+    if raw.is_empty() && empty_flag {
+        if !is_ext4_fd_or_alias_current(raw_dirfd) {
+            return Ok(None);
+        }
+        let Some((idx, alias_gen)) = resolve_ext4_slot_idx(process, raw_dirfd) else {
+            return Ok(Some(SyscallReturn::error(Errno::EBADF)));
+        };
+        let (mount_id, ino) = match with_vfs_state(|state| {
+            let Some(entry) = state.fds.get(idx) else {
+                return Err(Errno::EBADF);
+            };
+            if !entry_matches(entry, process, idx, alias_gen) {
+                return Err(Errno::EBADF);
+            }
+            Ok((entry.mount_id, entry.ino))
+        })? {
+            Ok(v) => v,
+            Err(e) => return Ok(Some(SyscallReturn::error(e))),
+        };
+        let res = super::step33_mounts::with_ext4_volume(mount_id, |vol, dev, _| {
+            let stat = vol.stat_inode(dev, ino)?;
+            check_ext4_access(mount_id, &stat, mode)
+        });
+        return Ok(Some(encode_result(res)));
+    }
     if !needs_ext4_path_interception(process, raw_dirfd, &raw) {
         return Ok(None);
     }
     let dirfd = linux_signed_int(raw_dirfd);
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
-    let _ = AT_EACCESS | AT_NO_AUTOMOUNT;
     match resolve_path(process, dirfd, &raw, follow) {
         Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => Ok(Some(encode_result(
             check_ext4_access(mount_id, &stat, mode),
         ))),
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(ResolvedPath::Virtual { .. }) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_access_virtual_abs(process, &abs_path, mode, flags)?,
+        )),
         Ok(ResolvedPath::Initramfs { abs_path }) => {
             let host_path =
                 match resolve_initramfs_for_dispatch(process, dirfd, raw_dirfd, &raw, &abs_path) {
@@ -2900,7 +3101,41 @@ fn handle_mkdirat(
             });
             Ok(Some(encode_result(res)))
         }
-        Ok(ResolvedPath::Virtual { .. }) | Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_mkdir_virtual_abs(process, &abs_path, raw_mode)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
+}
+
+fn handle_mknodat(
+    raw_dirfd: u64,
+    user_path: u64,
+    raw_mode: u64,
+    raw_dev: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let process = current_process_id()?;
+    let raw = match read_user_path_opt_empty(user_path) {
+        Ok(p) => p,
+        Err(e) => {
+            if !needs_ext4_path_interception(process, raw_dirfd, b"") {
+                return Ok(None);
+            }
+            return Ok(Some(SyscallReturn::error(e)));
+        }
+    };
+    if !needs_ext4_path_interception(process, raw_dirfd, &raw) {
+        return Ok(None);
+    }
+    let dirfd = linux_signed_int(raw_dirfd);
+    match resolve_path(process, dirfd, &raw, false) {
+        Ok(ResolvedPath::Ext4Existing { .. }) => Ok(Some(SyscallReturn::error(Errno::EEXIST))),
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::EPERM))),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_mknod_virtual_abs(process, &abs_path, raw_mode, raw_dev)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
 }
@@ -2965,7 +3200,10 @@ fn handle_unlinkat(
             Ok(Some(encode_result(res)))
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(ResolvedPath::Virtual { .. }) | Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_unlink_virtual_abs(process, &abs_path, flags)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
 }
@@ -3018,7 +3256,10 @@ fn handle_symlinkat(
             });
             Ok(Some(encode_result(res)))
         }
-        Ok(ResolvedPath::Virtual { .. }) | Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_symlink_virtual_abs(process, &target, &abs_path)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
 }
@@ -3154,48 +3395,63 @@ fn handle_renameat(
     let old_trimmed = trim_trailing_slash_if_nonempty(&oldpath);
     let new_trimmed = trim_trailing_slash_if_nonempty(&newpath);
 
-    let (old_mount, old_parent, old_leaf) =
+    let old_resolved =
         match resolve_path(process, linux_signed_int(raw_olddirfd), &old_trimmed, false) {
-            Ok(ResolvedPath::Ext4Existing {
-                mount_id,
-                parent_ino,
-                leaf,
-                ..
-            }) => {
-                if leaf.is_empty() {
-                    return Ok(Some(SyscallReturn::error(Errno::EBUSY)));
-                }
-                (mount_id, parent_ino, leaf)
-            }
-            Ok(ResolvedPath::Ext4MissingParent { .. }) => {
-                return Ok(Some(SyscallReturn::error(Errno::ENOENT)));
-            }
-            Ok(_) => return Ok(None),
+            Ok(v) => v,
             Err(e) => return Ok(Some(SyscallReturn::error(e))),
         };
-
-    let (new_mount, new_parent, new_leaf) =
+    let new_resolved =
         match resolve_path(process, linux_signed_int(raw_newdirfd), &new_trimmed, false) {
-            Ok(ResolvedPath::Ext4Existing {
-                mount_id,
-                parent_ino,
-                leaf,
-                ..
-            })
-            | Ok(ResolvedPath::Ext4MissingParent {
-                mount_id,
-                parent_ino,
-                leaf,
-                ..
-            }) => {
-                if leaf.is_empty() {
-                    return Ok(Some(SyscallReturn::error(Errno::EBUSY)));
-                }
-                (mount_id, parent_ino, leaf)
-            }
-            Ok(_) => return Ok(Some(SyscallReturn::error(Errno::EXDEV))),
+            Ok(v) => v,
             Err(e) => return Ok(Some(SyscallReturn::error(e))),
         };
+    if let (
+        ResolvedPath::Virtual { abs_path: old_abs },
+        ResolvedPath::Virtual { abs_path: new_abs },
+    ) = (&old_resolved, &new_resolved)
+    {
+        return Ok(Some(super::step33_mounts::try_rename_virtual_abs(
+            process, old_abs, new_abs, flags,
+        )?));
+    }
+    let (old_mount, old_parent, old_leaf) = match old_resolved {
+        ResolvedPath::Ext4Existing {
+            mount_id,
+            parent_ino,
+            leaf,
+            ..
+        } => {
+            if leaf.is_empty() {
+                return Ok(Some(SyscallReturn::error(Errno::EBUSY)));
+            }
+            (mount_id, parent_ino, leaf)
+        }
+        ResolvedPath::Ext4MissingParent { .. } => {
+            return Ok(Some(SyscallReturn::error(Errno::ENOENT)));
+        }
+        ResolvedPath::Virtual { .. } => return Ok(Some(SyscallReturn::error(Errno::EXDEV))),
+        ResolvedPath::Initramfs { .. } => return Ok(None),
+    };
+    let (new_mount, new_parent, new_leaf) = match new_resolved {
+        ResolvedPath::Ext4Existing {
+            mount_id,
+            parent_ino,
+            leaf,
+            ..
+        }
+        | ResolvedPath::Ext4MissingParent {
+            mount_id,
+            parent_ino,
+            leaf,
+            ..
+        } => {
+            if leaf.is_empty() {
+                return Ok(Some(SyscallReturn::error(Errno::EBUSY)));
+            }
+            (mount_id, parent_ino, leaf)
+        }
+        _ => return Ok(Some(SyscallReturn::error(Errno::EXDEV))),
+    };
 
     if old_mount != new_mount {
         return Ok(Some(SyscallReturn::error(Errno::EXDEV)));
@@ -3243,7 +3499,10 @@ fn handle_truncate(user_path: u64, length: i64) -> Result<Option<SyscallReturn>,
             Ok(Some(encode_result(res)))
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(_) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_truncate_virtual_abs(process, &abs_path, length)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
 }
@@ -3348,14 +3607,12 @@ fn handle_fchmodat(
             Ok(Some(encode_result(res)))
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(_) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => Ok(Some(
+            super::step33_mounts::try_chmod_virtual_abs(process, &abs_path, raw_mode, flags)?,
+        )),
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
-}
-
-fn decode_chown_id(raw: u64) -> Option<u32> {
-    let id = raw as u32;
-    if id == u32::MAX { None } else { Some(id) }
 }
 
 fn handle_fchown(raw_fd: u64, raw_uid: u64, raw_gid: u64) -> Result<Result<i64, Errno>, ()> {
@@ -3443,34 +3700,14 @@ fn handle_fchownat(
             Ok(Some(encode_result(res)))
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(_) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => {
+            Ok(Some(super::step33_mounts::try_chown_virtual_abs(
+                process, &abs_path, raw_uid, raw_gid, flags,
+            )?))
+        }
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
-}
-
-fn parse_utimens_pair(user_times: u64, now: u32) -> Result<(Option<u32>, Option<u32>), Errno> {
-    if user_times == 0 {
-        return Ok((Some(now), Some(now)));
-    }
-    let mut raw = [0u8; 32];
-    copy_from_user(&mut raw, user_times)?;
-    let asec = i64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
-    let ansec = i64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
-    let msec = i64::from_le_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
-    let mnsec = i64::from_le_bytes(raw[24..32].try_into().unwrap_or([0; 8]));
-    let decode_ts = |sec: i64, nsec: i64| -> Result<Option<u32>, Errno> {
-        if nsec == UTIME_OMIT {
-            return Ok(None);
-        }
-        if nsec == UTIME_NOW {
-            return Ok(Some(now));
-        }
-        if !(0..1_000_000_000).contains(&nsec) {
-            return Err(Errno::EINVAL);
-        }
-        Ok(Some(sec.clamp(0, i64::from(u32::MAX)) as u32))
-    };
-    Ok((decode_ts(asec, ansec)?, decode_ts(msec, mnsec)?))
 }
 
 fn handle_utimensat(
@@ -3534,7 +3771,88 @@ fn handle_utimensat(
             Ok(Some(encode_result(res)))
         }
         Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
-        Ok(_) => Ok(None),
+        Ok(ResolvedPath::Virtual { abs_path }) => {
+            let (atime, mtime) = match parse_utimens_pair(user_times, now) {
+                Ok(v) => v,
+                Err(e) => return Ok(Some(SyscallReturn::error(e))),
+            };
+            Ok(Some(super::step33_mounts::try_utimens_virtual_abs(
+                process, &abs_path, atime, mtime, flags,
+            )?))
+        }
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
+        Err(e) => Ok(Some(SyscallReturn::error(e))),
+    }
+}
+
+fn handle_name_to_handle_at(
+    raw_dirfd: u64,
+    user_path: u64,
+    user_handle: u64,
+    user_mnt_id: u64,
+    flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if (flags & !(AT_EMPTY_PATH | AT_SYMLINK_FOLLOW | 0x200)) != 0 {
+        return Ok(Some(SyscallReturn::error(Errno::EINVAL)));
+    }
+    let process = current_process_id()?;
+    let raw = match read_user_path_opt_empty(user_path) {
+        Ok(p) => p,
+        Err(e) => {
+            if !needs_ext4_path_interception(process, raw_dirfd, b"") {
+                return Ok(None);
+            }
+            return Ok(Some(SyscallReturn::error(e)));
+        }
+    };
+    if raw.is_empty() && (flags & AT_EMPTY_PATH) != 0 && is_ext4_fd_or_alias_current(raw_dirfd) {
+        let Some((idx, alias_gen)) = resolve_ext4_slot_idx(process, raw_dirfd) else {
+            return Ok(Some(SyscallReturn::error(Errno::EBADF)));
+        };
+        let (mount_id, ino) = match with_vfs_state(|state| {
+            let Some(entry) = state.fds.get(idx) else {
+                return Err(Errno::EBADF);
+            };
+            if !entry_matches(entry, process, idx, alias_gen) {
+                return Err(Errno::EBADF);
+            }
+            Ok((entry.mount_id, entry.ino))
+        })? {
+            Ok(v) => v,
+            Err(e) => return Ok(Some(SyscallReturn::error(e))),
+        };
+        return Ok(Some(encode_result(write_linux_file_handle(
+            user_handle,
+            user_mnt_id,
+            u64::from(ino),
+            super::step33_mounts::ext4_table_mount_id(mount_id),
+        ))));
+    }
+    if !needs_ext4_path_interception(process, raw_dirfd, &raw) {
+        return Ok(None);
+    }
+    let follow = (flags & AT_SYMLINK_FOLLOW) != 0;
+    let dirfd = linux_signed_int(raw_dirfd);
+    match resolve_path(process, dirfd, &raw, follow) {
+        Ok(ResolvedPath::Ext4Existing { mount_id, stat, .. }) => {
+            Ok(Some(encode_result(write_linux_file_handle(
+                user_handle,
+                user_mnt_id,
+                u64::from(stat.ino),
+                super::step33_mounts::ext4_table_mount_id(mount_id),
+            ))))
+        }
+        Ok(ResolvedPath::Ext4MissingParent { .. }) => Ok(Some(SyscallReturn::error(Errno::ENOENT))),
+        Ok(ResolvedPath::Virtual { abs_path }) => {
+            Ok(Some(super::step33_mounts::try_name_to_handle_virtual_abs(
+                process,
+                &abs_path,
+                user_handle,
+                user_mnt_id,
+                flags,
+            )?))
+        }
+        Ok(ResolvedPath::Initramfs { .. }) => Ok(None),
         Err(e) => Ok(Some(SyscallReturn::error(e))),
     }
 }

@@ -9,8 +9,8 @@ use kernal_linux_abi::{
 };
 use kernal_linux_cgroup::CAP_CHOWN;
 use kernal_linux_dpkg::{
-    AdvisoryLockTable, F_GETLK, F_SETLK, F_SETLKW, F_UNLCK, LOCK_NB, LOCK_UN, PackageMetadataTable,
-    PosixFlock, TargetKey, TimespecPair, XattrTable,
+    AdvisoryLockTable, F_GETLK, F_OFD_GETLK, F_OFD_SETLK, F_OFD_SETLKW, F_SETLK, F_SETLKW, F_UNLCK,
+    LOCK_NB, LOCK_UN, PackageMetadataTable, PosixFlock, TargetKey, TimespecPair, XattrTable,
 };
 
 const CAP_FOWNER: u32 = 3;
@@ -194,7 +194,10 @@ pub(super) fn try_handle_syscall_with_frame(
         )?))),
         NR_FCNTL => {
             let cmd = linux_unsigned_int(request.args[1]);
-            if matches!(cmd, F_GETLK | F_SETLK | F_SETLKW) {
+            if matches!(
+                cmd,
+                F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW
+            ) {
                 Ok(Some(handle_fcntl_lock(
                     request.args[0],
                     cmd,
@@ -291,7 +294,8 @@ fn resolve_lock_target(raw_fd: u64) -> Result<(TargetKey, u64, i64, i64), Errno>
         ));
     }
     let key = TargetKey::from_fd(fd)?;
-    let owner_ofd = u64::from(current_pid()).wrapping_shl(32) | u64::from(fd as u32);
+    let owner_ofd =
+        (1u64 << 63) | (u64::from(current_pid()).wrapping_shl(32)) | u64::from(fd as u32);
     Ok((key, owner_ofd, 0, 0))
 }
 
@@ -326,7 +330,7 @@ fn handle_fcntl_lock(
     user_flock: u64,
     mut frame: Option<&mut ExceptionFrame>,
 ) -> Result<SyscallReturn, ()> {
-    let (key, _, offset, file_len) = match resolve_lock_target(raw_fd) {
+    let (key, owner_ofd, offset, file_len) = match resolve_lock_target(raw_fd) {
         Ok(v) => v,
         Err(e) => return Ok(SyscallReturn::error(e)),
     };
@@ -341,10 +345,18 @@ fn handle_fcntl_lock(
         Ok(r) => r,
         Err(e) => return Ok(SyscallReturn::error(e)),
     };
+    let is_ofd = matches!(cmd, F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW);
+    if is_ofd && req.l_pid != 0 {
+        return Ok(SyscallReturn::error(Errno::EINVAL));
+    }
     let pid = current_pid();
-    if cmd == F_GETLK {
-        let res =
-            with_step39_state(|state| state.locks.fcntl_getlk(key, pid, req, offset, file_len))?;
+    let owner = if is_ofd { owner_ofd } else { u64::from(pid) };
+    if matches!(cmd, F_GETLK | F_OFD_GETLK) {
+        let res = with_step39_state(|state| {
+            state
+                .locks
+                .fcntl_getlk_owner(key, owner, req, offset, file_len)
+        })?;
         let out = match res {
             Ok(f) => f,
             Err(e) => return Ok(SyscallReturn::error(e)),
@@ -354,11 +366,15 @@ fn handle_fcntl_lock(
         }
         return Ok(encode_result(Ok(0)));
     }
+    let blocking = matches!(cmd, F_SETLKW | F_OFD_SETLKW);
     let process = super::step_fd_util::current_process_object();
     loop {
         let res = with_step39_state(|state| {
-            let r = state.locks.fcntl_setlk(key, pid, req, offset, file_len);
+            let r = state
+                .locks
+                .fcntl_setlk_owner(key, owner, req, offset, file_len);
             if r.is_ok()
+                && !is_ofd
                 && req.l_type != F_UNLCK
                 && let Some(proc_id) = process
             {
@@ -367,7 +383,7 @@ fn handle_fcntl_lock(
             r.map(|()| 0)
         })?;
         match res {
-            Err(Errno::EAGAIN) if cmd == F_SETLKW && frame.is_some() => {
+            Err(Errno::EAGAIN) if blocking && frame.is_some() => {
                 if let Some(interrupted) =
                     super::step35_events_cgroup::blocking_wait_step(frame.as_deref_mut())?
                 {

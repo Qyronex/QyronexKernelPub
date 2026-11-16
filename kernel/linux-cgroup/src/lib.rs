@@ -663,11 +663,16 @@ const fn write_u32(out: &mut [u8; 24], off: usize, val: u32) {
     out[off + 3] = b[3];
 }
 
+/// Maximum relative cgroup v2 path length (`/sys/fs/cgroup/<rel>`).
+pub const MAX_CGROUP_PATH_LEN: usize = 128;
+/// Maximum number of PIDs directly attached to a single cgroup node.
+pub const MAX_CGROUP_ATTACHED_PIDS: usize = 32;
+
 /// One node in the Step-36/41 cgroups v2 unified hierarchy (`/sys/fs/cgroup/<slice>`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CgroupNode {
     live: bool,
-    path: [u8; 48],
+    path: [u8; MAX_CGROUP_PATH_LEN],
     path_len: usize,
     pids_max: u32,
     pids_current: u32,
@@ -678,14 +683,16 @@ pub struct CgroupNode {
     cpu_usage_us: u64,
     cpu_nr_throttled: u64,
     subtree_control: u32, // bit 0 = pids, bit 1 = memory, bit 2 = cpu
-    attached_pids: [u32; 8],
+    attached_pids: [u32; MAX_CGROUP_ATTACHED_PIDS],
     attached_count: usize,
+    oom_group: bool,
+    frozen: bool,
 }
 
 impl CgroupNode {
     const EMPTY: Self = Self {
         live: false,
-        path: [0u8; 48],
+        path: [0u8; MAX_CGROUP_PATH_LEN],
         path_len: 0,
         pids_max: u32::MAX,
         pids_current: 0,
@@ -696,8 +703,10 @@ impl CgroupNode {
         cpu_usage_us: 0,
         cpu_nr_throttled: 0,
         subtree_control: 0,
-        attached_pids: [0; 8],
+        attached_pids: [0; MAX_CGROUP_ATTACHED_PIDS],
         attached_count: 0,
+        oom_group: false,
+        frozen: false,
     };
 
     pub fn path(&self) -> &[u8] {
@@ -731,17 +740,33 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
         Self { nodes }
     }
 
-    /// Creates a child cgroup directory (`mkdir("/sys/fs/cgroup/<rel>")`).
+    /// Creates a child cgroup directory (`mkdir("/sys/fs/cgroup/<rel>")`), allowing direct
+    /// multi-level slice creation for legacy callers and unit tests.
     pub fn mkdir(&mut self, rel_path: &[u8]) -> Result<usize, Errno> {
+        self.mkdir_inner(rel_path, false)
+    }
+
+    /// Creates a child cgroup directory with POSIX parent validation (`ENOENT` if missing).
+    pub fn mkdir_strict(&mut self, rel_path: &[u8]) -> Result<usize, Errno> {
+        self.mkdir_inner(rel_path, true)
+    }
+
+    fn mkdir_inner(&mut self, rel_path: &[u8], require_parent: bool) -> Result<usize, Errno> {
         let clean = trim_slashes(rel_path);
         if clean.is_empty() {
             return Err(Errno::EEXIST);
         }
-        if clean.len() > 48 {
+        if clean.len() > MAX_CGROUP_PATH_LEN {
             return Err(Errno::ENAMETOOLONG);
         }
         if self.nodes.iter().any(|n| n.live && n.path() == clean) {
             return Err(Errno::EEXIST);
+        }
+        if require_parent && let Some(pos) = clean.iter().rposition(|&b| b == b'/') {
+            let parent = &clean[..pos];
+            if !self.nodes.iter().any(|n| n.live && n.path() == parent) {
+                return Err(Errno::ENOENT);
+            }
         }
         let (idx, slot) = self
             .nodes
@@ -749,7 +774,7 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
             .enumerate()
             .find(|(_, n)| !n.live)
             .ok_or(Errno::ENOSPC)?;
-        let mut p = [0u8; 48];
+        let mut p = [0u8; MAX_CGROUP_PATH_LEN];
         p[..clean.len()].copy_from_slice(clean);
         *slot = CgroupNode {
             live: true,
@@ -764,6 +789,15 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
     pub fn rmdir(&mut self, rel_path: &[u8]) -> Result<(), Errno> {
         let clean = trim_slashes(rel_path);
         if clean.is_empty() {
+            return Err(Errno::EBUSY);
+        }
+        let has_child = self.nodes.iter().any(|n| {
+            n.live
+                && n.path_len > clean.len()
+                && n.path().starts_with(clean)
+                && n.path()[clean.len()] == b'/'
+        });
+        if has_child {
             return Err(Errno::EBUSY);
         }
         let slot = self
@@ -812,24 +846,41 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
                 Ok(())
             }
             b"cgroup.subtree_control" => {
-                if trimmed.windows(4).any(|w| w == b"pids") {
-                    self.nodes[idx].subtree_control |= 1;
-                }
-                if trimmed.windows(6).any(|w| w == b"memory") {
-                    self.nodes[idx].subtree_control |= 2;
-                }
-                if trimmed.windows(3).any(|w| w == b"cpu") {
-                    self.nodes[idx].subtree_control |= 4;
+                for tok in trimmed.split(|&b| b == b' ' || b == b'\t' || b == b'\n') {
+                    if let Some(name) = tok.strip_prefix(b"+") {
+                        match name {
+                            b"pids" => self.nodes[idx].subtree_control |= 1,
+                            b"memory" => self.nodes[idx].subtree_control |= 2,
+                            b"cpu" => self.nodes[idx].subtree_control |= 4,
+                            _ => {}
+                        }
+                    } else if let Some(name) = tok.strip_prefix(b"-") {
+                        match name {
+                            b"pids" => self.nodes[idx].subtree_control &= !1,
+                            b"memory" => self.nodes[idx].subtree_control &= !2,
+                            b"cpu" => self.nodes[idx].subtree_control &= !4,
+                            _ => {}
+                        }
+                    } else if tok.windows(4).any(|w| w == b"pids") {
+                        self.nodes[idx].subtree_control |= 1;
+                    } else if tok.windows(6).any(|w| w == b"memory") {
+                        self.nodes[idx].subtree_control |= 2;
+                    } else if tok.windows(3).any(|w| w == b"cpu") {
+                        self.nodes[idx].subtree_control |= 4;
+                    }
                 }
                 Ok(())
             }
-            b"cgroup.procs" => {
+            b"cgroup.procs" | b"cgroup.threads" => {
                 let pid = parse_u64_ascii(trimmed)? as u32;
                 if pid == 0 {
                     return Err(Errno::EINVAL);
                 }
                 if self.nodes[idx].pids_current >= self.nodes[idx].pids_max {
                     return Err(Errno::EAGAIN);
+                }
+                if self.nodes[idx].attached_pids[..self.nodes[idx].attached_count].contains(&pid) {
+                    return Ok(());
                 }
                 // Detach from any previous cgroup first.
                 for node in &mut self.nodes {
@@ -856,6 +907,16 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
                 node.pids_current += 1;
                 Ok(())
             }
+            b"cgroup.freeze" => {
+                self.nodes[idx].frozen = parse_u64_ascii(trimmed)? != 0;
+                Ok(())
+            }
+            b"cgroup.type" => Ok(()),
+            b"cgroup.kill" => Ok(()),
+            b"memory.oom.group" => {
+                self.nodes[idx].oom_group = parse_u64_ascii(trimmed)? != 0;
+                Ok(())
+            }
             _ => Err(Errno::EACCES),
         }
     }
@@ -872,15 +933,48 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
 
         match file_name {
             b"cgroup.controllers" => Ok(copy_bytes(out, b"cpu memory pids\n")),
-            b"cgroup.subtree_control" => Ok(copy_bytes(out, b"cpu memory pids\n")),
-            b"cgroup.events" => {
-                let populated = if node.pids_current > 0 {
-                    &b"populated 1\nfrozen 0\n"[..]
-                } else {
-                    &b"populated 0\nfrozen 0\n"[..]
-                };
-                Ok(copy_bytes(out, populated))
+            b"cgroup.subtree_control" => {
+                let mut pos = 0usize;
+                for (bit, name) in [(4u32, &b"cpu"[..]), (2, b"memory"), (1, b"pids")] {
+                    if node.subtree_control & bit != 0 {
+                        if pos > 0 {
+                            pos += copy_bytes(&mut out[pos..], b" ");
+                        }
+                        pos += copy_bytes(&mut out[pos..], name);
+                    }
+                }
+                pos += copy_bytes(&mut out[pos..], b"\n");
+                Ok(pos)
             }
+            b"cgroup.events" => {
+                let mut populated = node.pids_current > 0;
+                if !populated && !group_path.is_empty() {
+                    populated = self.nodes.iter().any(|n| {
+                        n.live
+                            && n.pids_current > 0
+                            && n.path_len > group_path.len()
+                            && n.path().starts_with(group_path)
+                            && n.path()[group_path.len()] == b'/'
+                    });
+                }
+                let txt = match (populated, node.frozen) {
+                    (true, true) => &b"populated 1\nfrozen 1\n"[..],
+                    (true, false) => &b"populated 1\nfrozen 0\n"[..],
+                    (false, true) => &b"populated 0\nfrozen 1\n"[..],
+                    (false, false) => &b"populated 0\nfrozen 0\n"[..],
+                };
+                Ok(copy_bytes(out, txt))
+            }
+            b"cgroup.freeze" => Ok(copy_bytes(out, if node.frozen { b"1\n" } else { b"0\n" })),
+            b"cgroup.type" => Ok(copy_bytes(out, b"domain\n")),
+            b"memory.oom.group" => Ok(copy_bytes(
+                out,
+                if node.oom_group { b"1\n" } else { b"0\n" },
+            )),
+            b"cgroup.stat" => Ok(copy_bytes(
+                out,
+                b"nr_descendants 0\nnr_dying_descendants 0\n",
+            )),
             b"pids.max" => {
                 if node.pids_max == u32::MAX {
                     Ok(copy_bytes(out, b"max\n"))
@@ -908,15 +1002,86 @@ impl<const MAX_GROUPS: usize> CgroupTree<MAX_GROUPS> {
                 out,
             )),
             b"memory.stat" => Ok(write_memory_stat(node.memory_current, out)),
-            b"cgroup.procs" => {
-                if node.attached_count == 0 {
-                    Ok(0)
-                } else {
-                    Ok(write_u64_line(u64::from(node.attached_pids[0]), out))
+            b"cgroup.procs" | b"cgroup.threads" => {
+                let mut pos = 0usize;
+                for &pid in &node.attached_pids[..node.attached_count] {
+                    pos += write_u64_line(u64::from(pid), &mut out[pos..]);
                 }
+                Ok(pos)
             }
             _ => Err(Errno::ENOENT),
         }
+    }
+
+    pub fn has_dir(&self, rel_path: &[u8]) -> bool {
+        let clean = trim_slashes(rel_path);
+        self.nodes.iter().any(|n| n.live && n.path() == clean)
+    }
+
+    pub fn list_dir(&self, rel_path: &[u8], mut emit: impl FnMut(&[u8], bool)) -> bool {
+        let clean = trim_slashes(rel_path);
+        if !self.has_dir(clean) {
+            return false;
+        }
+        for name in [
+            &b"cgroup.controllers"[..],
+            b"cgroup.events",
+            b"cgroup.freeze",
+            b"cgroup.procs",
+            b"cgroup.stat",
+            b"cgroup.subtree_control",
+            b"cgroup.threads",
+            b"cgroup.type",
+            b"cpu.max",
+            b"cpu.stat",
+            b"memory.current",
+            b"memory.max",
+            b"memory.oom.group",
+            b"memory.stat",
+            b"pids.current",
+            b"pids.max",
+        ] {
+            emit(name, false);
+        }
+        if !clean.is_empty() {
+            emit(b"cgroup.kill", false);
+        }
+        for node in &self.nodes {
+            if !node.live {
+                continue;
+            }
+            let p = node.path();
+            if p.is_empty() {
+                continue;
+            }
+            let child_name = if clean.is_empty() {
+                if !p.contains(&b'/') { Some(p) } else { None }
+            } else if p.len() > clean.len() + 1 && p.starts_with(clean) && p[clean.len()] == b'/' {
+                let rest = &p[clean.len() + 1..];
+                if !rest.contains(&b'/') {
+                    Some(rest)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(name) = child_name {
+                emit(name, true);
+            }
+        }
+        true
+    }
+
+    pub fn pid_cgroup_path(&self, pid: u32, out: &mut [u8]) -> usize {
+        for node in &self.nodes {
+            if node.live && node.attached_pids[..node.attached_count].contains(&pid) {
+                let mut pos = copy_bytes(out, b"/");
+                pos += copy_bytes(&mut out[pos..], node.path());
+                return pos;
+            }
+        }
+        copy_bytes(out, b"/")
     }
 
     /// Enforces `pids.max` when `pid` attempts to fork/clone a new child.
@@ -1603,6 +1768,62 @@ mod tests {
         assert_eq!(
             sec.evaluate_seccomp(63, 0x8000_003e, 0, [0; 6]),
             SeccompVerdict::Kill
+        );
+    }
+
+    #[test]
+    fn cgroup_v2_nested_hierarchy_listing_and_pid_lookup_work() {
+        let mut tree = CgroupTree::<8>::new();
+        assert_eq!(
+            tree.mkdir_strict(b"system.slice/journald.service"),
+            Err(Errno::ENOENT)
+        );
+        tree.mkdir_strict(b"system.slice").unwrap();
+        tree.mkdir_strict(b"system.slice/journald.service").unwrap();
+        tree.write_control_file(
+            b"system.slice/cgroup.subtree_control",
+            b"+cpu +memory +pids\n",
+        )
+        .unwrap();
+        tree.write_control_file(b"system.slice/journald.service/cgroup.procs", b"42\n")
+            .unwrap();
+
+        let mut path = [0u8; MAX_CGROUP_PATH_LEN];
+        let plen = tree.pid_cgroup_path(42, &mut path);
+        assert_eq!(&path[..plen], b"/system.slice/journald.service");
+
+        let mut entries = [[0u8; 32]; 32];
+        let mut entry_lens = [0usize; 32];
+        let mut entry_dirs = [false; 32];
+        let mut count = 0usize;
+        assert!(tree.list_dir(b"system.slice", |name, is_dir| {
+            if count < entries.len() {
+                let n = name.len().min(32);
+                entries[count][..n].copy_from_slice(&name[..n]);
+                entry_lens[count] = n;
+                entry_dirs[count] = is_dir;
+                count += 1;
+            }
+        }));
+        assert!(
+            entries[..count]
+                .iter()
+                .zip(entry_lens[..count].iter())
+                .zip(entry_dirs[..count].iter())
+                .any(|((buf, &l), &is_dir)| is_dir && &buf[..l] == b"journald.service")
+        );
+        assert!(
+            entries[..count]
+                .iter()
+                .zip(entry_lens[..count].iter())
+                .zip(entry_dirs[..count].iter())
+                .any(|((buf, &l), &is_dir)| !is_dir && &buf[..l] == b"cgroup.procs")
+        );
+
+        assert_eq!(tree.rmdir(b"system.slice"), Err(Errno::EBUSY));
+        assert_eq!(
+            tree.rmdir(b"system.slice/journald.service"),
+            Err(Errno::EBUSY)
         );
     }
 }

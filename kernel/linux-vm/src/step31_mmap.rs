@@ -11,6 +11,10 @@ use crate::{
 
 /// Linux `PROT_NONE` protection constant (`0x0`, guard-page reservations).
 pub const PROT_NONE: u64 = 0x0;
+/// Linux `MAP_SHARED` flag (`0x01`, shared mapping).
+pub const MAP_SHARED: u64 = 0x01;
+/// Linux `MAP_SHARED_VALIDATE` flag (`0x03`).
+pub const MAP_SHARED_VALIDATE: u64 = 0x03;
 /// Linux `MAP_FIXED` flag (`0x10`, exact page-aligned address placement/replacement).
 pub const MAP_FIXED: u64 = 0x10;
 /// Linux `MAP_DENYWRITE` flag (`0x0800`, ignored per Linux UAPI, passed by `ld.so`).
@@ -27,7 +31,8 @@ pub const MAP_NONBLOCK: u64 = 0x10000;
 pub const MAP_STACK: u64 = 0x20000;
 
 /// Complete mask of `mmap(2)` flags accepted by the Step-31 dynamic linker and libc VM owner.
-pub const STEP31_ALLOWED_MMAP_FLAGS: u64 = MAP_PRIVATE
+pub const STEP31_ALLOWED_MMAP_FLAGS: u64 = MAP_SHARED
+    | MAP_PRIVATE
     | MAP_ANONYMOUS
     | MAP_FIXED
     | MAP_DENYWRITE
@@ -62,6 +67,7 @@ pub enum MmapFileBacking<'a> {
 pub struct Step31MmapSpec {
     pub perms: VmPerms,
     pub anonymous: bool,
+    pub shared: bool,
     pub fixed: bool,
     pub offset: u64,
 }
@@ -101,7 +107,10 @@ pub fn validate_step31_mmap_spec(
     fd: u64,
     offset: u64,
 ) -> Result<Step31MmapSpec, Error> {
-    if (flags & 0x03) != MAP_PRIVATE || (flags & !STEP31_ALLOWED_MMAP_FLAGS) != 0 {
+    let share_kind = flags & 0x03;
+    if !matches!(share_kind, MAP_SHARED | MAP_PRIVATE | MAP_SHARED_VALIDATE)
+        || (flags & !STEP31_ALLOWED_MMAP_FLAGS) != 0
+    {
         return Err(Error::Linux(Errno::EINVAL));
     }
     if offset & (PAGE_SIZE - 1) != 0 {
@@ -115,6 +124,7 @@ pub fn validate_step31_mmap_spec(
     Ok(Step31MmapSpec {
         perms,
         anonymous,
+        shared: share_kind != MAP_PRIVATE,
         fixed: flags & MAP_FIXED != 0,
         offset,
     })
@@ -566,6 +576,12 @@ mod tests {
         )
         .unwrap();
         assert!(hint_spec.anonymous);
+        assert!(!hint_spec.shared);
         assert!(!hint_spec.fixed);
+
+        let shared_spec =
+            validate_step31_mmap_spec(PROT_READ | PROT_WRITE, MAP_SHARED, 3, 0).unwrap();
+        assert!(!shared_spec.anonymous);
+        assert!(shared_spec.shared);
     }
 }

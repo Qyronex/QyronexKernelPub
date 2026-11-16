@@ -51,6 +51,7 @@ pub struct RuntimeTablePool {
     next: u64,
     end: u64,
     free_head: u64,
+    floor_sealed: bool,
 }
 
 impl RuntimeTablePool {
@@ -75,7 +76,22 @@ impl RuntimeTablePool {
             next,
             end: layout.page_tables.end,
             free_head: 0,
+            floor_sealed: false,
         })
+    }
+
+    /// Seals the non-releasable pre-live table floor right after permanent kernel TTBR1 mappings
+    /// and Step-7..14 construction allocations complete, so initial PID 1 user page tables allocated
+    /// afterward remain cleanly reclaimable on `execve(2)`.
+    ///
+    /// # Safety
+    /// Caller must own the exclusive BSP construction window after all permanent kernel/proof
+    /// tables have been allocated and before any live user-process page tables are allocated.
+    pub unsafe fn seal_live_release_floor(&mut self) {
+        if !self.floor_sealed {
+            self.allocation_start = self.next;
+            self.floor_sealed = true;
+        }
     }
 
     /// Inert replacement left behind after the one-way live-runtime handoff.
@@ -90,6 +106,7 @@ impl RuntimeTablePool {
             next: 0,
             end: 0,
             free_head: 0,
+            floor_sealed: false,
         }
     }
 
@@ -322,9 +339,12 @@ impl LiveRuntimeTablePoolCell {
             Err(_) => return Err(Error::LiveInvalidState),
         }
 
-        // Seal the releasable live range only now, after every Step7-14 construction
-        // allocation is complete. Pre-live proof tables stay permanently below the floor.
-        source.allocation_start = source.next;
+        // Seal the releasable live range only now, after every Step7-14 (and optional permanent
+        // Step-15 kernel high-alias) allocation is complete. Pre-live proof tables stay permanently
+        // below the floor.
+        if !source.floor_sealed {
+            source.allocation_start = source.next;
+        }
 
         // Move, do not copy, the unique monotonic cursor. The caller's construction-window backend is
         // immediately replaced by a value on which every Backend operation fails.
@@ -443,6 +463,7 @@ mod tests {
             next,
             end: 0x9000,
             free_head: 0,
+            floor_sealed: false,
         }
     }
 
@@ -454,6 +475,7 @@ mod tests {
             next: 0x2000,
             end: 0x5000,
             free_head: 0,
+            floor_sealed: false,
         }
     }
 

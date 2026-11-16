@@ -76,6 +76,8 @@ mod step31_runtime;
 mod step32_dev;
 #[path = "step33_ext4_vfs.rs"]
 mod step33_ext4_vfs;
+#[path = "step33_memfs.rs"]
+mod step33_memfs;
 #[path = "step33_mounts.rs"]
 mod step33_mounts;
 #[path = "step34_net.rs"]
@@ -192,10 +194,14 @@ unsafe fn run_protected(
     // Build the real long-lived Linux Process/address-space owner while the protected callback still
     // owns the exact construction-window page-table cursor. Later loader/trap/pthread composition
     // borrows this same state; no proof-only root or temporary Process is created.
+    // Permanent TTBR1 high-alias tables are now complete, so seal the reclaim floor before
+    // allocating PID 1 user page tables so `execve(2)` from PID 1 can cleanly reclaim them.
     // SAFETY: this callback is BSP-exclusive and `backend` is the unique mutable RuntimeTablePool
     // cursor supplied by the protected-boot owner for the duration of this synchronous callback.
+    unsafe { backend.as_mut().seal_live_release_floor() };
     runtime::initialize_linux_runtime(unsafe { backend.as_mut() }).map_err(|_| ())?;
     serial.write_str("KERNAL/ARM64: Step 15 persistent Linux runtime initialized\n");
+    step33_mounts::ensure_boot_initialized();
     if let Some(ip) = step34_net::init_hardware_net() {
         serial.write_str("KERNAL/ARM64: VirtIO-Net DHCP ip=");
         serial.write_u64(u64::from(ip[0]));
@@ -1286,6 +1292,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     }
 
     if request.number == 215 {
+        step31_runtime::sync_shared_mmap_range(request.args[0], request.args[1], true);
         let call = MinimumRuntimeCall::Munmap {
             address: request.args[0],
             length: request.args[1],
@@ -1318,11 +1325,25 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         }
     }
 
+    if request.number == 227 {
+        let addr = request.args[0];
+        let len = request.args[1];
+        let msync_flags = request.args[2];
+        if (addr & 0xfff) != 0 || (msync_flags & !7) != 0 {
+            frame.x[0] = SyscallReturn::error(kernal_linux_abi::Errno::EINVAL).as_u64_bits();
+            return true;
+        }
+        step31_runtime::sync_shared_mmap_range(addr, len, false);
+        frame.x[0] = 0;
+        return true;
+    }
+
     if request.number == 93 {
         return exit::handle_thread_exit(request.args[0]);
     }
 
     if request.number == 94 {
+        step31_runtime::sync_shared_mmap_all_for_current(true);
         return exit::handle_group_exit(request.args[0]);
     }
 

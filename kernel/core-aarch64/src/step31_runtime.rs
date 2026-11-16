@@ -209,6 +209,7 @@ fn handle_prlimit64(
     let resource = decode_rlimit_resource(raw_resource).map_err(Step31Error::Linux)?;
     let (_process_id, caller_pid, _pgid) = current_process_identity()?;
 
+    let is_root = super::step_fd_util::current_uid_gid().0 == 0;
     if pid_i32 != 0 && (pid_i32 as u32) != caller_pid.get() {
         let target_pid = NonZeroU32::new(pid_i32 as u32).ok_or(Step31Error::Invariant)?;
         let exists = super::runtime::with_linux_runtime(|state| {
@@ -221,11 +222,12 @@ fn handle_prlimit64(
         })
         .map_err(|_| Step31Error::Invariant)?
         .map_err(|_| Step31Error::Invariant)?;
-        return if exists {
-            Err(Step31Error::Linux(Errno::EPERM))
-        } else {
-            Err(Step31Error::Linux(Errno::ESRCH))
-        };
+        if !exists {
+            return Err(Step31Error::Linux(Errno::ESRCH));
+        }
+        if !is_root {
+            return Err(Step31Error::Linux(Errno::EPERM));
+        }
     }
 
     let baseline = default_rlimit64(resource);
@@ -236,7 +238,7 @@ fn handle_prlimit64(
         let requested = Rlimit64::from_le_bytes(raw_new)
             .validate()
             .map_err(Step31Error::Linux)?;
-        if requested.rlim_max > baseline.rlim_max {
+        if !is_root && requested.rlim_max > baseline.rlim_max {
             return Err(Step31Error::Linux(Errno::EPERM));
         }
     }
@@ -524,6 +526,9 @@ fn current_process_identity() -> Result<(ObjectId, NonZeroU32, NonZeroU32), Step
 
 #[cfg(feature = "step29-qemu-proof")]
 fn validate_serial_tty_fd(process: ObjectId, fd: i32) -> Result<(), Step31Error> {
+    if super::step_fd_util::is_live_non_tty_native_fd(process, fd as u64) {
+        return Err(Step31Error::Linux(Errno::ENOTTY));
+    }
     super::step29_runtime::with_process(process, |runtime| {
         match runtime.fds().object_kind(fd).map_err(map_fd_error)? {
             OpenObjectKind::External(
@@ -1002,8 +1007,246 @@ fn map_usercopy_error(error: UsercopyError) -> Result<Errno, ()> {
     }
 }
 
+#[cfg(feature = "step29-qemu-proof")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum SharedMmapBacking {
+    MemFs { mount_id: u32, mem_ino: u64 },
+    MemFd { idx: usize, generation: u64 },
+    Ext4 { mount_id: u32, ino: u32 },
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+#[derive(Clone, Copy)]
+struct SharedMmapEntry {
+    live: bool,
+    process: ObjectId,
+    va_start: u64,
+    len: u64,
+    file_offset: u64,
+    backing: SharedMmapBacking,
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+impl SharedMmapEntry {
+    const EMPTY: Self = Self {
+        live: false,
+        process: ObjectId(0),
+        va_start: 0,
+        len: 0,
+        file_offset: 0,
+        backing: SharedMmapBacking::Ext4 {
+            mount_id: 0,
+            ino: 0,
+        },
+    };
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+struct SharedMmapCell {
+    state: core::sync::atomic::AtomicU8,
+    entries: core::cell::UnsafeCell<[SharedMmapEntry; 32]>,
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+// SAFETY: access is synchronized by atomic CAS lock `0 -> 1 -> 0` with acquire/release ordering.
+unsafe impl Sync for SharedMmapCell {}
+
+#[cfg(feature = "step29-qemu-proof")]
+static SHARED_MMAPS: SharedMmapCell = SharedMmapCell {
+    state: core::sync::atomic::AtomicU8::new(0),
+    entries: core::cell::UnsafeCell::new([SharedMmapEntry::EMPTY; 32]),
+};
+
+#[cfg(feature = "step29-qemu-proof")]
+fn with_shared_mmaps<R>(f: impl FnOnce(&mut [SharedMmapEntry; 32]) -> R) -> Option<R> {
+    use core::sync::atomic::Ordering;
+    let mut spins = 0usize;
+    while SHARED_MMAPS
+        .state
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spins += 1;
+        if spins >= 1_000_000 {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+    // SAFETY: exclusive state `1` acquired above.
+    let res = f(unsafe { &mut *SHARED_MMAPS.entries.get() });
+    SHARED_MMAPS.state.store(0, Ordering::Release);
+    Some(res)
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn record_shared_mmap(
+    process: ObjectId,
+    va_start: u64,
+    raw_len: u64,
+    file_offset: u64,
+    backing: SharedMmapBacking,
+) {
+    let page_mask = 4096u64 - 1;
+    let aligned = raw_len
+        .saturating_add(page_mask)
+        .checked_div(4096)
+        .unwrap_or(0)
+        .saturating_mul(4096)
+        .max(4096);
+    let _ = with_shared_mmaps(|entries| {
+        if let Some(slot) = entries.iter_mut().find(|e| !e.live) {
+            *slot = SharedMmapEntry {
+                live: true,
+                process,
+                va_start,
+                len: aligned,
+                file_offset,
+                backing,
+            };
+        }
+    });
+}
+
+/// Flushes dirty pages in active writable `MAP_SHARED` file mappings for `current_process_identity()`.
+pub(super) fn sync_shared_mmap_range(address: u64, length: u64, unmapping: bool) {
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    {
+        let _ = (address, length, unmapping);
+    }
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        sync_shared_mmap_inner(Some((address, length)), unmapping);
+    }
+}
+
+/// Flushes all active writable `MAP_SHARED` file mappings for the active user process.
+pub(super) fn sync_shared_mmap_all_for_current(clear_entries: bool) {
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    {
+        let _ = clear_entries;
+    }
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        sync_shared_mmap_inner(None, clear_entries);
+    }
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool) {
+    let Ok((process, _, _)) = current_process_identity() else {
+        return;
+    };
+    let req_span = match range_filter {
+        Some((addr, len)) => {
+            if len == 0 {
+                return;
+            }
+            let page_end = addr.saturating_add(len).saturating_add(4095) & !4095u64;
+            let page_start = addr & !4095u64;
+            if page_end <= page_start {
+                return;
+            }
+            Some((page_start, page_end))
+        }
+        None => None,
+    };
+
+    let mut snap = [SharedMmapEntry::EMPTY; 32];
+    let mut snap_n = 0usize;
+    let _ = with_shared_mmaps(|entries| {
+        for e in entries.iter_mut() {
+            if !e.live || e.process != process {
+                continue;
+            }
+            let e_end = e.va_start.saturating_add(e.len);
+            let matches = match req_span {
+                None => true,
+                Some((s, end)) => e.va_start < end && e_end > s,
+            };
+            if matches {
+                snap[snap_n] = *e;
+                snap_n += 1;
+                if remove_matched && req_span.is_none() {
+                    *e = SharedMmapEntry::EMPTY;
+                }
+            }
+        }
+    });
+
+    let mut page_buf = [0u8; 4096];
+    for e in &snap[..snap_n] {
+        let e_end = e.va_start.saturating_add(e.len);
+        let (ov_start, ov_end) = match req_span {
+            None => (e.va_start, e_end),
+            Some((s, end)) => (e.va_start.max(s), e_end.min(end)),
+        };
+        let mut va = ov_start;
+        while va < ov_end {
+            let chunk = usize::try_from(ov_end - va).unwrap_or(4096).min(4096);
+            if kernal_usercopy_aarch64::copy_from_user(&mut page_buf[..chunk], va).is_ok() {
+                let file_off = e.file_offset.saturating_add(va - e.va_start);
+                match e.backing {
+                    SharedMmapBacking::MemFs { mount_id, mem_ino } => {
+                        if let Ok(off_usize) = usize::try_from(file_off) {
+                            super::step33_mounts::write_back_memfs_mmap(
+                                mount_id,
+                                mem_ino,
+                                off_usize,
+                                &page_buf[..chunk],
+                            );
+                        }
+                    }
+                    SharedMmapBacking::MemFd { idx, generation } => {
+                        if let Ok(off_usize) = usize::try_from(file_off) {
+                            super::step35_events_cgroup::write_back_memfd_mmap(
+                                idx,
+                                generation,
+                                off_usize,
+                                &page_buf[..chunk],
+                            );
+                        }
+                    }
+                    SharedMmapBacking::Ext4 { mount_id, ino } => {
+                        super::step33_ext4_vfs::write_back_ext4_mmap(
+                            mount_id,
+                            ino,
+                            file_off,
+                            &page_buf[..chunk],
+                        );
+                    }
+                }
+            }
+            va = va.saturating_add(chunk as u64);
+        }
+    }
+
+    if remove_matched && let Some((u_start, u_end)) = req_span {
+        let _ = with_shared_mmaps(|entries| {
+            for e in entries.iter_mut() {
+                if !e.live || e.process != process {
+                    continue;
+                }
+                let e_end = e.va_start.saturating_add(e.len);
+                if e.va_start >= u_end || e_end <= u_start {
+                    continue;
+                }
+                if u_start <= e.va_start && u_end >= e_end {
+                    *e = SharedMmapEntry::EMPTY;
+                } else if u_start <= e.va_start {
+                    let cut = u_end - e.va_start;
+                    e.va_start = u_end;
+                    e.len -= cut;
+                    e.file_offset = e.file_offset.saturating_add(cut);
+                } else {
+                    e.len = u_start - e.va_start;
+                }
+            }
+        });
+    }
+}
+
 /// Routes Step-31 dynamic linker `mmap(2)` requests (`MAP_FIXED`, `MAP_DENYWRITE`, `PROT_NONE`,
-/// `PROT_EXEC`, or file-backed `MAP_PRIVATE`) through the Step-31 VM transaction owner while
+/// `PROT_EXEC`, `MAP_SHARED`, or file-backed mappings) through the Step-31 VM transaction owner while
 /// leaving standard anonymous `MAP_PRIVATE | MAP_ANONYMOUS` (`PROT_READ` / `PROT_READ | PROT_WRITE`)
 /// requests to the baseline `live_vm::handle` path.
 pub(super) fn try_handle_dynamic_mmap(
@@ -1049,7 +1292,13 @@ pub(super) fn try_handle_dynamic_mmap(
     #[cfg(feature = "step29-qemu-proof")]
     {
         Some(handle_file_backed_mmap(
-            address, length, protection, flags, fd, offset,
+            address,
+            length,
+            protection,
+            flags,
+            fd,
+            offset,
+            spec.shared,
         ))
     }
 }
@@ -1069,6 +1318,39 @@ pub(super) fn handle_mprotect(
 }
 
 #[cfg(feature = "step29-qemu-proof")]
+fn finish_file_backed_mmap(
+    process: ObjectId,
+    address: u64,
+    length: u64,
+    protection: u64,
+    flags: u64,
+    raw_fd: u64,
+    offset: u64,
+    bytes: &[u8],
+    track_shared_backing: Option<SharedMmapBacking>,
+) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
+    let res = super::live_vm::handle_step31_dynamic_mmap(
+        address,
+        length,
+        protection,
+        flags,
+        raw_fd,
+        offset,
+        kernal_linux_vm::MmapFileBacking::FileSlice {
+            bytes,
+            file_offset: offset,
+        },
+    )?;
+    if let Ok(mapped_va) = res
+        && let Some(backing) = track_shared_backing
+    {
+        record_shared_mmap(process, mapped_va, length, offset, backing);
+    }
+    Ok(res)
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+#[allow(clippy::too_many_arguments)]
 fn handle_file_backed_mmap(
     address: u64,
     length: u64,
@@ -1076,25 +1358,68 @@ fn handle_file_backed_mmap(
     flags: u64,
     raw_fd: u64,
     offset: u64,
+    shared: bool,
 ) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
     use kernal_linux_abi::linux_signed_int;
     use kernal_linux_vfs::{InitramfsRoot, NodeKind, OverlayNodeHandle};
-    use kernal_linux_vm::{Error as VmError, MmapFileBacking};
+    use kernal_linux_vm::{Error as VmError, PROT_WRITE};
 
     let (process, _, _) = current_process_identity().map_err(|_| ())?;
-    match super::step33_ext4_vfs::try_read_ext4_fd_for_mmap(process, raw_fd) {
-        Ok(Some(file_bytes)) => {
-            return super::live_vm::handle_step31_dynamic_mmap(
+    let need_write = shared && (protection & PROT_WRITE) != 0;
+    if shared {
+        sync_shared_mmap_all_for_current(false);
+    }
+    match super::step33_ext4_vfs::try_read_ext4_fd_for_mmap_with_meta(process, raw_fd, need_write) {
+        Ok(Some((file_bytes, mount_id, ino))) => {
+            return finish_file_backed_mmap(
+                process,
                 address,
                 length,
                 protection,
                 flags,
                 raw_fd,
                 offset,
-                MmapFileBacking::FileSlice {
-                    bytes: &file_bytes,
-                    file_offset: offset,
-                },
+                &file_bytes,
+                need_write.then_some(SharedMmapBacking::Ext4 { mount_id, ino }),
+            );
+        }
+        Ok(None) => {}
+        Err(errno) => return Ok(Err(VmError::Linux(errno))),
+    }
+    match super::step33_mounts::try_read_proc_sys_fd_for_mmap(process, raw_fd, need_write) {
+        Ok(Some((file_bytes, mem_opt))) => {
+            let backing = if need_write {
+                mem_opt.map(|(mount_id, mem_ino)| SharedMmapBacking::MemFs { mount_id, mem_ino })
+            } else {
+                None
+            };
+            return finish_file_backed_mmap(
+                process,
+                address,
+                length,
+                protection,
+                flags,
+                raw_fd,
+                offset,
+                &file_bytes,
+                backing,
+            );
+        }
+        Ok(None) => {}
+        Err(errno) => return Ok(Err(VmError::Linux(errno))),
+    }
+    match super::step35_events_cgroup::try_read_memfd_for_mmap(process, raw_fd, need_write) {
+        Ok(Some((file_bytes, idx, generation))) => {
+            return finish_file_backed_mmap(
+                process,
+                address,
+                length,
+                protection,
+                flags,
+                raw_fd,
+                offset,
+                &file_bytes,
+                need_write.then_some(SharedMmapBacking::MemFd { idx, generation }),
             );
         }
         Ok(None) => {}
@@ -1146,17 +1471,8 @@ fn handle_file_backed_mmap(
         let archive = kernal_cpio::Archive::parse(archive_bytes).map_err(|_| ())?;
         let root = InitramfsRoot::new(archive, root_id);
         let file_bytes = root.read_at(file, 0, usize::MAX).map_err(|_| ())?;
-        super::live_vm::handle_step31_dynamic_mmap(
-            address,
-            length,
-            protection,
-            flags,
-            raw_fd,
-            offset,
-            MmapFileBacking::FileSlice {
-                bytes: file_bytes,
-                file_offset: offset,
-            },
+        finish_file_backed_mmap(
+            process, address, length, protection, flags, raw_fd, offset, file_bytes, None,
         )
     })
 }
@@ -1178,7 +1494,10 @@ pub(super) fn try_handle_debian_process_clone(
         VFORK_PROCESS_FLAGS,
     };
 
+    const CLONE_PIDFD: u64 = 0x0000_1000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
     const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    const CLONE_NAMESPACES_MASK: u64 = 0x7e02_0000;
     const GLIBC_FORK_FLAGS: u64 = LINUX_SIGCHLD | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
 
     if request.number != 220 {
@@ -1186,35 +1505,71 @@ pub(super) fn try_handle_debian_process_clone(
     }
 
     let flags = request.args[0];
+    if (flags & CLONE_NAMESPACES_MASK) != 0 {
+        // systemd uses unprivileged fallback paths (`EPERM`) when namespace isolation is denied.
+        frame.x[0] = SyscallReturn::error(Errno::EPERM).as_u64_bits();
+        return Some(true);
+    }
+    let want_pidfd = (flags & CLONE_PIDFD) != 0;
+    if want_pidfd && (flags & CLONE_PARENT_SETTID) != 0 {
+        frame.x[0] = SyscallReturn::error(Errno::EINVAL).as_u64_bits();
+        return Some(true);
+    }
     let child_stack = request.args[1];
+    let parent_tid = request.args[2];
     let child_tid = request.args[4];
+    if want_pidfd {
+        if !parent_tid.is_multiple_of(4) {
+            frame.x[0] = SyscallReturn::error(Errno::EINVAL).as_u64_bits();
+            return Some(true);
+        }
+        if parent_tid == 0 || kernal_usercopy::UserRange::new(parent_tid, 4).is_err() {
+            frame.x[0] = SyscallReturn::error(Errno::EFAULT).as_u64_bits();
+            return Some(true);
+        }
+    }
+    let base_flags = flags & !CLONE_PIDFD;
 
-    let (child_tid_set, child_tid_clear) = if flags == VFORK_PROCESS_FLAGS {
-        if child_stack != 0 && child_stack != frame.sp_el0 {
-            frame.x[0] = SyscallReturn::error(Errno::EINVAL).as_u64_bits();
-            return Some(true);
-        }
-        (None, None)
-    } else if matches!(
-        flags,
-        f if f == GLIBC_FORK_FLAGS
-            || f == (LINUX_SIGCHLD | CLONE_CHILD_SETTID)
-            || f == (LINUX_SIGCHLD | CLONE_CHILD_CLEARTID)
-    ) {
-        if child_stack != 0
-            || !child_tid.is_multiple_of(4)
-            || kernal_usercopy::UserRange::new(child_tid, 4).is_err()
-        {
-            frame.x[0] = SyscallReturn::error(Errno::EINVAL).as_u64_bits();
-            return Some(true);
-        }
-        (
-            (flags & CLONE_CHILD_SETTID != 0).then_some(child_tid),
-            (flags & CLONE_CHILD_CLEARTID != 0).then_some(child_tid),
-        )
-    } else {
-        return None;
-    };
+    let (child_tid_set, child_tid_clear, child_stack_override) =
+        if base_flags == VFORK_PROCESS_FLAGS {
+            let sp_override = if child_stack != 0 && child_stack != frame.sp_el0 {
+                if !child_stack.is_multiple_of(16)
+                    || child_stack
+                        .checked_sub(16)
+                        .is_none_or(|base| kernal_usercopy::UserRange::new(base, 16).is_err())
+                {
+                    frame.x[0] = SyscallReturn::error(Errno::EINVAL).as_u64_bits();
+                    return Some(true);
+                }
+                Some(child_stack)
+            } else {
+                None
+            };
+            (None, None, sp_override)
+        } else if matches!(
+            base_flags,
+            f if f == GLIBC_FORK_FLAGS
+                || f == (LINUX_SIGCHLD | CLONE_CHILD_SETTID)
+                || f == (LINUX_SIGCHLD | CLONE_CHILD_CLEARTID)
+                || f == LINUX_SIGCHLD
+        ) {
+            let need_tid = (base_flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) != 0;
+            if child_stack != 0
+                || (need_tid
+                    && (!child_tid.is_multiple_of(4)
+                        || kernal_usercopy::UserRange::new(child_tid, 4).is_err()))
+            {
+                frame.x[0] = SyscallReturn::error(Errno::EINVAL).as_u64_bits();
+                return Some(true);
+            }
+            (
+                (base_flags & CLONE_CHILD_SETTID != 0).then_some(child_tid),
+                (base_flags & CLONE_CHILD_CLEARTID != 0).then_some(child_tid),
+                None,
+            )
+        } else {
+            return None;
+        };
 
     let Ok(fork_plan) = ProcessClonePlan::validate(FORK_PROCESS_FLAGS, 0, 0, 0, 0) else {
         return Some(false);
@@ -1241,10 +1596,33 @@ pub(super) fn try_handle_debian_process_clone(
             super::super::SMOKE_WORKER_PRIORITY,
             child_tid_set,
             child_tid_clear,
+            child_stack_override,
         )
     }) else {
         return Some(false);
     };
+    if want_pidfd {
+        let Ok((parent_process, _, _)) = current_process_identity() else {
+            return Some(false);
+        };
+        let pidfd = match super::step35_events_cgroup::open_pidfd_for_process(
+            parent_process,
+            published.child_pid().get(),
+        ) {
+            Ok(fd) => fd,
+            Err(errno) => {
+                frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
+                return Some(true);
+            }
+        };
+        if let Err(err) = kernal_usercopy_aarch64::copy_to_user(parent_tid, &pidfd.to_le_bytes()) {
+            let Ok(errno) = map_usercopy_error(err) else {
+                return Some(false);
+            };
+            frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
+            return Some(true);
+        }
+    }
     frame.x[0] = u64::from(published.child_pid().get());
     super::arm_step30_post_fork_reschedule_trace();
     if let Some(serial) = super::step15_svc_trace_serial() {

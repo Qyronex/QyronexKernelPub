@@ -84,6 +84,13 @@ pub(super) const fn is_conformance_fd(raw_fd: u64) -> bool {
     fd >= CONFORMANCE_FD_BASE && fd < CONFORMANCE_FD_BASE + (MAX_CONFORMANCE_FDS as i32)
 }
 
+pub(super) fn is_open_conformance_fd(raw_fd: u64) -> bool {
+    let Ok(idx) = conformance_fd_idx(raw_fd) else {
+        return false;
+    };
+    with_step44_state(|state| state.fds[idx].open).unwrap_or(false)
+}
+
 fn conformance_fd_idx(raw_fd: u64) -> Result<usize, Errno> {
     if !is_conformance_fd(raw_fd) {
         return Err(Errno::EBADF);

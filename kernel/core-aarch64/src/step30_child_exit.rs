@@ -678,6 +678,9 @@ pub(super) fn complete_process_exit_wait_after_lifecycle(
     let mut notifications = ProcessExitNotifyPlan::new();
     notifications.include_targets(current_cpu, plan.signal_targets())?;
     notifications.deliver()?;
+    if let Some((parent_id, child_pid, child_uid)) = plan.exited_child() {
+        super::step35_events_cgroup::on_child_process_exited(parent_id, child_pid, child_uid);
+    }
 
     match plan.disposition() {
         super::runtime::ProcessExitWaitDisposition::NoParentPublication => Ok(None),

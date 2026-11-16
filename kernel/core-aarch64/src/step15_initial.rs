@@ -48,6 +48,33 @@ pub(super) fn step28_proof_complete() -> bool {
     STEP28_PROOF_STATE.load(Ordering::Acquire) == STEP28_LEADER_LOADED
 }
 
+fn extract_bootargs_init_cmd(out: &mut [u8; 128]) -> Option<usize> {
+    let mut bootargs = [0u8; 256];
+    let len = super::step42_hardware::copy_bootargs(&mut bootargs);
+    if len == 0 {
+        return None;
+    }
+    let mut init_path: Option<&[u8]> = None;
+    for token in bootargs[..len].split(|&b| b == b' ' || b == b'\t' || b == b'\n') {
+        if let Some(val) = token.strip_prefix(b"init=") {
+            init_path = Some(val);
+        }
+    }
+    let path = init_path?;
+    if !path.starts_with(b"/")
+        || path.len() < 2
+        || path.len() > out.len() - 5
+        || !path
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return None;
+    }
+    out[..5].copy_from_slice(b"exec ");
+    out[5..5 + path.len()].copy_from_slice(path);
+    Some(5 + path.len())
+}
+
 /// Preserves the accepted Step-15 direct-initrd loader entry while selecting a proof-scoped archive
 /// executable only when the dedicated acceptance features are active. Step 28/29 continue to select
 /// the pinned unchanged BusyBox image; Step 30 selects the ordinary static Linux proof executable
@@ -107,24 +134,40 @@ pub unsafe fn load_and_publish<const SCHED_THREADS: usize, const WAKES: usize>(
                 )
                 .map_err(|_| Error::Initramfs)?;
 
-            let argv0: &[u8] = b"/bin/dash";
-            let mut argv_tail: [&[u8]; 1] = [b"-i"];
+            let mut init_cmd_buf = [0u8; 128];
+            let init_cmd_len = extract_bootargs_init_cmd(&mut init_cmd_buf);
+            let mut default_tail: [&[u8]; 1] = [b"-i"];
             if !cfg!(feature = "step31-debian-shell")
                 && let Ok(Some(script)) = parsed.get(b"etc/kernal-init")
                 && script.is_regular_file()
             {
-                argv_tail[0] = b"/etc/kernal-init";
+                default_tail[0] = b"/etc/kernal-init";
             }
-            let envp: [&[u8]; 4] = [
+            let init_tail: [&[u8]; 2] = [b"-c", &init_cmd_buf[..init_cmd_len.unwrap_or(0)]];
+            let default_envp: [&[u8]; 4] = [
                 b"PATH=/bin:/usr/bin:/sbin:/usr/sbin",
                 b"HOME=/root",
                 b"TERM=vt100",
                 b"PS1=debian13# ",
             ];
+            let init_envp: [&[u8]; 3] = [
+                b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                b"HOME=/root",
+                b"TERM=vt100",
+            ];
+            let argv0: &[u8] = b"/bin/dash";
             let random = entropy::take_at_random().map_err(Error::Entropy)?;
             let mut start = LinuxProcessStart::new(argv0, random);
-            start.argv_tail = &argv_tail;
-            start.envp = &envp;
+            start.argv_tail = if init_cmd_len.is_some() {
+                &init_tail
+            } else {
+                &default_tail
+            };
+            start.envp = if init_cmd_len.is_some() {
+                &init_envp
+            } else {
+                &default_envp
+            };
 
             // SAFETY: selected image & optional interpreter borrows remain scoped to `with_bytes`;
             // caller holds the synchronous loader/backend/scheduler mutation window.

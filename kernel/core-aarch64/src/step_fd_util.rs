@@ -100,9 +100,22 @@ impl<const P: usize> DirectProcessRefs<P> {
         }
     }
 
+    pub(super) fn apply_close_range(&mut self, owner: ObjectId, cloexec_only: bool) -> bool {
+        if cloexec_only {
+            let _ = self.set_cloexec(owner, true);
+            false
+        } else {
+            self.close_owner(owner)
+        }
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.owners.iter().all(Option::is_none)
     }
+}
+
+pub(super) fn fd_in_close_range(fd: i32, first: u32, last: u32) -> bool {
+    u32::try_from(fd).is_ok_and(|u| u >= first && u <= last)
 }
 
 pub(super) fn current_scheduler_thread() -> Option<kernal_scheduler_smp::GlobalThreadId> {
@@ -147,17 +160,30 @@ fn write_prefixed_u64(prefix: &[u8], val: u64, suffix: &[u8], out: &mut [u8]) ->
     c + take_suffix
 }
 
-fn describe_subsystem_handle(handle: SubsystemHandle, out: &mut [u8]) -> Option<usize> {
+fn describe_subsystem_handle(
+    handle: SubsystemHandle,
+    proc_sys_fds: Option<&[super::step33_mounts::ProcSysFdEntry]>,
+    out: &mut [u8],
+) -> Option<usize> {
     match handle.kind {
         SUBSYS_DEV => {
             super::step32_dev::describe_dev_slot(handle.slot, Some(handle.generation), None, out)
         }
-        SUBSYS_PROC_SYS => super::step33_mounts::describe_proc_sys_slot(
-            handle.slot,
-            Some(handle.generation),
-            None,
-            out,
-        ),
+        SUBSYS_PROC_SYS => match proc_sys_fds {
+            Some(fds) => super::step33_mounts::describe_proc_sys_entry_in_slice(
+                fds,
+                handle.slot,
+                Some(handle.generation),
+                None,
+                out,
+            ),
+            None => super::step33_mounts::describe_proc_sys_slot(
+                handle.slot,
+                Some(handle.generation),
+                None,
+                out,
+            ),
+        },
         SUBSYS_NET => Some(write_prefixed_u64(
             b"socket:[",
             u64::from(handle.slot),
@@ -199,11 +225,34 @@ pub(super) fn collect_process_fd_numbers(process: ObjectId, out: &mut Vec<i32>) 
     super::step42_hardware::append_open_hw_fds(process, out);
     super::step33_ext4_vfs::append_open_ext4_fds(process, out);
     super::step34_net::append_open_socket_fds(process, out);
+    super::step35_events_cgroup::append_open_event_fds(process, out);
+}
+
+pub(super) fn is_live_non_tty_native_fd(process: ObjectId, raw_fd: u64) -> bool {
+    super::step33_mounts::is_open_proc_sys_fd(process, raw_fd)
+        || super::step34_net::is_open_socket_fd(process, raw_fd)
+        || super::step35_events_cgroup::is_open_event_fd(process, raw_fd)
+        || super::step37_38_systemd_udev::is_open_kmsg_fd(process, raw_fd)
+        || super::step40_debian_boot::is_open_boot_fd(raw_fd)
+        || super::step41_container::is_open_container_fd(raw_fd)
+        || super::step42_hardware::is_open_hw_fd(process, raw_fd)
+        || super::step43_desktop::is_open_desktop_fd(raw_fd)
+        || super::step44_conformance::is_open_conformance_fd(raw_fd)
+        || super::step33_ext4_vfs::is_open_ext4_fd(process, raw_fd)
 }
 
 pub(super) fn describe_process_fd_target(
     process: ObjectId,
     fd: i32,
+    out: &mut [u8],
+) -> Option<usize> {
+    describe_process_fd_target_with_proc_sys(process, fd, None, out)
+}
+
+pub(super) fn describe_process_fd_target_with_proc_sys(
+    process: ObjectId,
+    fd: i32,
+    proc_sys_fds: Option<&[super::step33_mounts::ProcSysFdEntry]>,
     out: &mut [u8],
 ) -> Option<usize> {
     if (0..super::step29_runtime::STEP29_RUNTIME_FDS as i32).contains(&fd) {
@@ -222,7 +271,9 @@ pub(super) fn describe_process_fd_target(
             OpenObjectKind::Pipe => Some(write_prefixed_u64(b"pipe:[", fd as u64, b"]", out)),
             OpenObjectKind::File => Some(write_prefixed_u64(b"/file:[", fd as u64, b"]", out)),
             OpenObjectKind::Directory => Some(write_prefixed_u64(b"/dir:[", fd as u64, b"]", out)),
-            OpenObjectKind::Subsystem(handle) => describe_subsystem_handle(handle, out),
+            OpenObjectKind::Subsystem(handle) => {
+                describe_subsystem_handle(handle, proc_sys_fds, out)
+            }
         };
     }
     let raw_fd = fd as u64;
@@ -232,7 +283,16 @@ pub(super) fn describe_process_fd_target(
     }
     if super::step33_mounts::is_proc_sys_fd(raw_fd) {
         let slot = (fd - super::step33_mounts::PROC_SYS_FD_BASE) as u16;
-        return super::step33_mounts::describe_proc_sys_slot(slot, None, Some(process), out);
+        return match proc_sys_fds {
+            Some(fds) => super::step33_mounts::describe_proc_sys_entry_in_slice(
+                fds,
+                slot,
+                None,
+                Some(process),
+                out,
+            ),
+            None => super::step33_mounts::describe_proc_sys_slot(slot, None, Some(process), out),
+        };
     }
     if super::step42_hardware::is_hw_fd(raw_fd) {
         let slot = (fd - super::step42_hardware::HW_FD_BASE) as u16;
@@ -294,6 +354,8 @@ pub(super) fn on_subsystem_process_fork(parent: ObjectId, child: ObjectId) {
     super::step42_hardware::on_process_fork(parent, child);
     super::step33_ext4_vfs::on_process_fork(parent, child);
     super::step34_net::on_process_fork(parent, child);
+    super::step35_events_cgroup::on_process_fork(parent, child);
+    super::step37_38_systemd_udev::on_process_fork(parent, child);
 }
 
 pub(super) fn on_subsystem_process_exec(process: ObjectId) {
@@ -302,6 +364,8 @@ pub(super) fn on_subsystem_process_exec(process: ObjectId) {
     super::step42_hardware::on_process_exec(process);
     super::step33_ext4_vfs::on_process_exec(process);
     super::step34_net::on_process_exec(process);
+    super::step35_events_cgroup::on_process_exec(process);
+    super::step37_38_systemd_udev::on_process_exec(process);
 }
 
 pub(super) fn on_subsystem_process_exit(process: ObjectId) {
@@ -310,7 +374,78 @@ pub(super) fn on_subsystem_process_exit(process: ObjectId) {
     super::step42_hardware::on_process_exit(process);
     super::step33_ext4_vfs::on_process_exit(process);
     super::step34_net::on_process_exit(process);
+    super::step35_events_cgroup::on_process_exit(process);
+    super::step37_38_systemd_udev::on_process_exit(process);
     super::step39_dpkg::on_process_exit(process);
+}
+
+pub(super) fn close_range_for_all_subsystems(
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) -> Result<(), ()> {
+    let Some(process) = current_process_object() else {
+        return Ok(());
+    };
+    let mut dropped_subsys = [None::<SubsystemHandle>; super::step29_runtime::STEP29_RUNTIME_FDS];
+    let mut dropped_subsys_len = 0usize;
+    #[cfg(feature = "step29-qemu-proof")]
+    let mut closed_pipes = [None::<(kernal_linux_pipe::PipeId, kernal_linux_pipe::End)>;
+        super::step29_runtime::STEP29_RUNTIME_FDS];
+    #[cfg(feature = "step29-qemu-proof")]
+    let mut closed_pipes_len = 0usize;
+    let _ = super::step29_runtime::with_process(process, |runtime| {
+        let (fds, pipes, overlay) = runtime.fd_pipe_overlay_parts();
+        for fd in 0..super::step29_runtime::STEP29_RUNTIME_FDS as i32 {
+            if !fd_in_close_range(fd, first, last) || fds.object_kind(fd).is_err() {
+                continue;
+            }
+            if cloexec_only {
+                let _ = fds.set_close_on_exec(fd, true);
+                continue;
+            }
+            let _ = fds.close_with_release(fd, |released| match released {
+                kernal_linux_fd::ReleasedObject::Pipe(ep) => {
+                    pipes.close(ep).map_err(|_| Errno::EIO)?;
+                    #[cfg(feature = "step29-qemu-proof")]
+                    if closed_pipes_len < closed_pipes.len() {
+                        closed_pipes[closed_pipes_len] = Some((ep.pipe(), ep.end()));
+                        closed_pipes_len += 1;
+                    }
+                    Ok(())
+                }
+                kernal_linux_fd::ReleasedObject::RetainedDirectory(d) => {
+                    overlay.release_directory(d).map_err(|_| Errno::EIO)
+                }
+                kernal_linux_fd::ReleasedObject::RetainedReadOnly(l) => {
+                    overlay.release_open(l).map_err(|_| Errno::EIO)
+                }
+                kernal_linux_fd::ReleasedObject::WritableRegular(r) => {
+                    overlay.release_retained_regular(r).map_err(|_| Errno::EIO)
+                }
+                kernal_linux_fd::ReleasedObject::Subsystem(h) => {
+                    if dropped_subsys_len < dropped_subsys.len() {
+                        dropped_subsys[dropped_subsys_len] = Some(h);
+                        dropped_subsys_len += 1;
+                    }
+                    Ok(())
+                }
+            });
+        }
+    });
+    release_subsystem_handles(&dropped_subsys[..dropped_subsys_len]);
+    #[cfg(feature = "step29-qemu-proof")]
+    for (pipe, end) in closed_pipes[..closed_pipes_len].iter().flatten() {
+        super::futex::pipe_blocking::notify_after_endpoint_close(*pipe, *end).map_err(|_| ())?;
+    }
+    super::step32_dev::close_range_for_process(process, first, last, cloexec_only);
+    super::step34_net::close_range_for_process(process, first, last, cloexec_only);
+    super::step35_events_cgroup::close_range_for_process(process, first, last, cloexec_only);
+    super::step37_38_systemd_udev::close_range_for_process(process, first, last, cloexec_only);
+    super::step42_hardware::close_range_for_process(process, first, last, cloexec_only);
+    super::step33_ext4_vfs::close_range_for_process(process, first, last, cloexec_only);
+    super::step33_mounts::close_range_for_process(process, first, last, cloexec_only);
+    Ok(())
 }
 
 fn retain_native_subsystem_fd(
@@ -344,6 +479,9 @@ fn try_native_fcntl_meta(
     cmd: u32,
     argi: i32,
 ) -> Option<Result<i64, Errno>> {
+    if matches!(cmd, 5 | 6 | 7 | 36 | 37 | 38) {
+        return None;
+    }
     if super::step32_dev::is_dev_fd(raw_fd) {
         return super::step32_dev::handle_native_fcntl(process, raw_fd, cmd, argi);
     }
@@ -574,6 +712,8 @@ pub(super) fn read_user_cstr(user_ptr: u64, out: &mut [u8]) -> Result<usize, Err
 
 pub(super) const ARM64_STATX_BYTES: usize = 256;
 pub(super) const STATX_BASIC_STATS: u32 = 0x0000_07ff;
+pub(super) const STATX_MNT_ID: u32 = 0x0000_1000;
+pub(super) const STATX_ATTR_MOUNT_ROOT: u64 = 0x0000_2000;
 
 pub(super) fn read_user_iovec(user_iov: u64, index: usize) -> Result<(u64, usize), Errno> {
     if user_iov == 0 {
@@ -613,6 +753,98 @@ pub(super) struct StatMeta {
     pub mtime_nsec: u64,
     pub ctime_sec: i64,
     pub ctime_nsec: u64,
+    pub mnt_id: u32,
+    pub is_mount_root: bool,
+}
+
+pub(super) const EPOCH_BASE_SECONDS: u32 = 1_760_000_000;
+
+pub(super) fn current_epoch_now_secs() -> u32 {
+    let mono_secs = kernal_timer_aarch64::monotonic_now_ns().map_or(0u32, |ns| {
+        (ns / 1_000_000_000).min(u64::from(u32::MAX / 2)) as u32
+    });
+    EPOCH_BASE_SECONDS.saturating_add(mono_secs)
+}
+
+pub(super) fn current_uid_gid() -> (u32, u32) {
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    if let Some(current) = current_scheduler_thread() {
+        let _ = super::runtime::with_linux_runtime(|state| {
+            let _ = state.with_current_process_credentials(current, |proc_ref, creds| {
+                if let Ok(c) = creds.credentials(proc_ref) {
+                    uid = c.euid();
+                    gid = c.egid();
+                }
+            });
+        });
+    }
+    (uid, gid)
+}
+
+const UTIME_NOW: i64 = 0x3fff_ffff;
+const UTIME_OMIT: i64 = 0x3fff_fffe;
+
+pub(super) fn decode_chown_id(raw: u64) -> Option<u32> {
+    let id = raw as u32;
+    if id == u32::MAX { None } else { Some(id) }
+}
+
+pub(super) fn parse_utimens_pair(
+    user_times: u64,
+    now: u32,
+) -> Result<(Option<u32>, Option<u32>), Errno> {
+    if user_times == 0 {
+        return Ok((Some(now), Some(now)));
+    }
+    let mut raw = [0u8; 32];
+    copy_from_user(&mut raw, user_times)?;
+    let asec = i64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+    let ansec = i64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+    let msec = i64::from_le_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
+    let mnsec = i64::from_le_bytes(raw[24..32].try_into().unwrap_or([0; 8]));
+    let decode_ts = |sec: i64, nsec: i64| -> Result<Option<u32>, Errno> {
+        if nsec == UTIME_OMIT {
+            return Ok(None);
+        }
+        if nsec == UTIME_NOW {
+            return Ok(Some(now));
+        }
+        if !(0..1_000_000_000).contains(&nsec) {
+            return Err(Errno::EINVAL);
+        }
+        Ok(Some(sec.clamp(0, i64::from(u32::MAX)) as u32))
+    };
+    Ok((decode_ts(asec, ansec)?, decode_ts(msec, mnsec)?))
+}
+
+pub(super) fn write_linux_file_handle(
+    user_handle: u64,
+    user_mnt_id: u64,
+    ino: u64,
+    mnt_id: u32,
+) -> Result<i64, Errno> {
+    if user_handle == 0 || user_mnt_id == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let mut hdr = [0u8; 8];
+    copy_from_user(&mut hdr, user_handle)?;
+    let avail = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+    let needed: u32 = 8;
+    if avail > 128 {
+        return Err(Errno::EINVAL);
+    }
+    copy_to_user(user_handle, &needed.to_le_bytes())?;
+    if avail < needed {
+        return Err(Errno::EOVERFLOW);
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&needed.to_le_bytes());
+    out[4..8].copy_from_slice(&1i32.to_le_bytes());
+    out[8..16].copy_from_slice(&ino.to_le_bytes());
+    copy_to_user(user_handle, &out)?;
+    copy_to_user(user_mnt_id, &(mnt_id as i32).to_le_bytes())?;
+    Ok(0)
 }
 
 pub(super) fn write_aarch64_stat_meta(user_stat: u64, meta: &StatMeta) -> Result<i64, Errno> {
@@ -642,8 +874,15 @@ pub(super) fn write_aarch64_statx_meta(user_statx: u64, meta: &StatMeta) -> Resu
         return Err(Errno::EFAULT);
     }
     let mut buf = [0u8; ARM64_STATX_BYTES];
-    buf[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    let mut stx_mask = STATX_BASIC_STATS;
+    if meta.mnt_id != 0 {
+        stx_mask |= STATX_MNT_ID;
+    }
+    buf[0..4].copy_from_slice(&stx_mask.to_le_bytes());
     buf[4..8].copy_from_slice(&meta.blksize.to_le_bytes());
+    if meta.is_mount_root {
+        buf[8..16].copy_from_slice(&STATX_ATTR_MOUNT_ROOT.to_le_bytes());
+    }
     buf[16..20].copy_from_slice(&meta.nlink.to_le_bytes());
     buf[20..24].copy_from_slice(&meta.uid.to_le_bytes());
     buf[24..28].copy_from_slice(&meta.gid.to_le_bytes());
@@ -651,20 +890,22 @@ pub(super) fn write_aarch64_statx_meta(user_statx: u64, meta: &StatMeta) -> Resu
     buf[32..40].copy_from_slice(&meta.ino.to_le_bytes());
     buf[40..48].copy_from_slice(&meta.size.to_le_bytes());
     buf[48..56].copy_from_slice(&meta.blocks.to_le_bytes());
+    buf[56..64].copy_from_slice(&STATX_ATTR_MOUNT_ROOT.to_le_bytes());
     buf[64..72].copy_from_slice(&meta.atime_sec.to_le_bytes());
     buf[72..76].copy_from_slice(&(meta.atime_nsec as u32).to_le_bytes());
     buf[96..104].copy_from_slice(&meta.ctime_sec.to_le_bytes());
     buf[104..108].copy_from_slice(&(meta.ctime_nsec as u32).to_le_bytes());
     buf[112..120].copy_from_slice(&meta.mtime_sec.to_le_bytes());
     buf[120..124].copy_from_slice(&(meta.mtime_nsec as u32).to_le_bytes());
-    let rdev_major = ((meta.rdev >> 8) & 0xff) as u32;
-    let rdev_minor = (meta.rdev & 0xff) as u32;
+    let rdev_major = (((meta.rdev >> 8) & 0x0fff) | ((meta.rdev >> 32) & !0x0fff)) as u32;
+    let rdev_minor = ((meta.rdev & 0xff) | ((meta.rdev >> 12) & !0xff)) as u32;
     buf[128..132].copy_from_slice(&rdev_major.to_le_bytes());
     buf[132..136].copy_from_slice(&rdev_minor.to_le_bytes());
-    let dev_major = ((meta.dev >> 8) & 0xff) as u32;
-    let dev_minor = (meta.dev & 0xff) as u32;
+    let dev_major = (((meta.dev >> 8) & 0x0fff) | ((meta.dev >> 32) & !0x0fff)) as u32;
+    let dev_minor = ((meta.dev & 0xff) | ((meta.dev >> 12) & !0xff)) as u32;
     buf[136..140].copy_from_slice(&dev_major.to_le_bytes());
     buf[140..144].copy_from_slice(&dev_minor.to_le_bytes());
+    buf[144..152].copy_from_slice(&u64::from(meta.mnt_id).to_le_bytes());
     copy_to_user(user_statx, &buf)?;
     Ok(0)
 }

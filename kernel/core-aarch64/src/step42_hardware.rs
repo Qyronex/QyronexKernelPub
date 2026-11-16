@@ -35,6 +35,8 @@ pub(super) const HW_FD_BASE: i32 = 240;
 const MAX_HW_FDS: usize = 16;
 const O_CLOEXEC_U64: u64 = 0x0008_0000;
 const O_NONBLOCK_U64: u64 = 0x0800;
+const O_DIRECTORY_U64: u64 = 0x0000_4000;
+const O_PATH_U64: u64 = 0x0020_0000;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
 const HW_ADMIN_CAP: Capability = Capability {
@@ -558,6 +560,15 @@ pub(super) const fn is_hw_fd(raw_fd: u64) -> bool {
     fd >= HW_FD_BASE && fd < HW_FD_BASE + (MAX_HW_FDS as i32)
 }
 
+pub(super) fn is_open_hw_fd(process: ObjectId, raw_fd: u64) -> bool {
+    if !is_hw_fd(raw_fd) {
+        return false;
+    }
+    let idx = (linux_signed_int(raw_fd) - HW_FD_BASE) as usize;
+    with_step42_state(|state| resolve_hw_slot_mut(state, process, idx, None).is_some())
+        .unwrap_or(false)
+}
+
 fn is_hw_fd_or_alias(raw_fd: u64) -> bool {
     is_hw_fd(raw_fd)
         || lookup_aliased_subsystem_current(raw_fd).is_some_and(|h| h.kind == SUBSYS_HW)
@@ -812,6 +823,27 @@ pub(super) fn on_process_exit(process: ObjectId) {
     });
 }
 
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let _ = with_step42_state(|state| {
+        for idx in 0..MAX_HW_FDS {
+            let fd = HW_FD_BASE + (idx as i32);
+            if super::step_fd_util::fd_in_close_range(fd, first, last)
+                && state.fds[idx].live
+                && state.fds[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
+                retire_hw_slot_if_unused(state, idx);
+            }
+        }
+    });
+}
+
 fn parse_vda_partition_number(path: &[u8]) -> Option<u8> {
     let suffix = path.strip_prefix(b"/dev/vda")?;
     if suffix.is_empty() || suffix.len() > 2 {
@@ -1014,14 +1046,22 @@ pub(super) fn try_open_dev_bytes_if_block(
     path: &[u8],
     flags: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
+    let is_path = (flags & O_PATH_U64) != 0;
     let accmode = flags & 0o3;
-    let wants_write = matches!(accmode, 1 | 2);
+    let wants_write = !is_path && matches!(accmode, 1 | 2);
     let cloexec = (flags & O_CLOEXEC_U64) != 0;
-    let status_flags = accmode | (flags & O_NONBLOCK_U64);
+    let status_flags = if is_path {
+        O_PATH_U64
+    } else {
+        accmode | (flags & O_NONBLOCK_U64)
+    };
     let res = with_step42_state(|state| {
         let Some(kind) = match_hw_path(state, path) else {
             return Ok(None);
         };
+        if (flags & O_DIRECTORY_U64) != 0 {
+            return Ok(Some(Err(Errno::ENOTDIR)));
+        }
         let Some(process) = current_process_object() else {
             return Err(());
         };
@@ -1119,6 +1159,9 @@ fn read_slot_slice(
     count: usize,
 ) -> Result<usize, Errno> {
     let slot = state.fds[slot_idx];
+    if (slot.status_flags & O_PATH_U64) != 0 {
+        return Err(Errno::EBADF);
+    }
     match slot.kind {
         HwNodeKind::None => Err(Errno::EBADF),
         HwNodeKind::DevHwRng => {
@@ -1161,6 +1204,9 @@ fn write_slot_slice(
     count: usize,
 ) -> Result<usize, Errno> {
     let slot = state.fds[slot_idx];
+    if (slot.status_flags & O_PATH_U64) != 0 {
+        return Err(Errno::EBADF);
+    }
     match slot.kind {
         HwNodeKind::None => Err(Errno::EBADF),
         HwNodeKind::DevWatchdog => {
@@ -1273,6 +1319,9 @@ fn handle_pread64(
 ) -> Result<Result<i64, Errno>, ()> {
     with_step42_state(|state| {
         let (_process, _slot_idx, slot) = resolve_slot_for_current(state, raw_fd)?;
+        if (slot.status_flags & O_PATH_U64) != 0 {
+            return Err(Errno::EBADF);
+        }
         let Some(part) = slot.kind.block_part_number() else {
             return Err(Errno::ESPIPE);
         };
@@ -1294,6 +1343,9 @@ fn handle_pwrite64(
 ) -> Result<Result<i64, Errno>, ()> {
     with_step42_state(|state| {
         let (_process, _slot_idx, slot) = resolve_slot_for_current(state, raw_fd)?;
+        if (slot.status_flags & O_PATH_U64) != 0 {
+            return Err(Errno::EBADF);
+        }
         let Some(part) = slot.kind.block_part_number() else {
             return Err(Errno::ESPIPE);
         };
@@ -1325,6 +1377,9 @@ fn handle_fsync(raw_fd: u64) -> Result<Result<i64, Errno>, ()> {
 fn handle_ioctl(raw_fd: u64, req: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {
     with_step42_state(|state| {
         let (_process, _slot_idx, slot) = resolve_slot_for_current(state, raw_fd)?;
+        if (slot.status_flags & O_PATH_U64) != 0 {
+            return Err(Errno::EBADF);
+        }
         match slot.kind {
             HwNodeKind::DevRtc0 => match req {
                 RTC_RD_TIME => {
@@ -1509,7 +1564,52 @@ fn node_stat_meta(state: &Step42State, kind: HwNodeKind) -> StatMeta {
         mtime_nsec: 0,
         ctime_sec: 1_784_000_000,
         ctime_nsec: 0,
+        mnt_id: 0,
+        is_mount_root: false,
     }
+}
+
+fn fill_hw_mount_meta(meta: &mut StatMeta, kind: HwNodeKind) {
+    let fstype = match kind {
+        HwNodeKind::DevVda
+        | HwNodeKind::DevVdaPart(_)
+        | HwNodeKind::DevRtc0
+        | HwNodeKind::DevWatchdog
+        | HwNodeKind::DevHwRng => kernal_linux_mounts::FilesystemType::Devtmpfs,
+        _ => kernal_linux_mounts::FilesystemType::Sysfs,
+    };
+    let (dev, _, _, mnt_id) = super::step33_mounts::dev_and_mnt_id_for_fstype(fstype);
+    meta.dev = dev;
+    meta.mnt_id = mnt_id;
+}
+
+pub(super) fn try_stat_hw_bytes(path: &[u8], user_stat: u64) -> Result<Option<SyscallReturn>, ()> {
+    let found = with_step42_state(|state| {
+        match_hw_path(state, path).map(|kind| (kind, node_stat_meta(state, kind)))
+    })?;
+    let Some((kind, mut meta)) = found else {
+        return Ok(None);
+    };
+    fill_hw_mount_meta(&mut meta, kind);
+    Ok(Some(encode_result(
+        super::step_fd_util::write_aarch64_stat_meta(user_stat, &meta),
+    )))
+}
+
+pub(super) fn try_statx_hw_bytes(
+    path: &[u8],
+    user_statx: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let found = with_step42_state(|state| {
+        match_hw_path(state, path).map(|kind| (kind, node_stat_meta(state, kind)))
+    })?;
+    let Some((kind, mut meta)) = found else {
+        return Ok(None);
+    };
+    fill_hw_mount_meta(&mut meta, kind);
+    Ok(Some(encode_result(write_aarch64_statx_meta(
+        user_statx, &meta,
+    ))))
 }
 
 fn lookup_stat_meta_for_at(
@@ -1524,23 +1624,32 @@ fn lookup_stat_meta_for_at(
     if len == 0 && (flags & AT_EMPTY_PATH) != 0 && is_hw_fd_or_alias(dirfd) {
         let res = with_step42_state(|state| {
             let (_process, _slot_idx, slot) = resolve_slot_for_current(state, dirfd)?;
-            Ok(node_stat_meta(state, slot.kind))
+            Ok((slot.kind, node_stat_meta(state, slot.kind)))
         })?;
-        return Ok(Some(res));
+        return Ok(Some(res.map(|(kind, mut meta)| {
+            fill_hw_mount_meta(&mut meta, kind);
+            meta
+        })));
     }
     let meta = with_step42_state(|state| {
-        match_hw_path(state, &path_buf[..len]).map(|kind| Ok(node_stat_meta(state, kind)))
+        match_hw_path(state, &path_buf[..len]).map(|kind| (kind, node_stat_meta(state, kind)))
     })?;
-    Ok(meta)
+    Ok(meta.map(|(kind, mut m)| {
+        fill_hw_mount_meta(&mut m, kind);
+        Ok(m)
+    }))
 }
 
 fn handle_fstat(raw_fd: u64, user_stat: u64) -> Result<Result<i64, Errno>, ()> {
     let meta = with_step42_state(|state| {
         let (_process, _slot_idx, slot) = resolve_slot_for_current(state, raw_fd)?;
-        Ok(node_stat_meta(state, slot.kind))
+        Ok((slot.kind, node_stat_meta(state, slot.kind)))
     })?;
     match meta {
-        Ok(m) => Ok(super::step_fd_util::write_aarch64_stat_meta(user_stat, &m)),
+        Ok((kind, mut m)) => {
+            fill_hw_mount_meta(&mut m, kind);
+            Ok(super::step_fd_util::write_aarch64_stat_meta(user_stat, &m))
+        }
         Err(e) => Ok(Err(e)),
     }
 }

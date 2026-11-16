@@ -15,9 +15,9 @@ use kernal_linux_net::stack::{NetStack, TcpConnState};
 use kernal_linux_net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY,
     MAX_SCM_RIGHTS_FDS, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, NETLINK_ROUTE, NetInterfaceConfig,
-    SCM_RIGHTS, SHUT_RD, SHUT_RDWR, SHUT_WR, SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_RCVBUF,
-    SO_RCVTIMEO_NEW, SO_RCVTIMEO_OLD, SO_SNDBUF, SO_SNDTIMEO_NEW, SO_SNDTIMEO_OLD, SO_TYPE,
-    SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SockAddr, SocketTable, Ucred,
+    SCM_CREDENTIALS, SCM_RIGHTS, SHUT_RD, SHUT_RDWR, SHUT_WR, SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR,
+    SO_PROTOCOL, SO_RCVBUF, SO_RCVTIMEO_NEW, SO_RCVTIMEO_OLD, SO_SNDBUF, SO_SNDTIMEO_NEW,
+    SO_SNDTIMEO_OLD, SO_TYPE, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SockAddr, SocketTable, Ucred,
     handle_netlink_route_request_with_cfg,
 };
 
@@ -30,13 +30,15 @@ use super::step_fd_util::{
 /// `STEP29_RUNTIME_FDS` (`0..64`), `DEV_FD_BASE` (`64..96`), and `PROC_SYS_FD_BASE` (`96..128`).
 pub(super) const SOCK_FD_BASE: i32 = 128;
 const MAX_SOCKETS: usize = 32;
-const SOCK_BUF_CAP: usize = 512;
+const SOCK_BUF_CAP: usize = 4096;
 const MAX_IOV_BYTES: usize = 65_536;
-const MAX_SOCKADDR_BYTES: usize = 110;
+const MAX_SOCKADDR_BYTES: usize = 128;
 const ARM64_STAT_BYTES: usize = 128;
 const S_IFSOCK_MODE: u32 = 0o140_777;
 const SOCK_CLOEXEC_FLAG: u32 = 0x0008_0000;
 const SOCK_NONBLOCK_FLAG: u32 = 0x0000_0800;
+const MSG_TRUNC: u32 = 0x0020;
+const SOL_NETLINK: u32 = 270;
 const O_RDWR_U64: u64 = 2;
 
 const FIONREAD: u64 = 0x541B;
@@ -434,6 +436,33 @@ pub(super) fn on_process_exit(process: ObjectId) {
     drain_tx_frames();
 }
 
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let now = net_now_ns();
+    let mut closed_any = false;
+    let _ = with_net_full(|state| {
+        for idx in 0..MAX_SOCKETS {
+            let fd = SOCK_FD_BASE + (idx as i32);
+            if super::step_fd_util::fd_in_close_range(fd, first, last)
+                && state.meta[idx].live
+                && state.meta[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
+                state.retire_if_unused(idx, now);
+                closed_any = true;
+            }
+        }
+    });
+    if closed_any {
+        drain_tx_frames();
+    }
+}
+
 pub(super) fn retain_alias_handle(
     process: ObjectId,
     raw_fd: u64,
@@ -527,6 +556,13 @@ pub(super) fn handle_native_fcntl(
 pub(super) const fn is_socket_fd(raw_fd: u64) -> bool {
     let fd = linux_signed_int(raw_fd);
     fd >= SOCK_FD_BASE && fd < SOCK_FD_BASE + (MAX_SOCKETS as i32)
+}
+
+pub(super) fn is_open_socket_fd(process: ObjectId, raw_fd: u64) -> bool {
+    let Ok(idx) = usize::try_from(linux_signed_int(raw_fd) - SOCK_FD_BASE) else {
+        return false;
+    };
+    with_net_full(|state| state.check_slot(process, idx, None).is_ok()).unwrap_or(false)
 }
 
 /// Probes `POLL*` readiness for a Step-34 socket FD or aliased `SUBSYS_NET` FD owned by `process`.
@@ -833,9 +869,11 @@ fn handle_socket(raw_domain: u64, raw_type: u64, raw_proto: u64) -> Result<Resul
     };
     let sock_type = linux_unsigned_int(raw_type);
     let proto = linux_unsigned_int(raw_proto);
+    let cred = current_ucred();
     let process = current_process_object().unwrap_or(ObjectId(1));
     with_net_full(|state| {
         let idx = state.table.socket(domain, sock_type, proto)?;
+        let _ = state.table.set_peer_cred(idx, cred);
         state.init_slot(
             idx,
             process,
@@ -961,6 +999,7 @@ fn handle_bind(raw_fd: u64, user_addr: u64, addrlen: u64) -> Result<Result<i64, 
             addr
         };
         state.table.bind(idx, eff_addr)?;
+        let _ = state.table.set_peer_cred(idx, current_ucred());
         state.meta[idx].bound_local = state.table.getsockname(idx).ok();
         Ok(0)
     })
@@ -1364,12 +1403,14 @@ fn send_payload_blocking(
     flags: u32,
     dest: Option<SockAddr>,
     rights: &[i32],
+    sender_cred: Option<Ucred>,
 ) -> Result<SyscallReturn, ()> {
     let process = current_process_object().unwrap_or(ObjectId(1));
     let (idx, alias_gen) = match resolve_socket_target(raw_fd) {
         Ok(pair) => pair,
         Err(e) => return Ok(SyscallReturn::error(e)),
     };
+    let eff_cred = sender_cred.unwrap_or_else(current_ucred);
     let allowed_flags = MSG_DONTWAIT | MSG_NOSIGNAL;
     if (flags & !allowed_flags) != 0 {
         // Ignore unknown benign flags? Allow MSG_MORE/0 if needed, or reject invalid only if huge.
@@ -1411,8 +1452,10 @@ fn send_payload_blocking(
                 let mut reply = vec![0u8; 1024];
                 let n =
                     handle_netlink_route_request_with_cfg(payload, &mut reply, bound_pid, &iface)?;
-                reply.truncate(n);
-                state.netlink_rx[idx].push_back(reply);
+                if n > 0 {
+                    reply.truncate(n);
+                    state.netlink_rx[idx].push_back(reply);
+                }
                 return Ok(Some(payload.len()));
             }
 
@@ -1462,7 +1505,13 @@ fn send_payload_blocking(
                     Ok(Some(n))
                 }
                 HardwareSockKind::None => {
-                    let n = state.table.send(idx, &payload[offset..], dest, rights)?;
+                    let n = state.table.send_with_cred(
+                        idx,
+                        &payload[offset..],
+                        dest,
+                        rights,
+                        Some(eff_cred),
+                    )?;
                     Ok(Some(n))
                 }
                 HardwareSockKind::TcpListener { .. } => Err(Errno::ENOTCONN),
@@ -1525,13 +1574,21 @@ fn send_payload_blocking(
     }
 }
 
+struct RecvPayload {
+    data: Vec<u8>,
+    full_len: usize,
+    peer: Option<SockAddr>,
+    rights: [i32; MAX_SCM_RIGHTS_FDS],
+    rights_count: usize,
+    cred: Option<Ucred>,
+}
+
 fn recv_payload_blocking(
     mut frame: Option<&mut ExceptionFrame>,
     raw_fd: u64,
     max_len: usize,
     flags: u32,
-) -> Result<Result<(Vec<u8>, Option<SockAddr>, [i32; MAX_SCM_RIGHTS_FDS], usize), SyscallReturn>, ()>
-{
+) -> Result<Result<RecvPayload, SyscallReturn>, ()> {
     let process = current_process_object().unwrap_or(ObjectId(1));
     let (idx, alias_gen) = match resolve_socket_target(raw_fd) {
         Ok(pair) => pair,
@@ -1566,14 +1623,17 @@ fn recv_payload_blocking(
                 let Some(msg) = msg else {
                     return Err(Errno::EAGAIN);
                 };
-                let copy_len = take.min(msg.len());
+                let full_len = msg.len();
+                let copy_len = take.min(full_len);
                 let out = msg[..copy_len].to_vec();
-                return Ok((
-                    out,
-                    Some(SockAddr::Netlink { pid: 0, groups: 0 }),
-                    [-1; MAX_SCM_RIGHTS_FDS],
-                    0,
-                ));
+                return Ok(RecvPayload {
+                    data: out,
+                    full_len,
+                    peer: Some(SockAddr::Netlink { pid: 0, groups: 0 }),
+                    rights: [-1; MAX_SCM_RIGHTS_FDS],
+                    rights_count: 0,
+                    cred: None,
+                });
             }
 
             let mut buf = vec![0u8; take];
@@ -1586,7 +1646,14 @@ fn recv_payload_blocking(
                     let (n, src_ip, src_port) = stack.udp_recv_from(handle, &mut buf, peek)?;
                     buf.truncate(n);
                     let peer = encode_sockaddr_for_domain(m.domain, src_ip, src_port);
-                    Ok((buf, Some(peer), [-1; MAX_SCM_RIGHTS_FDS], 0))
+                    Ok(RecvPayload {
+                        full_len: n,
+                        data: buf,
+                        peer: Some(peer),
+                        rights: [-1; MAX_SCM_RIGHTS_FDS],
+                        rights_count: 0,
+                        cred: None,
+                    })
                 }
                 HardwareSockKind::Tcp { handle, .. } => {
                     used_hw_net = true;
@@ -1598,13 +1665,27 @@ fn recv_payload_blocking(
                     let peer = stack
                         .tcp_addrs(handle)
                         .map(|a| encode_sockaddr_for_domain(m.domain, a.remote_ip, a.remote_port));
-                    Ok((buf, peer, [-1; MAX_SCM_RIGHTS_FDS], 0))
+                    Ok(RecvPayload {
+                        full_len: n,
+                        data: buf,
+                        peer,
+                        rights: [-1; MAX_SCM_RIGHTS_FDS],
+                        rights_count: 0,
+                        cred: None,
+                    })
                 }
                 HardwareSockKind::None => {
-                    let (n, peer, rights, rcount) =
-                        state.table.recv_with_peek(idx, &mut buf, peek)?;
+                    let (n, full_len, peer, rights, rcount, cred) =
+                        state.table.recv_with_cred_peek(idx, &mut buf, peek)?;
                     buf.truncate(n);
-                    Ok((buf, peer, rights, rcount))
+                    Ok(RecvPayload {
+                        full_len,
+                        data: buf,
+                        peer,
+                        rights,
+                        rights_count: rcount,
+                        cred,
+                    })
                 }
                 HardwareSockKind::TcpListener { .. } => Err(Errno::ENOTCONN),
             }
@@ -1669,6 +1750,7 @@ fn handle_sendto_blocking(
         linux_unsigned_int(raw_flags),
         dest,
         &[],
+        None,
     )
 }
 
@@ -1690,23 +1772,28 @@ fn handle_recvfrom_blocking(
     if take > 0 && user_buf == 0 {
         return Ok(SyscallReturn::error(Errno::EFAULT));
     }
-    let (data, peer_addr, _, _) =
-        match recv_payload_blocking(frame, raw_fd, take, linux_unsigned_int(raw_flags))? {
-            Ok(t) => t,
-            Err(ret) => return Ok(ret),
-        };
-    if !data.is_empty()
-        && let Err(e) = copy_to_user(user_buf, &data)
+    let flags = linux_unsigned_int(raw_flags);
+    let recv = match recv_payload_blocking(frame, raw_fd, take, flags)? {
+        Ok(r) => r,
+        Err(ret) => return Ok(ret),
+    };
+    if !recv.data.is_empty()
+        && let Err(e) = copy_to_user(user_buf, &recv.data)
     {
         return Ok(SyscallReturn::error(e));
     }
     if user_src != 0
-        && let Some(addr) = peer_addr
+        && let Some(addr) = recv.peer
         && let Err(e) = write_user_sockaddr(user_src, user_addrlen, &addr)
     {
         return Ok(SyscallReturn::error(e));
     }
-    Ok(encode_result(Ok(data.len() as i64)))
+    let ret_len = if (flags & MSG_TRUNC) != 0 {
+        recv.full_len
+    } else {
+        recv.data.len()
+    };
+    Ok(encode_result(Ok(ret_len as i64)))
 }
 
 fn handle_writev_blocking(
@@ -1743,7 +1830,7 @@ fn handle_writev_blocking(
             break;
         }
     }
-    send_payload_blocking(frame, raw_fd, &payload, 0, None, &[])
+    send_payload_blocking(frame, raw_fd, &payload, 0, None, &[], None)
 }
 
 fn handle_readv_blocking(
@@ -1773,18 +1860,18 @@ fn handle_readv_blocking(
             break;
         }
     }
-    let (data, _, _, _) = match recv_payload_blocking(frame, raw_fd, total, 0)? {
-        Ok(t) => t,
+    let recv = match recv_payload_blocking(frame, raw_fd, total, 0)? {
+        Ok(r) => r,
         Err(ret) => return Ok(ret),
     };
     let mut off = 0usize;
     for (base, take) in iovs {
-        if off >= data.len() {
+        if off >= recv.data.len() {
             break;
         }
-        let chunk = take.min(data.len() - off);
+        let chunk = take.min(recv.data.len() - off);
         if chunk > 0 {
-            if let Err(e) = copy_to_user(base, &data[off..off + chunk]) {
+            if let Err(e) = copy_to_user(base, &recv.data[off..off + chunk]) {
                 return Ok(SyscallReturn::error(e));
             }
             off += chunk;
@@ -1857,7 +1944,10 @@ fn handle_setsockopt(
         match state.table.setsockopt(idx, level, optname, val) {
             Ok(()) => Ok(0),
             Err(Errno::ENOPROTOOPT)
-                if level == IPPROTO_TCP || level == IPPROTO_IPV6 || level == SOL_SOCKET =>
+                if level == IPPROTO_TCP
+                    || level == IPPROTO_IPV6
+                    || level == SOL_SOCKET
+                    || (level == SOL_NETLINK && state.meta[idx].domain == AF_NETLINK) =>
             {
                 Ok(0)
             }
@@ -1878,7 +1968,7 @@ fn handle_getsockopt(
         Ok(pair) => pair,
         Err(e) => return Ok(Err(e)),
     };
-    if user_optval == 0 || user_optlen == 0 {
+    if user_optlen == 0 {
         return Ok(Err(Errno::EFAULT));
     }
     let mut len_bytes = [0u8; 4];
@@ -1886,6 +1976,9 @@ fn handle_getsockopt(
         return Ok(Err(e));
     }
     let max_len = (u32::from_le_bytes(len_bytes) as usize).min(32);
+    if max_len > 0 && user_optval == 0 {
+        return Ok(Err(Errno::EFAULT));
+    }
     let mut out = [0u8; 32];
     let level = linux_unsigned_int(raw_level);
     let optname = linux_unsigned_int(raw_optname);
@@ -1944,6 +2037,19 @@ fn handle_getsockopt(
             out[0..4].copy_from_slice(&u32::from(m.domain).to_le_bytes());
             return Ok(4usize);
         }
+        if level == SOL_SOCKET
+            && optname == SO_ACCEPTCONN
+            && matches!(m.hw, HardwareSockKind::TcpListener { .. })
+        {
+            if max_len < 4 {
+                return Err(Errno::EINVAL);
+            }
+            out[0..4].copy_from_slice(&1u32.to_le_bytes());
+            return Ok(4usize);
+        }
+        if level == SOL_NETLINK && m.domain == AF_NETLINK && optname == 9 {
+            return Ok(0usize);
+        }
         state
             .table
             .getsockopt(idx, level, optname, &mut out[..max_len])
@@ -1952,8 +2058,10 @@ fn handle_getsockopt(
         Ok(w) => w,
         Err(e) => return Ok(Err(e)),
     };
-    if let Err(e) = copy_to_user(user_optval, &out[..written]) {
-        return Ok(Err(e));
+    if written > 0 {
+        if let Err(e) = copy_to_user(user_optval, &out[..written]) {
+            return Ok(Err(e));
+        }
     }
     if let Err(e) = copy_to_user(user_optlen, &(written as u32).to_le_bytes()) {
         return Ok(Err(e));
@@ -2084,22 +2192,47 @@ fn handle_sendmsg_blocking(
 
     let mut rights = [0i32; MAX_SCM_RIGHTS_FDS];
     let mut rights_count = 0usize;
+    let mut explicit_cred: Option<Ucred> = None;
     if msg_control != 0 && msg_controllen >= 16 {
-        let mut cmsg = [0u8; 16 + MAX_SCM_RIGHTS_FDS * 4];
+        let mut cmsg = [0u8; 256];
         let copy_len = (msg_controllen as usize).min(cmsg.len());
         if let Err(e) = copy_from_user(&mut cmsg[..copy_len], msg_control) {
             return Ok(SyscallReturn::error(e));
         }
-        let cmsg_len = u64::from_le_bytes(cmsg[0..8].try_into().unwrap()) as usize;
-        let cmsg_level = i32::from_le_bytes(cmsg[8..12].try_into().unwrap());
-        let cmsg_type = i32::from_le_bytes(cmsg[12..16].try_into().unwrap());
-        if cmsg_level == (SOL_SOCKET as i32) && cmsg_type == SCM_RIGHTS && cmsg_len >= 16 {
-            let data_bytes = cmsg_len.min(copy_len) - 16;
-            rights_count = (data_bytes / 4).min(MAX_SCM_RIGHTS_FDS);
-            for (r_idx, slot) in rights.iter_mut().enumerate().take(rights_count) {
-                let off = 16 + r_idx * 4;
-                *slot = i32::from_le_bytes(cmsg[off..off + 4].try_into().unwrap());
+        let cur = current_ucred();
+        let mut pos = 0usize;
+        while pos + 16 <= copy_len {
+            let cmsg_len = u64::from_le_bytes(cmsg[pos..pos + 8].try_into().unwrap()) as usize;
+            let cmsg_level = i32::from_le_bytes(cmsg[pos + 8..pos + 12].try_into().unwrap());
+            let cmsg_type = i32::from_le_bytes(cmsg[pos + 12..pos + 16].try_into().unwrap());
+            if cmsg_len < 16 || pos.saturating_add(cmsg_len) > copy_len {
+                break;
             }
+            if cmsg_level == (SOL_SOCKET as i32) && cmsg_type == SCM_RIGHTS {
+                let data_bytes = cmsg_len - 16;
+                rights_count = (data_bytes / 4).min(MAX_SCM_RIGHTS_FDS);
+                for (r_idx, slot) in rights.iter_mut().enumerate().take(rights_count) {
+                    let off = pos + 16 + r_idx * 4;
+                    *slot = i32::from_le_bytes(cmsg[off..off + 4].try_into().unwrap());
+                }
+            } else if cmsg_level == (SOL_SOCKET as i32)
+                && cmsg_type == SCM_CREDENTIALS
+                && cmsg_len >= 28
+            {
+                let req_pid = u32::from_le_bytes(cmsg[pos + 16..pos + 20].try_into().unwrap());
+                let req_uid = u32::from_le_bytes(cmsg[pos + 20..pos + 24].try_into().unwrap());
+                let req_gid = u32::from_le_bytes(cmsg[pos + 24..pos + 28].try_into().unwrap());
+                explicit_cred = Some(if cur.uid == 0 {
+                    Ucred {
+                        pid: if req_pid > 0 { req_pid } else { cur.pid },
+                        uid: req_uid,
+                        gid: req_gid,
+                    }
+                } else {
+                    cur
+                });
+            }
+            pos = pos.saturating_add((cmsg_len + 7) & !7);
         }
     }
 
@@ -2110,6 +2243,7 @@ fn handle_sendmsg_blocking(
         linux_unsigned_int(raw_flags),
         dest,
         &rights[..rights_count],
+        explicit_cred,
     )
 }
 
@@ -2154,11 +2288,17 @@ fn handle_recvmsg_blocking(
         }
     }
 
-    let (data, peer, rights, rights_count) =
-        match recv_payload_blocking(frame, raw_fd, total_iov, linux_unsigned_int(raw_flags))? {
-            Ok(t) => t,
-            Err(ret) => return Ok(ret),
-        };
+    let flags = linux_unsigned_int(raw_flags);
+    let recv = match recv_payload_blocking(frame, raw_fd, total_iov, flags)? {
+        Ok(r) => r,
+        Err(ret) => return Ok(ret),
+    };
+    let data = recv.data;
+    let peer = recv.peer;
+    let rights = recv.rights;
+    let rights_count = recv.rights_count;
+    let recv_cred = recv.cred;
+    let full_len = recv.full_len;
 
     let mut off = 0usize;
     for (base, take) in iovs {
@@ -2190,27 +2330,52 @@ fn handle_recvmsg_blocking(
     }
 
     let mut out_cmsg_len = 0usize;
-    if rights_count > 0 && msg_control != 0 && msg_controllen >= 16 + rights_count * 4 {
-        let cmsg_len = 16 + rights_count * 4;
-        let mut cmsg = [0u8; 16 + MAX_SCM_RIGHTS_FDS * 4];
-        cmsg[0..8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-        cmsg[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
-        cmsg[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
-        for (i, &fd) in rights.iter().enumerate().take(rights_count) {
-            let off = 16 + i * 4;
-            cmsg[off..off + 4].copy_from_slice(&fd.to_le_bytes());
+    if msg_control != 0 && msg_controllen >= 16 {
+        let mut cmsg = [0u8; 32 + 16 + MAX_SCM_RIGHTS_FDS * 4];
+        let mut pos = 0usize;
+        if let Some(cred) = recv_cred
+            && pos + 28 <= msg_controllen
+            && pos + 32 <= cmsg.len()
+        {
+            cmsg[pos..pos + 8].copy_from_slice(&(28u64).to_le_bytes());
+            cmsg[pos + 8..pos + 12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+            cmsg[pos + 12..pos + 16].copy_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+            cmsg[pos + 16..pos + 28].copy_from_slice(&cred.to_le_bytes());
+            pos += 32;
+            out_cmsg_len = pos.min(msg_controllen);
         }
-        if let Err(e) = copy_to_user(msg_control, &cmsg[..cmsg_len]) {
+        if rights_count > 0 {
+            let cmsg_len = 16 + rights_count * 4;
+            if pos + cmsg_len <= msg_controllen && pos + cmsg_len <= cmsg.len() {
+                cmsg[pos..pos + 8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+                cmsg[pos + 8..pos + 12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+                cmsg[pos + 12..pos + 16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+                for (i, &fd) in rights.iter().enumerate().take(rights_count) {
+                    let fd_off = pos + 16 + i * 4;
+                    cmsg[fd_off..fd_off + 4].copy_from_slice(&fd.to_le_bytes());
+                }
+                let aligned = (cmsg_len + 7) & !7;
+                out_cmsg_len = (pos + aligned).min(msg_controllen);
+            }
+        }
+        if out_cmsg_len > 0
+            && let Err(e) = copy_to_user(msg_control, &cmsg[..out_cmsg_len])
+        {
             return Ok(SyscallReturn::error(e));
         }
-        out_cmsg_len = cmsg_len;
     }
+    let msg_flags = if full_len > off { MSG_TRUNC } else { 0 };
     hdr[40..48].copy_from_slice(&(out_cmsg_len as u64).to_le_bytes());
-    hdr[48..52].copy_from_slice(&0i32.to_le_bytes()); // msg_flags
+    hdr[48..52].copy_from_slice(&(msg_flags as i32).to_le_bytes()); // msg_flags
     if let Err(e) = copy_to_user(user_msghdr, &hdr) {
         return Ok(SyscallReturn::error(e));
     }
-    Ok(encode_result(Ok(off as i64)))
+    let ret_len = if (flags & MSG_TRUNC) != 0 {
+        full_len
+    } else {
+        off
+    };
+    Ok(encode_result(Ok(ret_len as i64)))
 }
 
 fn encode_ipv4_sockaddr_in(ip: [u8; 4], out: &mut [u8]) {

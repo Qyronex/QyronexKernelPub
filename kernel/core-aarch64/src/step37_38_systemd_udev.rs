@@ -18,7 +18,6 @@ const MAX_SERVICES: usize = 16;
 const KMSG_CAP: usize = 1024;
 const MAX_DEVS: usize = 16;
 
-const ARM64_STAT_BYTES: usize = 128;
 const S_IFCHR_MODE: u32 = 0o020_644;
 const KMSG_RDEV: u64 = (1u64 << 8) | 11u64; // makedev(1, 11) for /dev/kmsg
 
@@ -26,6 +25,9 @@ const O_ACCMODE: u64 = 0x3;
 const O_RDONLY: u64 = 0;
 const O_WRONLY: u64 = 1;
 const O_RDWR: u64 = 2;
+const O_DIRECTORY: u64 = 0x0000_4000;
+const O_CLOEXEC: u64 = 0x0008_0000;
+const O_PATH: u64 = 0x0020_0000;
 
 const SEEK_SET: i64 = 0;
 const SEEK_CUR: i64 = 1;
@@ -36,6 +38,8 @@ const NR_CLOSE: u64 = 57;
 const NR_LSEEK: u64 = 62;
 const NR_READ: u64 = 63;
 const NR_WRITE: u64 = 64;
+const NR_READV: u64 = 65;
+const NR_WRITEV: u64 = 66;
 const NR_NEWFSTATAT: u64 = 79;
 const NR_FSTAT: u64 = 80;
 const NR_REBOOT: u64 = 142;
@@ -57,14 +61,16 @@ enum Step37FdKind {
 #[derive(Clone, Copy)]
 struct KmsgFdEntry {
     live: bool,
-    owner_process: ObjectId,
+    owners: super::step_fd_util::DirectProcessRefs<
+        { super::step29_runtime::STEP29_RUNTIME_PROCESS_VIEWS },
+    >,
     kind: Step37FdKind,
 }
 
 impl KmsgFdEntry {
     const EMPTY: Self = Self {
         live: false,
-        owner_process: ObjectId(0),
+        owners: super::step_fd_util::DirectProcessRefs::empty(),
         kind: Step37FdKind::Kmsg {
             offset: 0,
             can_read: false,
@@ -138,6 +144,77 @@ pub(super) const fn is_kmsg_fd(raw_fd: u64) -> bool {
     fd >= KMSG_FD_BASE && fd < KMSG_FD_BASE + (MAX_KMSG_FDS as i32)
 }
 
+pub(super) fn is_open_kmsg_fd(process: ObjectId, raw_fd: u64) -> bool {
+    if !is_kmsg_fd(raw_fd) {
+        return false;
+    }
+    let idx = (linux_signed_int(raw_fd) - KMSG_FD_BASE) as usize;
+    with_systemd_udev_state(|state| {
+        let entry = &state.kmsg_fds[idx];
+        entry.live && entry.owners.has_owner(process)
+    })
+    .unwrap_or(false)
+}
+
+fn retire_kmsg_slot_if_unused(state: &mut Step37And38State, idx: usize) {
+    if state.kmsg_fds[idx].live && state.kmsg_fds[idx].owners.is_empty() {
+        state.kmsg_fds[idx] = KmsgFdEntry::EMPTY;
+    }
+}
+
+pub(super) fn on_process_fork(parent: ObjectId, child: ObjectId) {
+    let _ = with_systemd_udev_state(|state| {
+        for entry in &mut state.kmsg_fds {
+            if entry.live {
+                entry.owners.on_fork(parent, child);
+            }
+        }
+    });
+}
+
+pub(super) fn on_process_exec(process: ObjectId) {
+    let _ = with_systemd_udev_state(|state| {
+        for idx in 0..MAX_KMSG_FDS {
+            if state.kmsg_fds[idx].live {
+                state.kmsg_fds[idx].owners.close_cloexec_for(process);
+                retire_kmsg_slot_if_unused(state, idx);
+            }
+        }
+    });
+}
+
+pub(super) fn on_process_exit(process: ObjectId) {
+    let _ = with_systemd_udev_state(|state| {
+        for idx in 0..MAX_KMSG_FDS {
+            if state.kmsg_fds[idx].live {
+                let _ = state.kmsg_fds[idx].owners.close_owner(process);
+                retire_kmsg_slot_if_unused(state, idx);
+            }
+        }
+    });
+}
+
+pub(super) fn close_range_for_process(
+    process: ObjectId,
+    first: u32,
+    last: u32,
+    cloexec_only: bool,
+) {
+    let _ = with_systemd_udev_state(|state| {
+        for idx in 0..MAX_KMSG_FDS {
+            let fd = KMSG_FD_BASE + (idx as i32);
+            if super::step_fd_util::fd_in_close_range(fd, first, last)
+                && state.kmsg_fds[idx].live
+                && state.kmsg_fds[idx]
+                    .owners
+                    .apply_close_range(process, cloexec_only)
+            {
+                retire_kmsg_slot_if_unused(state, idx);
+            }
+        }
+    });
+}
+
 /// Maps a `/sys`-relative `uevent` trigger path to its logical device name (`vda`, `eth0`, `ttyAMA0`).
 fn uevent_device_from_sysfs_rel(rel: &[u8]) -> Option<&'static [u8]> {
     match rel {
@@ -199,6 +276,16 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             request.args[1],
             request.args[2],
         )?))),
+        NR_READV if is_kmsg_fd(request.args[0]) => Ok(Some(encode_result(handle_kmsg_readv(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
+        NR_WRITEV if is_kmsg_fd(request.args[0]) => Ok(Some(encode_result(handle_kmsg_writev(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
         NR_NEWFSTATAT => handle_newfstatat_if_kmsg(request.args[1], request.args[2]),
         NR_FSTAT if is_kmsg_fd(request.args[0]) => Ok(Some(encode_result(handle_kmsg_fstat(
             request.args[0],
@@ -229,25 +316,42 @@ fn handle_openat_if_kmsg_or_uevent(
     let Some(path_len) = read_short_user_path(user_path, &mut path_buf) else {
         return Ok(None);
     };
-    let path = &path_buf[..path_len];
+    try_open_kmsg_or_uevent_bytes(&path_buf[..path_len], raw_flags)
+}
 
+pub(super) fn try_open_kmsg_or_uevent_bytes(
+    path: &[u8],
+    raw_flags: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    let is_path = (raw_flags & O_PATH) != 0;
     let acc = raw_flags & O_ACCMODE;
     let kind = if path == b"/dev/kmsg" {
-        let (can_read, can_write) = match acc {
-            O_RDONLY => (true, false),
-            O_WRONLY => (false, true),
-            O_RDWR => (true, true),
-            _ => return Ok(Some(SyscallReturn::error(Errno::EINVAL))),
+        if (raw_flags & O_DIRECTORY) != 0 {
+            return Ok(Some(SyscallReturn::error(Errno::ENOTDIR)));
+        }
+        let (can_read, can_write) = if is_path {
+            (false, false)
+        } else {
+            match acc {
+                O_RDONLY => (true, false),
+                O_WRONLY => (false, true),
+                O_RDWR => (true, true),
+                _ => return Ok(Some(SyscallReturn::error(Errno::EINVAL))),
+            }
         };
         Step37FdKind::Kmsg {
             offset: 0,
             can_read,
             can_write,
         }
-    } else if acc != O_RDONLY
+    } else if !is_path
+        && acc != O_RDONLY
         && let Some(sys_rel) = path.strip_prefix(b"/sys/")
         && let Some(dev_name) = uevent_device_from_sysfs_rel(sys_rel)
     {
+        if (raw_flags & O_DIRECTORY) != 0 {
+            return Ok(Some(SyscallReturn::error(Errno::ENOTDIR)));
+        }
         let mut name_buf = [0u8; 16];
         name_buf[..dev_name.len()].copy_from_slice(dev_name);
         Step37FdKind::UeventTrigger {
@@ -259,6 +363,7 @@ fn handle_openat_if_kmsg_or_uevent(
     };
 
     let owner = current_process_id()?;
+    let cloexec = (raw_flags & O_CLOEXEC) != 0;
     let res = with_systemd_udev_state(|state| {
         state.ensure_initialized();
         let Some((idx, slot)) = state
@@ -269,9 +374,11 @@ fn handle_openat_if_kmsg_or_uevent(
         else {
             return Err(Errno::EMFILE);
         };
+        let mut owners = super::step_fd_util::DirectProcessRefs::empty();
+        owners.init(owner, cloexec);
         *slot = KmsgFdEntry {
             live: true,
-            owner_process: owner,
+            owners,
             kind,
         };
         Ok(i64::from(KMSG_FD_BASE + (idx as i32)))
@@ -284,10 +391,10 @@ fn handle_kmsg_close(raw_fd: u64) -> Result<Result<i64, Errno>, ()> {
     let owner = current_process_id()?;
     with_systemd_udev_state(|state| {
         let entry = &mut state.kmsg_fds[idx];
-        if !entry.live || entry.owner_process != owner {
+        if !entry.live || !entry.owners.close_owner(owner) {
             return Err(Errno::EBADF);
         }
-        *entry = KmsgFdEntry::EMPTY;
+        retire_kmsg_slot_if_unused(state, idx);
         Ok(0)
     })
 }
@@ -305,7 +412,7 @@ fn handle_kmsg_lseek(
         state.ensure_initialized();
         let total = state.pid1.kmsg_bytes().len() as i64;
         let entry = &mut state.kmsg_fds[idx];
-        if !entry.live || entry.owner_process != owner {
+        if !entry.live || !entry.owners.has_owner(owner) {
             return Err(Errno::EBADF);
         }
         let Step37FdKind::Kmsg { offset, .. } = &mut entry.kind else {
@@ -333,7 +440,7 @@ fn handle_kmsg_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64
     let take_res = with_systemd_udev_state(|state| {
         state.ensure_initialized();
         let entry = state.kmsg_fds[idx];
-        if !entry.live || entry.owner_process != owner {
+        if !entry.live || !entry.owners.has_owner(owner) {
             return Err(Errno::EBADF);
         }
         let Step37FdKind::Kmsg {
@@ -373,11 +480,60 @@ fn handle_kmsg_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64
     Ok(Ok(take as i64))
 }
 
+fn handle_kmsg_readv(
+    raw_fd: u64,
+    user_iov: u64,
+    raw_iovcnt: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    let iovcnt = linux_signed_int(raw_iovcnt);
+    if !(0..=1024).contains(&iovcnt) {
+        return Ok(Err(Errno::EINVAL));
+    }
+    for index in 0..(iovcnt as usize) {
+        let (base, len) = match super::step_fd_util::read_user_iovec(user_iov, index) {
+            Ok(pair) => pair,
+            Err(e) => return Ok(Err(e)),
+        };
+        if len > 0 {
+            return handle_kmsg_read(raw_fd, base, len as u64);
+        }
+    }
+    Ok(Ok(0))
+}
+
+fn handle_kmsg_writev(
+    raw_fd: u64,
+    user_iov: u64,
+    raw_iovcnt: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    let iovcnt = linux_signed_int(raw_iovcnt);
+    if !(0..=1024).contains(&iovcnt) {
+        return Ok(Err(Errno::EINVAL));
+    }
+    let mut msg = [0u8; 256];
+    let mut captured = 0usize;
+    let mut total = 0usize;
+    for index in 0..(iovcnt as usize) {
+        let (base, seg_len) = match super::step_fd_util::read_user_iovec(user_iov, index) {
+            Ok(pair) => pair,
+            Err(e) => return Ok(Err(e)),
+        };
+        total = total.saturating_add(seg_len);
+        if seg_len == 0 || captured >= msg.len() {
+            continue;
+        }
+        let take = seg_len.min(msg.len() - captured);
+        if let Err(e) = copy_from_user(&mut msg[captured..captured + take], base) {
+            return Ok(Err(e));
+        }
+        captured += take;
+    }
+    handle_kmsg_write_bytes(raw_fd, &msg[..captured], total)
+}
+
 fn handle_kmsg_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Errno>, ()> {
-    let idx = (linux_signed_int(raw_fd) - KMSG_FD_BASE) as usize;
-    let owner = current_process_id()?;
-    let requested = usize::try_from(count).unwrap_or(128).min(128);
-    let mut msg = [0u8; 128];
+    let requested = usize::try_from(count).unwrap_or(256).min(256);
+    let mut msg = [0u8; 256];
     if requested > 0 {
         if user_buf == 0 {
             return Ok(Err(Errno::EFAULT));
@@ -386,10 +542,21 @@ fn handle_kmsg_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i6
             return Ok(Err(e));
         }
     }
-    let trimmed_len = msg[..requested]
+    handle_kmsg_write_bytes(raw_fd, &msg[..requested], requested)
+}
+
+fn handle_kmsg_write_bytes(
+    raw_fd: u64,
+    msg: &[u8],
+    report_len: usize,
+) -> Result<Result<i64, Errno>, ()> {
+    let idx = (linux_signed_int(raw_fd) - KMSG_FD_BASE) as usize;
+    let owner = current_process_id()?;
+    let trimmed_len = msg
         .iter()
         .position(|&b| b == b'\n' || b == b'\r' || b == 0)
-        .unwrap_or(requested);
+        .unwrap_or(msg.len())
+        .min(256);
     enum WriteTarget {
         Kmsg,
         Uevent {
@@ -401,7 +568,7 @@ fn handle_kmsg_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i6
     let action_res = with_systemd_udev_state(|state| {
         state.ensure_initialized();
         let entry = state.kmsg_fds[idx];
-        if !entry.live || entry.owner_process != owner {
+        if !entry.live || !entry.owners.has_owner(owner) {
             return Err(Errno::EBADF);
         }
         match entry.kind {
@@ -440,7 +607,7 @@ fn handle_kmsg_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i6
     {
         return Ok(Err(e));
     }
-    Ok(Ok(requested as i64))
+    Ok(Ok(report_len as i64))
 }
 
 fn handle_newfstatat_if_kmsg(user_path: u64, user_stat: u64) -> Result<Option<SyscallReturn>, ()> {
@@ -458,8 +625,8 @@ fn handle_kmsg_fstat(raw_fd: u64, user_stat: u64) -> Result<Result<i64, Errno>, 
     let idx = (linux_signed_int(raw_fd) - KMSG_FD_BASE) as usize;
     let owner = current_process_id()?;
     let live = with_systemd_udev_state(|state| {
-        let entry = state.kmsg_fds[idx];
-        entry.live && entry.owner_process == owner
+        let entry = &state.kmsg_fds[idx];
+        entry.live && entry.owners.has_owner(owner)
     })?;
     if !live {
         return Ok(Err(Errno::EBADF));
@@ -467,20 +634,61 @@ fn handle_kmsg_fstat(raw_fd: u64, user_stat: u64) -> Result<Result<i64, Errno>, 
     Ok(write_kmsg_stat(user_stat))
 }
 
+fn kmsg_stat_meta() -> super::step_fd_util::StatMeta {
+    let (dev, _, _, mnt_id) = super::step33_mounts::dev_and_mnt_id_for_fstype(
+        kernal_linux_mounts::FilesystemType::Devtmpfs,
+    );
+    super::step_fd_util::StatMeta {
+        dev,
+        ino: (1u64 << 61) | KMSG_RDEV,
+        mode: S_IFCHR_MODE,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: KMSG_RDEV,
+        size: 0,
+        blksize: 4096,
+        blocks: 0,
+        atime_sec: 1_784_000_000,
+        atime_nsec: 0,
+        mtime_sec: 1_784_000_000,
+        mtime_nsec: 0,
+        ctime_sec: 1_784_000_000,
+        ctime_nsec: 0,
+        mnt_id,
+        is_mount_root: false,
+    }
+}
+
+pub(super) fn try_stat_kmsg_bytes(
+    path: &[u8],
+    user_stat: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if path != b"/dev/kmsg" {
+        return Ok(None);
+    }
+    Ok(Some(encode_result(write_kmsg_stat(user_stat))))
+}
+
+pub(super) fn try_statx_kmsg_bytes(
+    path: &[u8],
+    user_statx: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    if path != b"/dev/kmsg" {
+        return Ok(None);
+    }
+    let meta = kmsg_stat_meta();
+    Ok(Some(encode_result(
+        super::step_fd_util::write_aarch64_statx_meta(user_statx, &meta),
+    )))
+}
+
 fn write_kmsg_stat(user_stat: u64) -> Result<i64, Errno> {
     if user_stat == 0 {
         return Err(Errno::EFAULT);
     }
-    let mut stat = [0u8; ARM64_STAT_BYTES];
-    let ino = (1u64 << 61) | KMSG_RDEV;
-    stat[0..8].copy_from_slice(&5u64.to_le_bytes()); // st_dev (devtmpfs)
-    stat[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
-    stat[16..20].copy_from_slice(&S_IFCHR_MODE.to_le_bytes()); // st_mode (S_IFCHR | 0644)
-    stat[20..24].copy_from_slice(&1u32.to_le_bytes()); // st_nlink
-    stat[32..40].copy_from_slice(&KMSG_RDEV.to_le_bytes()); // st_rdev = makedev(1, 11)
-    stat[56..60].copy_from_slice(&4096i32.to_le_bytes()); // st_blksize
-    copy_to_user(user_stat, &stat)?;
-    Ok(0)
+    let meta = kmsg_stat_meta();
+    super::step_fd_util::write_aarch64_stat_meta(user_stat, &meta)
 }
 
 fn handle_reboot(raw_magic1: u64, raw_magic2: u64, raw_cmd: u64) -> Result<Result<i64, Errno>, ()> {

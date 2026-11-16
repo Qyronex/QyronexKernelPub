@@ -24,6 +24,9 @@ pub const LOCK_UN: u32 = 8;
 pub const F_GETLK: u32 = 5;
 pub const F_SETLK: u32 = 6;
 pub const F_SETLKW: u32 = 7;
+pub const F_OFD_GETLK: u32 = 36;
+pub const F_OFD_SETLK: u32 = 37;
+pub const F_OFD_SETLKW: u32 = 38;
 pub const F_RDLCK: u16 = 0;
 pub const F_WRLCK: u16 = 1;
 pub const F_UNLCK: u16 = 2;
@@ -297,20 +300,20 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
         Ok(())
     }
 
-    /// Releases all `flock` locks held by `owner_ofd` (e.g. on final close of open file description).
+    /// Releases all `flock` and `F_OFD_*` locks held by `owner_ofd` (on final OFD close).
     pub fn release_flock_owner(&mut self, owner_ofd: u64) {
         for entry in &mut self.locks {
-            if entry.live && !entry.kind.is_posix() && entry.owner == owner_ofd {
+            if entry.live && entry.owner == owner_ofd {
                 *entry = LockEntry::EMPTY;
             }
         }
     }
 
-    /// Executes `fcntl(F_GETLK)` for `target` on behalf of `caller_pid`.
-    pub fn fcntl_getlk(
+    /// Executes `fcntl(F_GETLK / F_OFD_GETLK)` for `target` under `owner` (`caller_pid` or OFD id).
+    pub fn fcntl_getlk_owner(
         &self,
         target: TargetKey,
-        caller_pid: u32,
+        owner: u64,
         mut req: PosixFlock,
         current_offset: i64,
         file_len: i64,
@@ -319,14 +322,13 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
             return Err(Errno::EINVAL);
         }
         let (start, end) = req.byte_range(current_offset, file_len)?;
-        let caller = u64::from(caller_pid);
         let want_write = req.l_type == F_WRLCK;
 
         if let Some(blocker) = self.locks.iter().find(|e| {
             e.live
                 && e.kind.is_posix()
                 && e.target == target
-                && e.owner != caller
+                && e.owner != owner
                 && ranges_overlap(e.start, e.end, start, end)
                 && (want_write || e.kind.is_exclusive())
         }) {
@@ -344,7 +346,11 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
                 l_whence: 0,
                 l_start: blocker.start,
                 l_len,
-                l_pid: blocker.owner as i32,
+                l_pid: if blocker.owner >= (1u64 << 63) {
+                    -1
+                } else {
+                    blocker.owner as i32
+                },
             })
         } else {
             req.l_type = F_UNLCK;
@@ -352,23 +358,34 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
         }
     }
 
-    /// Executes `fcntl(F_SETLK / F_SETLKW)` for `target` on behalf of `caller_pid`.
-    pub fn fcntl_setlk(
-        &mut self,
+    /// Executes `fcntl(F_GETLK)` for `target` on behalf of `caller_pid`.
+    pub fn fcntl_getlk(
+        &self,
         target: TargetKey,
         caller_pid: u32,
         req: PosixFlock,
         current_offset: i64,
         file_len: i64,
+    ) -> Result<PosixFlock, Errno> {
+        self.fcntl_getlk_owner(target, u64::from(caller_pid), req, current_offset, file_len)
+    }
+
+    /// Executes `fcntl(F_SETLK / F_SETLKW / F_OFD_SETLK / F_OFD_SETLKW)` for `target` under `owner`.
+    pub fn fcntl_setlk_owner(
+        &mut self,
+        target: TargetKey,
+        owner: u64,
+        req: PosixFlock,
+        current_offset: i64,
+        file_len: i64,
     ) -> Result<(), Errno> {
         let (start, end) = req.byte_range(current_offset, file_len)?;
-        let caller = u64::from(caller_pid);
         if req.l_type == F_UNLCK {
             for entry in &mut self.locks {
                 if entry.live
                     && entry.kind.is_posix()
                     && entry.target == target
-                    && entry.owner == caller
+                    && entry.owner == owner
                     && ranges_overlap(entry.start, entry.end, start, end)
                 {
                     *entry = LockEntry::EMPTY;
@@ -387,7 +404,7 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
             e.live
                 && e.kind.is_posix()
                 && e.target == target
-                && e.owner != caller
+                && e.owner != owner
                 && ranges_overlap(e.start, e.end, start, end)
                 && (new_kind.is_exclusive() || e.kind.is_exclusive())
         });
@@ -399,7 +416,7 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
             e.live
                 && e.kind.is_posix()
                 && e.target == target
-                && e.owner == caller
+                && e.owner == owner
                 && e.start == start
                 && e.end == end
         }) {
@@ -415,12 +432,24 @@ impl<const MAX_LOCKS: usize> AdvisoryLockTable<MAX_LOCKS> {
         *slot = LockEntry {
             live: true,
             target,
-            owner: caller,
+            owner,
             kind: new_kind,
             start,
             end,
         };
         Ok(())
+    }
+
+    /// Executes `fcntl(F_SETLK / F_SETLKW)` for `target` on behalf of `caller_pid`.
+    pub fn fcntl_setlk(
+        &mut self,
+        target: TargetKey,
+        caller_pid: u32,
+        req: PosixFlock,
+        current_offset: i64,
+        file_len: i64,
+    ) -> Result<(), Errno> {
+        self.fcntl_setlk_owner(target, u64::from(caller_pid), req, current_offset, file_len)
     }
 
     /// Releases all POSIX locks owned by `caller_pid` on close/exit.
