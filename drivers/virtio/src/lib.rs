@@ -7,11 +7,14 @@
 
 pub mod blk;
 pub mod blk_mmio;
+pub mod gpu;
+pub mod input;
 pub mod mmio;
 pub mod net;
 pub mod net_mmio;
 pub mod queue;
 pub mod rng;
+pub mod snd;
 
 pub use blk::{
     SECTOR_SIZE, VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO, VIRTIO_BLK_F_SIZE_MAX,
