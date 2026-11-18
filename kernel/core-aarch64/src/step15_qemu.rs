@@ -670,12 +670,6 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
                 break;
             }
             Err(()) => {
-                #[cfg(feature = "step31-debian-qemu")]
-                if let Some(serial) = step15_svc_serial() {
-                    serial.write_str("KERNAL/D13: pre-svc finalize failed nr=");
-                    serial.write_u64(frame.x[8]);
-                    serial.write_str("\n");
-                }
                 return false;
             }
         }
@@ -691,10 +685,6 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
         match runtime::with_linux_runtime(|state| state.pending_thread_exit(scheduler_owner)) {
             Ok(None) => {}
             Ok(Some(_)) | Err(_) => {
-                #[cfg(feature = "step31-debian-qemu")]
-                if let Some(serial) = step15_svc_serial() {
-                    serial.write_str("KERNAL/D13: pre-svc pending exit drain failed\n");
-                }
                 return false;
             }
         }
@@ -761,16 +751,7 @@ extern "C" fn step15_lower_el_fallback(frame: &mut ExceptionFrame) -> bool {
         return result.is_ok();
     }
 
-    let ok = deliver_step30_signal_on_return(frame).is_ok();
-    #[cfg(feature = "step31-debian-qemu")]
-    if !ok {
-        if let Some(serial) = step15_svc_serial() {
-            serial.write_str("KERNAL/D13: signal deliver failed nr=");
-            serial.write_u64(frame.x[8]);
-            serial.write_str("\n");
-        }
-    }
-    ok
+    deliver_step30_signal_on_return(frame).is_ok()
 }
 
 fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: &mut bool) -> bool {
@@ -803,12 +784,6 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             return false;
         }
         Err(()) => {
-            #[cfg(feature = "step31-debian-qemu")]
-            if let Some(serial) = step15_svc_serial() {
-                serial.write_str("KERNAL/D13: seccomp evaluate failed nr=");
-                serial.write_u64(request.number);
-                serial.write_str("\n");
-            }
             return false;
         }
     }
@@ -1319,6 +1294,31 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
             Ok(Err(_)) | Err(()) => {
                 if let Some(serial) = step15_svc_serial() {
                     serial.write_str("KERNAL/ARM64: Step 15 munmap invariant failed\n");
+                }
+                return false;
+            }
+        }
+    }
+
+    if request.number == 216 {
+        match step31_runtime::try_handle_mremap(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+        ) {
+            Ok(Ok(address)) => {
+                frame.x[0] = address;
+                return true;
+            }
+            Ok(Err(kernal_linux_vm::Error::Linux(errno))) => {
+                frame.x[0] = SyscallReturn::error(errno).as_u64_bits();
+                return true;
+            }
+            Ok(Err(_)) | Err(()) => {
+                if let Some(serial) = step15_svc_serial() {
+                    serial.write_str("KERNAL/ARM64: Step 15 mremap invariant failed\n");
                 }
                 return false;
             }

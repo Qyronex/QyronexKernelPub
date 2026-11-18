@@ -3,7 +3,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod linux;
-pub use kernal_user_elf::linux_stack::{MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_STRING_BYTES};
+pub use kernal_user_elf::linux_stack::{
+    MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_EXTENDED_ARGC, MAX_EXTENDED_ARGV0_BYTES,
+    MAX_EXTENDED_ENVC, MAX_EXTENDED_STRING_BYTES, MAX_STRING_BYTES,
+};
 pub use kernal_user_elf::{DynamicLoadPolicy, LoadPolicy};
 pub use linux::{
     AARCH64_LINUX_RT_SIGRETURN_TRAMPOLINE, LinuxInitialStackLayout, LinuxProcessStart,

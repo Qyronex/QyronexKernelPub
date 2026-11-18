@@ -373,7 +373,7 @@ pub fn gate_authority_and_desktop_isolation() -> GateResult {
     let s1 = seat.open_session(ctrl_cap, 1000, 1).unwrap();
     let s2 = seat.open_session(ctrl_cap, 1001, 2).unwrap();
     let g1 = seat.activate_session(ctrl_cap, s1.session_id).unwrap();
-    seat.evdev
+    seat.evdevs[0]
         .push_event(InputEvent {
             sec: 1,
             usec: 0,
@@ -384,8 +384,7 @@ pub fn gate_authority_and_desktop_isolation() -> GateResult {
         .unwrap();
     let _g2 = seat.activate_session(ctrl_cap, s2.session_id).unwrap();
     r.check(
-        seat.evdev
-            .read_event(g1.session_id, g1.generation, seat.active_session())
+        seat.evdevs[0].read_event(g1.session_id, g1.generation, seat.active_session())
             == Err(Errno::EACCES),
     );
     let mut drm = DrmDevice::new();

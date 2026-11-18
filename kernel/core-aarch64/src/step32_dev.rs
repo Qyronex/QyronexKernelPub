@@ -115,6 +115,8 @@ struct Step32DevState {
     ptys: PtyTable<MAX_PTYS, PTY_RING_BYTES>,
     console_ldisc: LineDiscipline<PTY_RING_BYTES>,
     console_session: TtySessionState,
+    vt_ldisc: LineDiscipline<PTY_RING_BYTES>,
+    vt_session: TtySessionState,
 }
 
 impl Step32DevState {
@@ -128,6 +130,8 @@ impl Step32DevState {
             console_session: TtySessionState::with_session(NonZeroU32::MIN, NonZeroU32::MIN),
             #[cfg(not(feature = "step31-debian-shell"))]
             console_session: TtySessionState::new(),
+            vt_ldisc: LineDiscipline::new(),
+            vt_session: TtySessionState::new(),
         }
     }
 }
@@ -297,6 +301,14 @@ fn format_dev_node_path(kind: DeviceNodeKind, out: &mut [u8]) -> usize {
         DeviceNodeKind::Random => Some(b"/dev/random"),
         DeviceNodeKind::Urandom => Some(b"/dev/urandom"),
         DeviceNodeKind::Tty => Some(b"/dev/tty"),
+        DeviceNodeKind::Vt(0) => Some(b"/dev/tty0"),
+        DeviceNodeKind::Vt(1) => Some(b"/dev/tty1"),
+        DeviceNodeKind::Vt(2) => Some(b"/dev/tty2"),
+        DeviceNodeKind::Vt(3) => Some(b"/dev/tty3"),
+        DeviceNodeKind::Vt(4) => Some(b"/dev/tty4"),
+        DeviceNodeKind::Vt(5) => Some(b"/dev/tty5"),
+        DeviceNodeKind::Vt(6) => Some(b"/dev/tty6"),
+        DeviceNodeKind::Vt(_) => Some(b"/dev/tty7"),
         DeviceNodeKind::Console => Some(b"/dev/console"),
         DeviceNodeKind::TtyAma0 => Some(b"/dev/ttyAMA0"),
         DeviceNodeKind::Ptmx => Some(b"/dev/ptmx"),
@@ -562,6 +574,7 @@ pub(super) fn probe_dev_fd_readiness(process: ObjectId, raw_fd: u64) -> Option<R
                 let (pending_sig, mask) = probe_console_in_state(state);
                 Outcome::Console(pending_sig, mask)
             }
+            DevBacking::Node(DeviceNodeKind::Vt(_)) => Outcome::Ready(u32::from(POLLOUT)),
             DevBacking::Node(_) => Outcome::Ready(u32::from(POLLIN) | u32::from(POLLOUT)),
             DevBacking::PtyMaster(master) => match state.ptys.master_readiness(master) {
                 Ok(mask) => Outcome::Ready(mask),
@@ -898,6 +911,16 @@ pub(super) fn handle_dev_ioctl(
                 arg,
                 sigttou_ignored_or_blocked,
             ),
+            DevBacking::Node(DeviceNodeKind::Vt(_)) => handle_vt_backing_ioctl(
+                &mut state.vt_ldisc,
+                &mut state.vt_session,
+                caller_pid,
+                caller_pgid,
+                caller_sid,
+                cmd,
+                arg,
+                sigttou_ignored_or_blocked,
+            ),
             DevBacking::PtySlave(slave) => {
                 if matches!(
                     cmd,
@@ -962,6 +985,100 @@ fn handle_console_backing_ioctl(
             arg,
             sigttou_ignored_or_blocked,
         ),
+        _ => Ok((SyscallReturn::error(Errno::ENOTTY), None)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_vt_backing_ioctl(
+    ldisc: &mut LineDiscipline<PTY_RING_BYTES>,
+    session: &mut TtySessionState,
+    caller_pid: NonZeroU32,
+    caller_pgid: NonZeroU32,
+    caller_sid: NonZeroU32,
+    cmd: u32,
+    arg: u64,
+    sigttou_ignored_or_blocked: bool,
+) -> Result<(SyscallReturn, Option<kernal_linux_dev::TtySignal>), ()> {
+    match cmd {
+        TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSWINSZ => {
+            Ok((handle_ldisc_ioctl(ldisc, cmd, arg)?, None))
+        }
+        TIOCSCTTY | TIOCNOTTY | TIOCGPGRP | TIOCSPGRP => handle_session_ioctl(
+            session,
+            caller_pid,
+            caller_pgid,
+            caller_sid,
+            cmd,
+            arg,
+            sigttou_ignored_or_blocked,
+        ),
+        // VT_OPENQRY (0x5600): return VT 1 as first available virtual console
+        0x5600 => {
+            if arg == 0 {
+                return Ok((SyscallReturn::error(Errno::EFAULT), None));
+            }
+            if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &1i32.to_le_bytes()) {
+                return Ok((map_usercopy(err)?, None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // VT_GETMODE (0x5601): struct vt_mode (8 bytes)
+        0x5601 => {
+            if arg == 0 {
+                return Ok((SyscallReturn::error(Errno::EFAULT), None));
+            }
+            if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &[0u8; 8]) {
+                return Ok((map_usercopy(err)?, None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // VT_GETSTATE (0x5603): struct vt_stat { v_active = 1, v_signal = 0, v_state = 0x3 }
+        0x5603 => {
+            if arg == 0 {
+                return Ok((SyscallReturn::error(Errno::EFAULT), None));
+            }
+            if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &[1, 0, 0, 0, 3, 0]) {
+                return Ok((map_usercopy(err)?, None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // VT_SETMODE, VT_SENDSIG, VT_RELDISP, VT_ACTIVATE, VT_WAITACTIVE, VT_DISALLOCATE
+        0x5602 | 0x5604 | 0x5605 | 0x5606 | 0x5607 | 0x5608 => {
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // KDGKBTYPE (0x4b33): KB_101 (0x02)
+        0x4b33 => {
+            if arg == 0 {
+                return Ok((SyscallReturn::error(Errno::EFAULT), None));
+            }
+            if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &[0x02u8]) {
+                return Ok((map_usercopy(err)?, None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // KDGETMODE (0x4b3b): KD_TEXT (0)
+        0x4b3b => {
+            if arg == 0 {
+                return Ok((SyscallReturn::error(Errno::EFAULT), None));
+            }
+            if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &0i32.to_le_bytes()) {
+                return Ok((map_usercopy(err)?, None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // KDGKBMODE (0x4b44): K_UNICODE (3)
+        0x4b44 => {
+            if arg == 0 {
+                return Ok((SyscallReturn::error(Errno::EFAULT), None));
+            }
+            if let Err(err) = kernal_usercopy_aarch64::copy_to_user(arg, &3i32.to_le_bytes()) {
+                return Ok((map_usercopy(err)?, None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        // KDSETMODE (0x4b3a), KDSKBMODE (0x4b45), KDSKBMUTE (0x4b51), KDSETLED (0x4b32)
+        0x4b32 | 0x4b3a | 0x4b45 | 0x4b51 => Ok((SyscallReturn::success(0).ok_or(())?, None)),
         _ => Ok((SyscallReturn::error(Errno::ENOTTY), None)),
     }
 }
@@ -1209,6 +1326,7 @@ fn lseek_dev_fd(raw_fd: u64) -> Result<SyscallReturn, ()> {
             | DeviceNodeKind::Random
             | DeviceNodeKind::Urandom => Ok(SyscallReturn::success(0).ok_or(())?),
             DeviceNodeKind::Tty
+            | DeviceNodeKind::Vt(_)
             | DeviceNodeKind::Console
             | DeviceNodeKind::TtyAma0
             | DeviceNodeKind::Ptmx
@@ -1319,6 +1437,16 @@ fn read_dev_entry(
                 total += read_len;
             }
             Ok(SyscallReturn::success(total as i64).ok_or(())?)
+        }
+        DevBacking::Node(DeviceNodeKind::Vt(_)) => {
+            if entry.nonblocking {
+                return Ok(SyscallReturn::error(Errno::EAGAIN));
+            }
+            loop {
+                if await_retry_or_signal(frame.as_deref_mut())? {
+                    return Ok(SyscallReturn::error(Errno::EINTR));
+                }
+            }
         }
         DevBacking::Node(
             DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
@@ -1657,6 +1785,9 @@ fn write_dev_entry(
                     };
                 }
             },
+            DevBacking::Node(DeviceNodeKind::Vt(_)) => {
+                total += take;
+            }
             DevBacking::Node(
                 DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
             ) => {

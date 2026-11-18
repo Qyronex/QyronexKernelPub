@@ -19,6 +19,7 @@ pub(super) const SUBSYS_EVENT: u8 = 4;
 pub(super) const SUBSYS_HW: u8 = 5;
 pub(super) const SUBSYS_EXT4: u8 = 6;
 pub(super) const SUBSYS_KMSG: u8 = 7;
+pub(super) const SUBSYS_DESKTOP: u8 = 8;
 
 const F_DUPFD: u32 = 0;
 const F_GETFD: u32 = 1;
@@ -215,6 +216,12 @@ fn describe_subsystem_handle(
             b"]",
             out,
         )),
+        SUBSYS_DESKTOP => super::step43_desktop::describe_desktop_slot(
+            handle.slot,
+            Some(handle.generation),
+            None,
+            out,
+        ),
         _ => None,
     }
 }
@@ -234,6 +241,7 @@ pub(super) fn collect_process_fd_numbers(process: ObjectId, out: &mut Vec<i32>) 
     super::step34_net::append_open_socket_fds(process, out);
     super::step35_events_cgroup::append_open_event_fds(process, out);
     super::step37_38_systemd_udev::append_open_kmsg_fds(process, out);
+    super::step43_desktop::append_open_desktop_fds(process, out);
 }
 
 pub(super) fn is_live_non_tty_native_fd(process: ObjectId, raw_fd: u64) -> bool {
@@ -244,7 +252,7 @@ pub(super) fn is_live_non_tty_native_fd(process: ObjectId, raw_fd: u64) -> bool 
         || super::step40_debian_boot::is_open_boot_fd(raw_fd)
         || super::step41_container::is_open_container_fd(raw_fd)
         || super::step42_hardware::is_open_hw_fd(process, raw_fd)
-        || super::step43_desktop::is_open_desktop_fd(raw_fd)
+        || super::step43_desktop::is_open_desktop_fd(process, raw_fd)
         || super::step44_conformance::is_open_conformance_fd(raw_fd)
         || super::step33_ext4_vfs::is_open_ext4_fd(process, raw_fd)
 }
@@ -310,6 +318,10 @@ pub(super) fn describe_process_fd_target_with_proc_sys(
         let slot = (fd - super::step37_38_systemd_udev::KMSG_FD_BASE) as u16;
         return Some(write_prefixed_u64(b"kmsg:[", u64::from(slot), b"]", out));
     }
+    if super::step43_desktop::is_desktop_fd(raw_fd) {
+        let slot = (fd - super::step43_desktop::DESKTOP_FD_BASE) as u16;
+        return super::step43_desktop::describe_desktop_slot(slot, None, Some(process), out);
+    }
     None
 }
 
@@ -343,6 +355,7 @@ pub(super) fn release_subsystem_handle(handle: SubsystemHandle) {
         SUBSYS_HW => super::step42_hardware::release_alias_handle(handle),
         SUBSYS_EXT4 => super::step33_ext4_vfs::release_alias_handle(handle),
         SUBSYS_KMSG => super::step37_38_systemd_udev::release_alias_handle(handle),
+        SUBSYS_DESKTOP => super::step43_desktop::release_alias_handle(handle),
         _ => {}
     }
 }
@@ -362,6 +375,7 @@ pub(super) fn on_subsystem_process_fork(parent: ObjectId, child: ObjectId) {
     super::step35_events_cgroup::on_process_fork(parent, child);
     super::step37_38_systemd_udev::on_process_fork(parent, child);
     super::step41_container::on_process_fork(parent, child);
+    super::step43_desktop::on_process_fork(parent, child);
 }
 
 pub(super) fn on_subsystem_process_exec(process: ObjectId) {
@@ -372,6 +386,7 @@ pub(super) fn on_subsystem_process_exec(process: ObjectId) {
     super::step34_net::on_process_exec(process);
     super::step35_events_cgroup::on_process_exec(process);
     super::step37_38_systemd_udev::on_process_exec(process);
+    super::step43_desktop::on_process_exec(process);
 }
 
 pub(super) fn on_subsystem_process_exit(process: ObjectId) {
@@ -384,6 +399,7 @@ pub(super) fn on_subsystem_process_exit(process: ObjectId) {
     super::step37_38_systemd_udev::on_process_exit(process);
     super::step39_dpkg::on_process_exit(process);
     super::step41_container::on_process_exit(process);
+    super::step43_desktop::on_process_exit(process);
 }
 
 pub(super) fn close_range_for_all_subsystems(
@@ -450,6 +466,7 @@ pub(super) fn close_range_for_all_subsystems(
     super::step35_events_cgroup::close_range_for_process(process, first, last, cloexec_only);
     super::step37_38_systemd_udev::close_range_for_process(process, first, last, cloexec_only);
     super::step42_hardware::close_range_for_process(process, first, last, cloexec_only);
+    super::step43_desktop::close_range_for_process(process, first, last, cloexec_only);
     super::step33_ext4_vfs::close_range_for_process(process, first, last, cloexec_only);
     super::step33_mounts::close_range_for_process(process, first, last, cloexec_only);
     Ok(())
@@ -466,6 +483,7 @@ pub(super) fn retain_existing_subsystem_handle(
         SUBSYS_HW => super::step42_hardware::retain_existing_handle(handle),
         SUBSYS_EXT4 => super::step33_ext4_vfs::retain_existing_handle(handle),
         SUBSYS_KMSG => super::step37_38_systemd_udev::retain_existing_handle(handle),
+        SUBSYS_DESKTOP => super::step43_desktop::retain_existing_handle(handle),
         _ => Err(Errno::EBADF),
     }
 }
@@ -539,6 +557,9 @@ fn retain_native_subsystem_fd(
     if super::step37_38_systemd_udev::is_kmsg_fd(raw_fd) {
         return super::step37_38_systemd_udev::retain_alias_handle(process, raw_fd).map(Some);
     }
+    if super::step43_desktop::is_desktop_fd(raw_fd) {
+        return super::step43_desktop::retain_alias_handle(process, raw_fd).map(Some);
+    }
     Ok(None)
 }
 
@@ -572,6 +593,9 @@ fn try_native_fcntl_meta(
     if super::step37_38_systemd_udev::is_kmsg_fd(raw_fd) {
         return super::step37_38_systemd_udev::handle_native_fcntl(process, raw_fd, cmd, argi);
     }
+    if super::step43_desktop::is_desktop_fd(raw_fd) {
+        return super::step43_desktop::handle_native_fcntl(process, raw_fd, cmd, argi);
+    }
     if matches!(cmd, F_GETFL | F_SETFL)
         && let Some(handle) = lookup_aliased_subsystem(process, raw_fd)
     {
@@ -588,6 +612,9 @@ fn try_native_fcntl_meta(
             SUBSYS_EXT4 => super::step33_ext4_vfs::handle_native_fcntl(process, raw_fd, cmd, argi),
             SUBSYS_KMSG => {
                 super::step37_38_systemd_udev::handle_native_fcntl(process, raw_fd, cmd, argi)
+            }
+            SUBSYS_DESKTOP => {
+                super::step43_desktop::handle_native_fcntl(process, raw_fd, cmd, argi)
             }
             _ => None,
         };

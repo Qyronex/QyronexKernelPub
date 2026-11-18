@@ -574,6 +574,29 @@ impl<const N: usize> WaitTable<N> {
         Ok(self.finish_terminal_waiters(record))
     }
 
+    /// Removes an already-published zombie child record whose parent has exited without reaping it.
+    pub fn reap_orphaned_zombie<const CHILD_CAPS: usize>(
+        &mut self,
+        publication: &ChildExitPublication,
+        child: &Process<CHILD_CAPS>,
+    ) -> Result<(), Error> {
+        if child.personality() != Personality::Linux {
+            return Err(Error::WrongPersonality);
+        }
+        if child.id() != publication.child {
+            return Err(Error::StalePublication);
+        }
+        if child.state() != ProcessState::Exited {
+            return Err(Error::ChildStillLive);
+        }
+        let record = self.record_for(publication)?;
+        if !matches!(record.state, ChildState::Zombie(_)) {
+            return Err(Error::AlreadyPublished);
+        }
+        self.children[publication.slot] = None;
+        Ok(())
+    }
+
     /// Publishes one real job-control stop observation for a still-live exact child generation.
     /// The child remains Running and no Process/FD/Fs/scheduler authority is mutated here.
     pub fn publish_stopped_with_wakes<const CHILD_CAPS: usize>(

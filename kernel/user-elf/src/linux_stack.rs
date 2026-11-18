@@ -12,6 +12,11 @@ pub const MAX_ARGC: usize = 16;
 pub const MAX_ENVC: usize = 16;
 pub const MAX_STRING_BYTES: usize = 2048;
 const MAX_INITIAL_IMAGE_BYTES: usize = 4096;
+pub const MAX_EXTENDED_ARGV0_BYTES: usize = 255;
+pub const MAX_EXTENDED_ARGC: usize = 64;
+pub const MAX_EXTENDED_ENVC: usize = 64;
+pub const MAX_EXTENDED_STRING_BYTES: usize = 6144;
+const MAX_EXTENDED_INITIAL_IMAGE_BYTES: usize = 8192;
 
 pub const AT_NULL: u64 = 0;
 pub const AT_PHDR: u64 = 3;
@@ -102,9 +107,9 @@ impl LinuxInitialStackLayout {
     }
 }
 
-struct BuiltStack {
+struct BuiltStack<const IMG_MAX: usize> {
     layout: LinuxInitialStackLayout,
-    bytes: [u8; MAX_INITIAL_IMAGE_BYTES],
+    bytes: [u8; IMG_MAX],
     len: usize,
 }
 
@@ -113,7 +118,33 @@ pub fn plan_linux_initial_stack(
     stack: InitialStackPlan,
     spec: LinuxInitialStackSpec<'_>,
 ) -> Result<LinuxInitialStackLayout, Error> {
-    Ok(build_stack(stack, spec)?.layout)
+    Ok(
+        build_stack_with_limits::<MAX_ARGC, MAX_ENVC, MAX_INITIAL_IMAGE_BYTES>(
+            stack,
+            spec,
+            MAX_ARGV0_BYTES,
+            MAX_STRING_BYTES,
+        )?
+        .layout,
+    )
+}
+
+/// Extended Linux process-start stack planner supporting richer environment/argument vectors.
+pub fn plan_linux_initial_stack_extended(
+    stack: InitialStackPlan,
+    spec: LinuxInitialStackSpec<'_>,
+) -> Result<LinuxInitialStackLayout, Error> {
+    Ok(build_stack_with_limits::<
+        MAX_EXTENDED_ARGC,
+        MAX_EXTENDED_ENVC,
+        MAX_EXTENDED_INITIAL_IMAGE_BYTES,
+    >(
+        stack,
+        spec,
+        MAX_EXTENDED_ARGV0_BYTES,
+        MAX_EXTENDED_STRING_BYTES,
+    )?
+    .layout)
 }
 
 /// Initializes one physical stack page with a Linux argc/argv/envp/auxv process-start image.
@@ -127,6 +158,49 @@ pub fn initialize_linux_stack_page(
     page_index: usize,
     destination: &mut [u8],
 ) -> Result<LinuxInitialStackLayout, Error> {
+    initialize_linux_stack_page_with_limits::<MAX_ARGC, MAX_ENVC, MAX_INITIAL_IMAGE_BYTES>(
+        stack,
+        spec,
+        page_index,
+        destination,
+        MAX_ARGV0_BYTES,
+        MAX_STRING_BYTES,
+    )
+}
+
+/// Extended physical stack-page initializer matching [`plan_linux_initial_stack_extended`].
+pub fn initialize_linux_stack_page_extended(
+    stack: InitialStackPlan,
+    spec: LinuxInitialStackSpec<'_>,
+    page_index: usize,
+    destination: &mut [u8],
+) -> Result<LinuxInitialStackLayout, Error> {
+    initialize_linux_stack_page_with_limits::<
+        MAX_EXTENDED_ARGC,
+        MAX_EXTENDED_ENVC,
+        MAX_EXTENDED_INITIAL_IMAGE_BYTES,
+    >(
+        stack,
+        spec,
+        page_index,
+        destination,
+        MAX_EXTENDED_ARGV0_BYTES,
+        MAX_EXTENDED_STRING_BYTES,
+    )
+}
+
+fn initialize_linux_stack_page_with_limits<
+    const ARGC_MAX: usize,
+    const ENVC_MAX: usize,
+    const IMG_MAX: usize,
+>(
+    stack: InitialStackPlan,
+    spec: LinuxInitialStackSpec<'_>,
+    page_index: usize,
+    destination: &mut [u8],
+    argv0_max: usize,
+    string_max: usize,
+) -> Result<LinuxInitialStackLayout, Error> {
     if destination.len() != PAGE_SIZE as usize {
         return Err(Error::PageSizeMismatch);
     }
@@ -134,7 +208,8 @@ pub fn initialize_linux_stack_page(
         return Err(Error::PageIndexOutOfRange);
     }
 
-    let built = build_stack(stack, spec)?;
+    let built =
+        build_stack_with_limits::<ARGC_MAX, ENVC_MAX, IMG_MAX>(stack, spec, argv0_max, string_max)?;
     let page_offset = (page_index as u64)
         .checked_mul(PAGE_SIZE)
         .ok_or(Error::AddressOverflow)?;
@@ -189,18 +264,20 @@ pub fn initialize_linux_stack_page(
     Ok(built.layout)
 }
 
-fn build_stack(
+fn build_stack_with_limits<const ARGC_MAX: usize, const ENVC_MAX: usize, const IMG_MAX: usize>(
     stack: InitialStackPlan,
     spec: LinuxInitialStackSpec<'_>,
-) -> Result<BuiltStack, Error> {
-    validate_spec(spec)?;
+    argv0_max: usize,
+    string_max: usize,
+) -> Result<BuiltStack<IMG_MAX>, Error> {
+    validate_spec_with_limits(spec, argv0_max, ARGC_MAX, ENVC_MAX, string_max)?;
 
     let argc = 1usize
         .checked_add(spec.argv_tail.len())
         .ok_or(Error::AddressOverflow)?;
     let envc = spec.envp.len();
-    let mut argv_addresses = [0u64; MAX_ARGC];
-    let mut env_addresses = [0u64; MAX_ENVC];
+    let mut argv_addresses = [0u64; ARGC_MAX];
+    let mut env_addresses = [0u64; ENVC_MAX];
     // Reserve strings in Linux upward address order (argv[0..] < envp[0..]) with a 16-byte
     // zeroed tail margin below stack_end so SIMD/setproctitle scans never touch stack_end.
     let mut string_cursor = stack
@@ -248,7 +325,7 @@ fn build_stack(
         .checked_sub(initial_sp)
         .ok_or(Error::AddressOverflow)?;
     let len = usize::try_from(image_span).map_err(|_| Error::AddressOverflow)?;
-    if len > MAX_INITIAL_IMAGE_BYTES {
+    if len > IMG_MAX {
         return Err(Error::StackTooSmall);
     }
 
@@ -258,7 +335,7 @@ fn build_stack(
         random,
         image_end: stack.stack_end(),
     };
-    let mut bytes = [0u8; MAX_INITIAL_IMAGE_BYTES];
+    let mut bytes = [0u8; IMG_MAX];
     let mut cursor = initial_sp;
 
     write_word(
@@ -327,7 +404,7 @@ fn reserve_c_string(cursor: u64, value: &[u8]) -> Result<u64, Error> {
 }
 
 fn write_c_string(
-    bytes: &mut [u8; MAX_INITIAL_IMAGE_BYTES],
+    bytes: &mut [u8],
     layout: LinuxInitialStackLayout,
     address: u64,
     value: &[u8],
@@ -339,20 +416,26 @@ fn write_c_string(
     write_bytes(bytes, layout, nul, &[0])
 }
 
-fn validate_spec(spec: LinuxInitialStackSpec<'_>) -> Result<(), Error> {
+fn validate_spec_with_limits(
+    spec: LinuxInitialStackSpec<'_>,
+    argv0_max: usize,
+    argc_max: usize,
+    envc_max: usize,
+    string_max: usize,
+) -> Result<(), Error> {
     if spec.argv0.is_empty() {
         return Err(Error::EmptyArgv0);
     }
-    if spec.argv0.len() > MAX_ARGV0_BYTES {
+    if spec.argv0.len() > argv0_max {
         return Err(Error::Argv0TooLong);
     }
     if spec.argv0.contains(&0) {
         return Err(Error::Argv0ContainsNul);
     }
-    if spec.argv_tail.len() >= MAX_ARGC {
+    if spec.argv_tail.len() >= argc_max {
         return Err(Error::TooManyArguments);
     }
-    if spec.envp.len() > MAX_ENVC {
+    if spec.envp.len() > envc_max {
         return Err(Error::TooManyEnvironmentEntries);
     }
     let mut total_strings = spec
@@ -369,7 +452,7 @@ fn validate_spec(spec: LinuxInitialStackSpec<'_>) -> Result<(), Error> {
             .and_then(|value| value.checked_add(1))
             .ok_or(Error::AddressOverflow)?;
     }
-    if total_strings > MAX_STRING_BYTES {
+    if total_strings > string_max {
         return Err(Error::VectorStringsTooLarge);
     }
     if spec.program_headers == 0
@@ -393,7 +476,7 @@ fn validate_spec(spec: LinuxInitialStackSpec<'_>) -> Result<(), Error> {
 }
 
 fn write_word(
-    bytes: &mut [u8; MAX_INITIAL_IMAGE_BYTES],
+    bytes: &mut [u8],
     layout: LinuxInitialStackLayout,
     cursor: &mut u64,
     value: u64,
@@ -406,7 +489,7 @@ fn write_word(
 }
 
 fn write_bytes(
-    bytes: &mut [u8; MAX_INITIAL_IMAGE_BYTES],
+    bytes: &mut [u8],
     layout: LinuxInitialStackLayout,
     address: u64,
     source: &[u8],

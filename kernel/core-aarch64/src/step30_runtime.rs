@@ -398,7 +398,9 @@ pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Res
                 Err(super::runtime::Error::Wait(WaitError::NoChild)) => {
                     return Ok(Outcome::Return(SyscallReturn::error(Errno::ECHILD)));
                 }
-                Err(_) => return Err(()),
+                Err(_) => {
+                    return Err(());
+                }
             };
             let resolution =
                 match resolve_blocking_wait(outcome, current, plan.selector, plan.interests, frame)
@@ -407,7 +409,9 @@ pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Res
                     Err(BlockingWaitError::NoChild) => {
                         return Ok(Outcome::Return(SyscallReturn::error(Errno::ECHILD)));
                     }
-                    Err(BlockingWaitError::Invariant) => return Err(()),
+                    Err(BlockingWaitError::Invariant) => {
+                        return Err(());
+                    }
                 };
             let outcome = match resolution {
                 BlockingWaitResolution::Outcome(outcome) => outcome,
@@ -436,7 +440,9 @@ pub(super) fn handle(request: SyscallRequest, frame: &mut ExceptionFrame) -> Res
 
                     // Phase 2 occurs only after successful userspace status publication. Terminal
                     // Exited is destructive; Stop/Continue consume only the exact current event.
-                    commit_wait_observation_phase2(current, observation)?;
+                    if commit_wait_observation_phase2(current, observation).is_err() {
+                        return Err(());
+                    }
                     Ok(Outcome::Return(
                         SyscallReturn::success(i64::from(observation.pid().get())).ok_or(())?,
                     ))
@@ -1319,7 +1325,9 @@ fn handle_live_exec(call: Step30RuntimeCall, frame: &mut ExceptionFrame) -> Resu
             rebind_exec_entry_generation_after_staging_error(frame);
             return Ok(Outcome::Return(SyscallReturn::error(errno)));
         }
-        Err(ExecPrepareError::Invariant) => return Err(()),
+        Err(ExecPrepareError::Invariant) => {
+            return Err(());
+        }
     };
 
     // From successful staging onward every owner failure is invariant/fail-stop. Re-observe
@@ -1845,14 +1853,15 @@ fn commit_wait_reap_with_live_owners(
     .map_err(|_| ())?;
 
     let runtime_result = frame_result.map_err(|_| ())?;
-    let semantic_result = runtime_result.map_err(|_| ())?;
-    semantic_result.map_err(|_| ())?;
+    runtime_result.map_err(|_| ())?.map_err(|_| ())?;
 
     // The Process/Wait/AddressSpace commit above is authoritative. Retire the process-local FD view
     // only afterwards so WNOWAIT and failed user-result publication remain non-destructive, while a
     // successful zombie reap cannot strand shared OFD/Pipe/Overlay references behind a dead Process.
     #[cfg(feature = "step29-qemu-proof")]
-    super::step29_runtime::retire_process(child).map_err(|_| ())?;
+    if super::step29_runtime::retire_process(child).is_err() {
+        return Err(());
+    }
 
     Ok(())
 }
@@ -1940,10 +1949,10 @@ fn block_until_wait_ready(
         match commit {
             WaitSignalCommitOutcome::AlreadyWoken => continue,
             WaitSignalCommitOutcome::Interrupted => {
-                if let Some(resolution) = deliver_interrupted_wait(frame, current, receipt)? {
-                    return Ok(resolution);
+                match deliver_interrupted_wait(frame, current, receipt)? {
+                    Some(resolution) => return Ok(resolution),
+                    None => continue,
                 }
-                continue;
             }
             WaitSignalCommitOutcome::Sleep => {}
         }
@@ -1974,8 +1983,9 @@ fn block_until_wait_ready(
                 // Consume any exact pending scheduler-exit proof first. A child exit racing a signal
                 // interruption must be published before we decide whether Wait Notified or Signal
                 // Interrupted is authoritative for this receipt.
-                super::drain_step30_pending_exits_before_wait(current_cpu)
-                    .map_err(|_| BlockingWaitError::Invariant)?;
+                if super::drain_step30_pending_exits_before_wait(current_cpu).is_err() {
+                    return Err(BlockingWaitError::Invariant);
+                }
 
                 let resumed_wait = super::runtime::with_linux_runtime(|state| {
                     state.commit_wait_sleep_signal_aware(&receipt)
@@ -1984,11 +1994,10 @@ fn block_until_wait_ready(
                 match resumed_wait {
                     Ok(WaitSignalCommitOutcome::AlreadyWoken) => continue,
                     Ok(WaitSignalCommitOutcome::Interrupted) => {
-                        if let Some(resolution) = deliver_interrupted_wait(frame, current, receipt)?
-                        {
-                            return Ok(resolution);
+                        match deliver_interrupted_wait(frame, current, receipt)? {
+                            Some(resolution) => return Ok(resolution),
+                            None => continue,
                         }
-                        continue;
                     }
                     Ok(WaitSignalCommitOutcome::Sleep) => {
                         return Err(BlockingWaitError::Invariant);
@@ -2007,10 +2016,14 @@ fn block_until_wait_ready(
                         }
                         continue;
                     }
-                    Err(error) => return Err(map_blocking_wait_owner_error(error)),
+                    Err(error) => {
+                        return Err(map_blocking_wait_owner_error(error));
+                    }
                 }
             }
-            Ok(_) => return Err(BlockingWaitError::Invariant),
+            Ok(_) => {
+                return Err(BlockingWaitError::Invariant);
+            }
             Err(kernal_scheduler_cpu::Error::NoRunnableThread) => {
                 // The scheduler documents this as a pre-switch failure: current remains Running. A
                 // signal may nevertheless have transitioned the waiter to Interrupted after commit,

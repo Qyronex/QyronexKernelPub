@@ -10,9 +10,9 @@ use kernal_linux_exec::ExecLookupPlan;
 use kernal_linux_exec::{Error as LinuxExecError, ExecArgumentStaging, ExecStringVector};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_scheduler_smp::GlobalThreadId;
-use kernal_user_elf_runtime_aarch64::{
-    LinuxProcessStart, MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_STRING_BYTES,
-};
+use kernal_user_elf_runtime_aarch64::LinuxProcessStart;
+#[cfg(not(feature = "step31-debian-qemu"))]
+use kernal_user_elf_runtime_aarch64::{MAX_ARGC, MAX_ARGV0_BYTES, MAX_ENVC, MAX_STRING_BYTES};
 use kernal_usercopy::Error as ExecUsercopyError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,23 +42,50 @@ struct ExecScratchEntry {
 /// only offsets into that buffer, so the value is not self-referential and can safely cross the later
 /// fresh-AddressSpace staging boundary. Pointer/range validation remains owned by `ExecStringVector`;
 /// this type only owns the copied bytes needed after the old TTBR0 is no longer usable.
+#[cfg(feature = "step31-debian-qemu")]
+use kernal_user_elf_runtime_aarch64::{
+    MAX_EXTENDED_ARGC, MAX_EXTENDED_ARGV0_BYTES, MAX_EXTENDED_ENVC, MAX_EXTENDED_STRING_BYTES,
+};
+
+#[cfg(not(feature = "step31-debian-qemu"))]
+const EXEC_ARGV0_BYTES: usize = MAX_ARGV0_BYTES;
+#[cfg(feature = "step31-debian-qemu")]
+const EXEC_ARGV0_BYTES: usize = MAX_EXTENDED_ARGV0_BYTES;
+
+#[cfg(not(feature = "step31-debian-qemu"))]
+const EXEC_ARGC: usize = MAX_ARGC;
+#[cfg(feature = "step31-debian-qemu")]
+const EXEC_ARGC: usize = MAX_EXTENDED_ARGC;
+
+#[cfg(not(feature = "step31-debian-qemu"))]
+const EXEC_ENVC: usize = MAX_ENVC;
+#[cfg(feature = "step31-debian-qemu")]
+const EXEC_ENVC: usize = MAX_EXTENDED_ENVC;
+
+#[cfg(not(feature = "step31-debian-qemu"))]
+const EXEC_STRING_BYTES: usize = MAX_STRING_BYTES;
+#[cfg(feature = "step31-debian-qemu")]
+const EXEC_STRING_BYTES: usize = MAX_EXTENDED_STRING_BYTES;
+
+const EXEC_EXTENDED_VECTORS: bool = cfg!(feature = "step31-debian-qemu");
+
 pub(super) struct StagedExecVectors {
-    bytes: [u8; MAX_STRING_BYTES],
+    bytes: [u8; EXEC_STRING_BYTES],
     used: usize,
-    argv: [Option<ExecScratchEntry>; MAX_ARGC],
+    argv: [Option<ExecScratchEntry>; EXEC_ARGC],
     argc: usize,
-    envp: [Option<ExecScratchEntry>; MAX_ENVC],
+    envp: [Option<ExecScratchEntry>; EXEC_ENVC],
     envc: usize,
 }
 
 impl StagedExecVectors {
     const fn new() -> Self {
         Self {
-            bytes: [0; MAX_STRING_BYTES],
+            bytes: [0; EXEC_STRING_BYTES],
             used: 0,
-            argv: [None; MAX_ARGC],
+            argv: [None; EXEC_ARGC],
             argc: 0,
-            envp: [None; MAX_ENVC],
+            envp: [None; EXEC_ENVC],
             envc: 0,
         }
     }
@@ -78,12 +105,12 @@ impl StagedExecVectors {
             return Err(ExecInputError::Linux(Errno::EINVAL));
         }
 
-        let mut argv_refs: [&[u8]; MAX_ARGC] = [&[]; MAX_ARGC];
+        let mut argv_refs: [&[u8]; EXEC_ARGC] = [&[]; EXEC_ARGC];
         for (index, slot) in self.argv.iter().copied().enumerate().take(self.argc) {
             let entry = slot.ok_or(ExecInputError::Invariant)?;
             argv_refs[index] = self.entry_bytes(entry)?;
         }
-        let mut env_refs: [&[u8]; MAX_ENVC] = [&[]; MAX_ENVC];
+        let mut env_refs: [&[u8]; EXEC_ENVC] = [&[]; EXEC_ENVC];
         for (index, slot) in self.envp.iter().copied().enumerate().take(self.envc) {
             let entry = slot.ok_or(ExecInputError::Invariant)?;
             env_refs[index] = self.entry_bytes(entry)?;
@@ -94,7 +121,8 @@ impl StagedExecVectors {
             &argv_refs[1..self.argc],
             &env_refs[..self.envc],
             random,
-        );
+        )
+        .with_extended_vectors(EXEC_EXTENDED_VECTORS);
         Ok(operation(start))
     }
 
@@ -111,17 +139,17 @@ impl StagedExecVectors {
             return Err(ExecInputError::Linux(Errno::EINVAL));
         }
 
-        let mut argv_refs: [&[u8]; MAX_ARGC] = [&[]; MAX_ARGC];
+        let mut argv_refs: [&[u8]; EXEC_ARGC] = [&[]; EXEC_ARGC];
         let mut out_argc = 0usize;
         for arg in prefix {
-            if out_argc >= MAX_ARGC {
+            if out_argc >= EXEC_ARGC {
                 return Err(ExecInputError::Linux(Errno::E2BIG));
             }
             argv_refs[out_argc] = arg;
             out_argc += 1;
         }
         for slot in self.argv.iter().copied().take(self.argc).skip(1) {
-            if out_argc >= MAX_ARGC {
+            if out_argc >= EXEC_ARGC {
                 return Err(ExecInputError::Linux(Errno::E2BIG));
             }
             let entry = slot.ok_or(ExecInputError::Invariant)?;
@@ -129,7 +157,7 @@ impl StagedExecVectors {
             out_argc += 1;
         }
 
-        let mut env_refs: [&[u8]; MAX_ENVC] = [&[]; MAX_ENVC];
+        let mut env_refs: [&[u8]; EXEC_ENVC] = [&[]; EXEC_ENVC];
         for (index, slot) in self.envp.iter().copied().enumerate().take(self.envc) {
             let entry = slot.ok_or(ExecInputError::Invariant)?;
             env_refs[index] = self.entry_bytes(entry)?;
@@ -140,7 +168,8 @@ impl StagedExecVectors {
             &argv_refs[1..out_argc],
             &env_refs[..self.envc],
             random,
-        );
+        )
+        .with_extended_vectors(EXEC_EXTENDED_VECTORS);
         Ok(operation(start))
     }
 
@@ -228,14 +257,14 @@ pub(super) fn stage_exec_vectors(
     envp_base: u64,
 ) -> Result<StagedExecVectors, ExecInputError> {
     let mut staged = StagedExecVectors::new();
-    let argv = stage_one_vector::<MAX_ARGC>(
+    let argv = stage_one_vector::<EXEC_ARGC>(
         argv_base,
         &mut staged.bytes,
         &mut staged.used,
         &mut staged.argv,
         true,
     )?;
-    let envp = stage_one_vector::<MAX_ENVC>(
+    let envp = stage_one_vector::<EXEC_ENVC>(
         envp_base,
         &mut staged.bytes,
         &mut staged.used,
@@ -243,7 +272,7 @@ pub(super) fn stage_exec_vectors(
         false,
     )?;
     let metadata =
-        ExecArgumentStaging::new(argv, envp, MAX_STRING_BYTES).map_err(map_linux_exec_error)?;
+        ExecArgumentStaging::new(argv, envp, EXEC_STRING_BYTES).map_err(map_linux_exec_error)?;
     if metadata.total_bytes() != staged.used {
         return Err(ExecInputError::Invariant);
     }
@@ -458,7 +487,7 @@ fn stage_exec_from_source(
 
 fn stage_one_vector<const N: usize>(
     vector_base: u64,
-    scratch: &mut [u8; MAX_STRING_BYTES],
+    scratch: &mut [u8; EXEC_STRING_BYTES],
     used: &mut usize,
     entries: &mut [Option<ExecScratchEntry>; N],
     enforce_argv0_limit: bool,
@@ -501,12 +530,12 @@ fn copy_user_pointer(address: u64) -> Result<u64, ExecInputError> {
 
 fn copy_user_c_string(
     address: u64,
-    scratch: &mut [u8; MAX_STRING_BYTES],
+    scratch: &mut [u8; EXEC_STRING_BYTES],
     used: &mut usize,
     enforce_argv0_limit: bool,
 ) -> Result<ExecScratchEntry, ExecInputError> {
     let start = *used;
-    let remaining = MAX_STRING_BYTES
+    let remaining = EXEC_STRING_BYTES
         .checked_sub(start)
         .ok_or(ExecInputError::Invariant)?;
     if remaining == 0 {
@@ -520,7 +549,7 @@ fn copy_user_c_string(
             .ok_or(ExecInputError::Linux(Errno::EFAULT))?;
         kernal_usercopy_aarch64::copy_from_user(&mut byte, user).map_err(map_usercopy_error)?;
         if byte[0] == 0 {
-            if enforce_argv0_limit && offset > MAX_ARGV0_BYTES {
+            if enforce_argv0_limit && offset > EXEC_ARGV0_BYTES {
                 return Err(ExecInputError::Linux(Errno::E2BIG));
             }
             let len_with_nul = offset

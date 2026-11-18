@@ -378,7 +378,7 @@ fn step42_to_step44_end_to_end_hardware_desktop_and_release_gate_contract() {
         seat.seat_generation(),
     )
     .unwrap();
-    let fb = drm.create_dumb(a1.session_id, 1280, 720, 32).unwrap();
+    let fb = drm.create_dumb(a1.session_id, 1280, 800, 32).unwrap();
     drm.set_crtc(
         a1.session_id,
         a1.generation,
@@ -386,7 +386,7 @@ fn step42_to_step44_end_to_end_hardware_desktop_and_release_gate_contract() {
         DisplayMode::default(),
     )
     .unwrap();
-    seat.evdev
+    seat.evdevs[0]
         .push_event(InputEvent {
             sec: 1,
             usec: 0,

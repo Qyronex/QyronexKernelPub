@@ -5,7 +5,10 @@ use kernal_elf::{Image, Machine};
 use kernal_user_elf::{DEFAULT_STACK_GUARD_PAGES, DEFAULT_STACK_PAGES};
 use kernal_user_elf::{
     DynamicLoadPolicy, DynamicUserLoadPlan, LoadPolicy, UserLoadPlan,
-    linux_stack::{LinuxInitialStackSpec, initialize_linux_stack_page, plan_linux_initial_stack},
+    linux_stack::{
+        LinuxInitialStackSpec, initialize_linux_stack_page, initialize_linux_stack_page_extended,
+        plan_linux_initial_stack, plan_linux_initial_stack_extended,
+    },
 };
 use kernal_vm::{PAGE_SIZE, USER_MAX_EXCLUSIVE};
 
@@ -53,6 +56,7 @@ pub struct LinuxProcessStart<'a> {
     pub gid: u32,
     pub egid: u32,
     pub secure: bool,
+    pub extended_vectors: bool,
     pub random: [u8; 16],
 }
 
@@ -67,6 +71,7 @@ impl<'a> LinuxProcessStart<'a> {
             gid: 0,
             egid: 0,
             secure: false,
+            extended_vectors: false,
             random,
         }
     }
@@ -86,6 +91,7 @@ impl<'a> LinuxProcessStart<'a> {
             gid: 0,
             egid: 0,
             secure: false,
+            extended_vectors: false,
             random,
         }
     }
@@ -103,6 +109,11 @@ impl<'a> LinuxProcessStart<'a> {
         self.gid = gid;
         self.egid = egid;
         self.secure = secure;
+        self
+    }
+
+    pub const fn with_extended_vectors(mut self, extended_vectors: bool) -> Self {
+        self.extended_vectors = extended_vectors;
         self
     }
 }
@@ -158,6 +169,7 @@ pub unsafe fn load_aarch64_linux_elf<
     backend: &mut B,
     reserved: &ReservationSet<RESERVED>,
 ) -> Result<LoadedImage, Error> {
+    let extended = start.extended_vectors;
     let (plan, spec, layout) = prepare_linux_image::<SEGMENTS>(image, policy, start)?;
     let initial_sp = layout.initial_sp();
     let trampoline_address = signal_trampoline_address(&plan)?;
@@ -191,7 +203,7 @@ pub unsafe fn load_aarch64_linux_elf<
             space,
             backend,
             reserved,
-            move |plan| initialize_linux_stack(plan, spec, layout),
+            move |plan| initialize_linux_stack(plan, spec, layout, extended),
         )
     }?;
 
@@ -239,6 +251,7 @@ pub unsafe fn load_aarch64_dynamic_linux_elf<
     backend: &mut B,
     reserved: &ReservationSet<RESERVED>,
 ) -> Result<LoadedImage, Error> {
+    let extended = start.extended_vectors;
     let (plan, spec, layout) =
         prepare_dynamic_linux_image::<SEGMENTS>(executable, interpreter, policy, start)?;
     let initial_sp = layout.initial_sp();
@@ -274,7 +287,7 @@ pub unsafe fn load_aarch64_dynamic_linux_elf<
             space,
             backend,
             reserved,
-            move |plan| initialize_linux_stack(plan.executable(), spec, layout),
+            move |plan| initialize_linux_stack(plan.executable(), spec, layout, extended),
         )
     }?;
 
@@ -453,8 +466,7 @@ fn prepare_linux_image<'a, const SEGMENTS: usize>(
         secure: start.secure,
         random: start.random,
     };
-    let layout = plan_linux_initial_stack(plan.stack(), spec)?;
-    preflight_linux_stack(&plan, spec, layout)?;
+    let layout = plan_and_preflight_stack(&plan, spec, start.extended_vectors)?;
     Ok((plan, spec, layout))
 }
 
@@ -501,8 +513,7 @@ fn prepare_dynamic_linux_image<'a, const SEGMENTS: usize>(
         secure: start.secure,
         random: start.random,
     };
-    let layout = plan_linux_initial_stack(plan.stack(), spec)?;
-    preflight_linux_stack(plan.executable(), spec, layout)?;
+    let layout = plan_and_preflight_stack(plan.executable(), spec, start.extended_vectors)?;
     Ok((plan, spec, layout))
 }
 
@@ -533,15 +544,48 @@ fn validate_signal_trampoline_gap<const SEGMENTS: usize>(
     Ok(())
 }
 
+fn init_stack_page_for_mode(
+    stack: kernal_user_elf::InitialStackPlan,
+    spec: LinuxInitialStackSpec<'_>,
+    page_index: usize,
+    scratch: &mut [u8; PAGE_SIZE as usize],
+    extended: bool,
+) -> Result<LinuxInitialStackLayout, Error> {
+    if extended {
+        Ok(initialize_linux_stack_page_extended(
+            stack, spec, page_index, scratch,
+        )?)
+    } else {
+        Ok(initialize_linux_stack_page(
+            stack, spec, page_index, scratch,
+        )?)
+    }
+}
+
+fn plan_and_preflight_stack<const SEGMENTS: usize>(
+    plan: &UserLoadPlan<SEGMENTS>,
+    spec: LinuxInitialStackSpec<'_>,
+    extended: bool,
+) -> Result<LinuxInitialStackLayout, Error> {
+    let layout = if extended {
+        plan_linux_initial_stack_extended(plan.stack(), spec)?
+    } else {
+        plan_linux_initial_stack(plan.stack(), spec)?
+    };
+    preflight_linux_stack(plan, spec, layout, extended)?;
+    Ok(layout)
+}
+
 fn preflight_linux_stack<const SEGMENTS: usize>(
     plan: &UserLoadPlan<SEGMENTS>,
     spec: LinuxInitialStackSpec<'_>,
     expected_layout: LinuxInitialStackLayout,
+    extended: bool,
 ) -> Result<(), Error> {
     let stack = plan.stack();
     let mut scratch = [0u8; PAGE_SIZE as usize];
     for page_index in 0..stack.stack_pages() {
-        let layout = initialize_linux_stack_page(stack, spec, page_index, &mut scratch)?;
+        let layout = init_stack_page_for_mode(stack, spec, page_index, &mut scratch, extended)?;
         if layout != expected_layout {
             return Err(Error::LinuxStackInvariant);
         }
@@ -554,11 +598,12 @@ fn initialize_linux_stack<const SEGMENTS: usize>(
     plan: &UserLoadPlan<SEGMENTS>,
     spec: LinuxInitialStackSpec<'_>,
     expected_layout: LinuxInitialStackLayout,
+    extended: bool,
 ) -> Result<(), Error> {
     let stack = plan.stack();
     let mut page = [0u8; PAGE_SIZE as usize];
     for page_index in 0..stack.stack_pages() {
-        let layout = initialize_linux_stack_page(stack, spec, page_index, &mut page)?;
+        let layout = init_stack_page_for_mode(stack, spec, page_index, &mut page, extended)?;
         if layout != expected_layout {
             return Err(Error::LinuxStackInvariant);
         }

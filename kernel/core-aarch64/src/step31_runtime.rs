@@ -1013,16 +1013,23 @@ enum SharedMmapBacking {
     MemFs { mount_id: u32, mem_ino: u64 },
     MemFd { idx: usize, generation: u64 },
     Ext4 { mount_id: u32, ino: u32 },
+    DrmDumb { handle: u32 },
 }
+
+#[cfg(feature = "step29-qemu-proof")]
+const MAX_SHARED_MMAPS: usize = 64;
 
 #[cfg(feature = "step29-qemu-proof")]
 #[derive(Clone, Copy)]
 struct SharedMmapEntry {
     live: bool,
+    writable: bool,
     process: ObjectId,
     va_start: u64,
     len: u64,
     file_offset: u64,
+    orig_prot: u64,
+    rev: u64,
     backing: SharedMmapBacking,
 }
 
@@ -1030,10 +1037,13 @@ struct SharedMmapEntry {
 impl SharedMmapEntry {
     const EMPTY: Self = Self {
         live: false,
+        writable: false,
         process: ObjectId(0),
         va_start: 0,
         len: 0,
         file_offset: 0,
+        orig_prot: 0,
+        rev: 0,
         backing: SharedMmapBacking::Ext4 {
             mount_id: 0,
             ino: 0,
@@ -1044,7 +1054,7 @@ impl SharedMmapEntry {
 #[cfg(feature = "step29-qemu-proof")]
 struct SharedMmapCell {
     state: core::sync::atomic::AtomicU8,
-    entries: core::cell::UnsafeCell<[SharedMmapEntry; 32]>,
+    entries: core::cell::UnsafeCell<[SharedMmapEntry; MAX_SHARED_MMAPS]>,
 }
 
 #[cfg(feature = "step29-qemu-proof")]
@@ -1054,11 +1064,13 @@ unsafe impl Sync for SharedMmapCell {}
 #[cfg(feature = "step29-qemu-proof")]
 static SHARED_MMAPS: SharedMmapCell = SharedMmapCell {
     state: core::sync::atomic::AtomicU8::new(0),
-    entries: core::cell::UnsafeCell::new([SharedMmapEntry::EMPTY; 32]),
+    entries: core::cell::UnsafeCell::new([SharedMmapEntry::EMPTY; MAX_SHARED_MMAPS]),
 };
 
 #[cfg(feature = "step29-qemu-proof")]
-fn with_shared_mmaps<R>(f: impl FnOnce(&mut [SharedMmapEntry; 32]) -> R) -> Option<R> {
+fn with_shared_mmaps<R>(
+    f: impl FnOnce(&mut [SharedMmapEntry; MAX_SHARED_MMAPS]) -> R,
+) -> Option<R> {
     use core::sync::atomic::Ordering;
     let mut spins = 0usize;
     while SHARED_MMAPS
@@ -1079,12 +1091,16 @@ fn with_shared_mmaps<R>(f: impl FnOnce(&mut [SharedMmapEntry; 32]) -> R) -> Opti
 }
 
 #[cfg(feature = "step29-qemu-proof")]
+#[allow(clippy::too_many_arguments)]
 fn record_shared_mmap(
     process: ObjectId,
     va_start: u64,
     raw_len: u64,
     file_offset: u64,
     backing: SharedMmapBacking,
+    writable: bool,
+    orig_prot: u64,
+    rev: u64,
 ) {
     let page_mask = 4096u64 - 1;
     let aligned = raw_len
@@ -1097,10 +1113,13 @@ fn record_shared_mmap(
         if let Some(slot) = entries.iter_mut().find(|e| !e.live) {
             *slot = SharedMmapEntry {
                 live: true,
+                writable,
                 process,
                 va_start,
                 len: aligned,
                 file_offset,
+                orig_prot,
+                rev,
                 backing,
             };
         }
@@ -1115,7 +1134,7 @@ pub(super) fn sync_shared_mmap_range(address: u64, length: u64, unmapping: bool)
     }
     #[cfg(feature = "step29-qemu-proof")]
     {
-        sync_shared_mmap_inner(Some((address, length)), unmapping);
+        sync_shared_mmap_inner(Some((address, length)), unmapping, false);
     }
 }
 
@@ -1127,12 +1146,98 @@ pub(super) fn sync_shared_mmap_all_for_current(clear_entries: bool) {
     }
     #[cfg(feature = "step29-qemu-proof")]
     {
-        sync_shared_mmap_inner(None, clear_entries);
+        sync_shared_mmap_inner(None, clear_entries, false);
+    }
+}
+
+/// Flushes active writable `MAP_SHARED` IPC (`memfd`/`memfs`) mappings for the current process.
+pub(super) fn sync_shared_ipc_mmaps_for_current() {
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        sync_shared_mmap_inner(None, false, true);
+    }
+}
+
+/// Refreshes read-only `MAP_SHARED` `memfd` mappings in the current process if modified remotely.
+pub(super) fn refresh_shared_memfd_mmaps_for_current() {
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        refresh_shared_memfd_mmaps_inner();
     }
 }
 
 #[cfg(feature = "step29-qemu-proof")]
-fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool) {
+fn refresh_shared_memfd_mmaps_inner() {
+    use kernal_linux_vm::{PROT_EXEC, PROT_WRITE};
+
+    let Ok((process, _, _)) = current_process_identity() else {
+        return;
+    };
+    let mut snap = [SharedMmapEntry::EMPTY; MAX_SHARED_MMAPS];
+    let mut snap_n = 0usize;
+    let _ = with_shared_mmaps(|entries| {
+        for e in entries.iter() {
+            if e.live
+                && !e.writable
+                && e.process == process
+                && (e.orig_prot & PROT_EXEC) == 0
+                && matches!(e.backing, SharedMmapBacking::MemFd { .. })
+            {
+                snap[snap_n] = *e;
+                snap_n += 1;
+            }
+        }
+    });
+    for e in &snap[..snap_n] {
+        let SharedMmapBacking::MemFd { idx, generation } = e.backing else {
+            continue;
+        };
+        let Some((bytes, new_rev)) =
+            super::step35_events_cgroup::read_memfd_if_changed(idx, generation, e.rev)
+        else {
+            continue;
+        };
+        let Ok(file_off) = usize::try_from(e.file_offset) else {
+            continue;
+        };
+        if file_off >= bytes.len() {
+            continue;
+        }
+        let Ok(max_bytes) = usize::try_from(e.len) else {
+            continue;
+        };
+        let copy_len = (bytes.len() - file_off).min(max_bytes);
+        if matches!(
+            super::live_vm::handle_step31_mprotect(e.va_start, e.len, e.orig_prot | PROT_WRITE),
+            Ok(Ok(()))
+        ) {
+            let mut off = 0usize;
+            while off < copy_len {
+                let chunk = (copy_len - off).min(4096);
+                let _ = kernal_usercopy_aarch64::copy_to_user(
+                    e.va_start + off as u64,
+                    &bytes[file_off + off..file_off + off + chunk],
+                );
+                off += chunk;
+            }
+            let _ = super::live_vm::handle_step31_mprotect(e.va_start, e.len, e.orig_prot);
+            let _ = with_shared_mmaps(|entries| {
+                for slot in entries.iter_mut() {
+                    if slot.live
+                        && slot.process == process
+                        && slot.va_start == e.va_start
+                        && slot.backing == e.backing
+                    {
+                        slot.rev = new_rev;
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool, ipc_only: bool) {
     let Ok((process, _, _)) = current_process_identity() else {
         return;
     };
@@ -1151,7 +1256,7 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
         None => None,
     };
 
-    let mut snap = [SharedMmapEntry::EMPTY; 32];
+    let mut snap = [SharedMmapEntry::EMPTY; MAX_SHARED_MMAPS];
     let mut snap_n = 0usize;
     let _ = with_shared_mmaps(|entries| {
         for e in entries.iter_mut() {
@@ -1164,8 +1269,16 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
                 Some((s, end)) => e.va_start < end && e_end > s,
             };
             if matches {
-                snap[snap_n] = *e;
-                snap_n += 1;
+                let should_flush = e.writable
+                    && (!ipc_only
+                        || matches!(
+                            e.backing,
+                            SharedMmapBacking::MemFd { .. } | SharedMmapBacking::MemFs { .. }
+                        ));
+                if should_flush {
+                    snap[snap_n] = *e;
+                    snap_n += 1;
+                }
                 if remove_matched && req_span.is_none() {
                     *e = SharedMmapEntry::EMPTY;
                 }
@@ -1210,6 +1323,13 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
                         super::step33_ext4_vfs::write_back_ext4_mmap(
                             mount_id,
                             ino,
+                            file_off,
+                            &page_buf[..chunk],
+                        );
+                    }
+                    SharedMmapBacking::DrmDumb { handle } => {
+                        super::step43_desktop::write_back_drm_dumb_mmap(
+                            handle,
                             file_off,
                             &page_buf[..chunk],
                         );
@@ -1268,6 +1388,15 @@ pub(super) fn try_handle_dynamic_mmap(
         return None;
     }
 
+    // On AArch64 Linux, PROT_WRITE without PROT_EXEC implies readable+writable page permissions
+    // (used e.g. by Weston's drm_fb_create_dumb mmap(PROT_WRITE, MAP_SHARED)).
+    let protection =
+        if (protection & PROT_WRITE) != 0 && (protection & kernal_linux_vm::PROT_EXEC) == 0 {
+            protection | PROT_READ
+        } else {
+            protection
+        };
+
     let Ok(spec) = validate_step31_mmap_spec(protection, flags, fd, offset) else {
         return None;
     };
@@ -1318,6 +1447,7 @@ pub(super) fn handle_mprotect(
 }
 
 #[cfg(feature = "step29-qemu-proof")]
+#[allow(clippy::too_many_arguments)]
 fn finish_file_backed_mmap(
     process: ObjectId,
     address: u64,
@@ -1327,7 +1457,7 @@ fn finish_file_backed_mmap(
     raw_fd: u64,
     offset: u64,
     bytes: &[u8],
-    track_shared_backing: Option<SharedMmapBacking>,
+    track_shared_backing: Option<(SharedMmapBacking, bool, u64)>,
 ) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
     let res = super::live_vm::handle_step31_dynamic_mmap(
         address,
@@ -1342,9 +1472,11 @@ fn finish_file_backed_mmap(
         },
     )?;
     if let Ok(mapped_va) = res
-        && let Some(backing) = track_shared_backing
+        && let Some((backing, writable, rev)) = track_shared_backing
     {
-        record_shared_mmap(process, mapped_va, length, offset, backing);
+        record_shared_mmap(
+            process, mapped_va, length, offset, backing, writable, protection, rev,
+        );
     }
     Ok(res)
 }
@@ -1380,7 +1512,7 @@ fn handle_file_backed_mmap(
                 raw_fd,
                 offset,
                 &file_bytes,
-                need_write.then_some(SharedMmapBacking::Ext4 { mount_id, ino }),
+                need_write.then_some((SharedMmapBacking::Ext4 { mount_id, ino }, true, 0)),
             );
         }
         Ok(None) => {}
@@ -1389,7 +1521,9 @@ fn handle_file_backed_mmap(
     match super::step33_mounts::try_read_proc_sys_fd_for_mmap(process, raw_fd, need_write) {
         Ok(Some((file_bytes, mem_opt))) => {
             let backing = if need_write {
-                mem_opt.map(|(mount_id, mem_ino)| SharedMmapBacking::MemFs { mount_id, mem_ino })
+                mem_opt.map(|(mount_id, mem_ino)| {
+                    (SharedMmapBacking::MemFs { mount_id, mem_ino }, true, 0)
+                })
             } else {
                 None
             };
@@ -1409,7 +1543,7 @@ fn handle_file_backed_mmap(
         Err(errno) => return Ok(Err(VmError::Linux(errno))),
     }
     match super::step35_events_cgroup::try_read_memfd_for_mmap(process, raw_fd, need_write) {
-        Ok(Some((file_bytes, idx, generation))) => {
+        Ok(Some((file_bytes, idx, generation, rev))) => {
             return finish_file_backed_mmap(
                 process,
                 address,
@@ -1419,8 +1553,45 @@ fn handle_file_backed_mmap(
                 raw_fd,
                 offset,
                 &file_bytes,
-                need_write.then_some(SharedMmapBacking::MemFd { idx, generation }),
+                shared.then_some((
+                    SharedMmapBacking::MemFd { idx, generation },
+                    need_write,
+                    rev,
+                )),
             );
+        }
+        Ok(None) => {}
+        Err(errno) => return Ok(Err(VmError::Linux(errno))),
+    }
+    match super::step43_desktop::try_prepare_desktop_mmap(raw_fd, offset, length) {
+        Ok(Some(handle)) => {
+            let res = super::live_vm::handle_step31_dynamic_mmap(
+                address,
+                length,
+                protection,
+                flags,
+                raw_fd,
+                0,
+                kernal_linux_vm::MmapFileBacking::FileSlice {
+                    bytes: &[],
+                    file_offset: 0,
+                },
+            )?;
+            if let Ok(mapped_va) = res
+                && need_write
+            {
+                record_shared_mmap(
+                    process,
+                    mapped_va,
+                    length,
+                    0,
+                    SharedMmapBacking::DrmDumb { handle },
+                    true,
+                    protection,
+                    0,
+                );
+            }
+            return Ok(res);
         }
         Ok(None) => {}
         Err(errno) => return Ok(Err(VmError::Linux(errno))),
@@ -1475,6 +1646,234 @@ fn handle_file_backed_mmap(
             process, address, length, protection, flags, raw_fd, offset, file_bytes, None,
         )
     })
+}
+
+/// Handles Linux `mremap(2)` (`old_address`, `old_size`, `new_size`, `flags`, `new_address`),
+/// supporting both tracked `MAP_SHARED` IPC/file mappings (e.g. Wayland `wl_shm_pool.resize`)
+/// and anonymous `MAP_PRIVATE` allocations.
+pub(super) fn try_handle_mremap(
+    old_address: u64,
+    old_size: u64,
+    new_size: u64,
+    flags: u64,
+    new_address: u64,
+) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    {
+        let _ = (old_address, old_size, new_size, flags, new_address);
+        Ok(Err(kernal_linux_vm::Error::Linux(Errno::ENOSYS)))
+    }
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        try_handle_mremap_inner(old_address, old_size, new_size, flags, new_address)
+    }
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn align_page_len(raw: u64) -> Option<u64> {
+    if raw == 0 {
+        return None;
+    }
+    raw.checked_add(4095).map(|v| v & !4095u64)
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn copy_user_pages_to_vec(va_start: u64, bytes_len: usize) -> Result<alloc::vec::Vec<u8>, Errno> {
+    let mut out = alloc::vec![0u8; bytes_len];
+    let mut off = 0usize;
+    while off < bytes_len {
+        let chunk = (bytes_len - off).min(4096);
+        kernal_usercopy_aarch64::copy_from_user(&mut out[off..off + chunk], va_start + off as u64)
+            .map_err(super::map_usercopy_errno)?;
+        off += chunk;
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn try_handle_mremap_inner(
+    old_address: u64,
+    old_size: u64,
+    new_size: u64,
+    flags: u64,
+    new_address: u64,
+) -> Result<Result<u64, kernal_linux_vm::Error>, ()> {
+    use kernal_linux_abi::MinimumRuntimeCall;
+    use kernal_linux_vm::{
+        Error as VmError, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MAP_SHARED, MmapFileBacking,
+        PROT_READ, PROT_WRITE,
+    };
+
+    const MREMAP_MAYMOVE: u64 = 1;
+    const MREMAP_FIXED: u64 = 2;
+
+    if (old_address & 0xfff) != 0 || (flags & !(MREMAP_MAYMOVE | MREMAP_FIXED)) != 0 {
+        return Ok(Err(VmError::Linux(Errno::EINVAL)));
+    }
+    let fixed = (flags & MREMAP_FIXED) != 0;
+    let maymove = (flags & MREMAP_MAYMOVE) != 0;
+    if fixed && (!maymove || (new_address & 0xfff) != 0) {
+        return Ok(Err(VmError::Linux(Errno::EINVAL)));
+    }
+    let Some(old_len) = align_page_len(old_size) else {
+        return Ok(Err(VmError::Linux(Errno::EINVAL)));
+    };
+    let Some(new_len) = align_page_len(new_size) else {
+        return Ok(Err(VmError::Linux(Errno::ENOMEM)));
+    };
+
+    let (process, _, _) = current_process_identity().map_err(|_| ())?;
+    let matched = with_shared_mmaps(|entries| {
+        entries
+            .iter()
+            .copied()
+            .find(|e| e.live && e.process == process && e.va_start == old_address)
+    })
+    .flatten();
+
+    if let Some(entry) = matched {
+        if entry.writable {
+            sync_shared_mmap_range(old_address, entry.len, false);
+        }
+        if new_len <= entry.len && !fixed {
+            if new_len < entry.len {
+                match super::live_vm::handle(MinimumRuntimeCall::Munmap {
+                    address: old_address + new_len,
+                    length: entry.len - new_len,
+                })? {
+                    Ok(_) => {}
+                    Err(e) => return Ok(Err(e)),
+                }
+                let _ = with_shared_mmaps(|entries| {
+                    for slot in entries.iter_mut() {
+                        if slot.live && slot.process == process && slot.va_start == old_address {
+                            slot.len = new_len;
+                        }
+                    }
+                });
+            }
+            return Ok(Ok(old_address));
+        }
+        if !maymove {
+            return Ok(Err(VmError::Linux(Errno::ENOMEM)));
+        }
+
+        let (bytes, new_rev) = match entry.backing {
+            SharedMmapBacking::MemFd { idx, generation } => {
+                match super::step35_events_cgroup::read_memfd_for_mremap(idx, generation) {
+                    Some((b, r)) => (b, r),
+                    None => return Ok(Err(VmError::Linux(Errno::EFAULT))),
+                }
+            }
+            SharedMmapBacking::MemFs { mount_id, mem_ino } => {
+                match super::step33_mounts::read_memfs_for_mremap(mount_id, mem_ino) {
+                    Some(b) => (b, entry.rev),
+                    None => return Ok(Err(VmError::Linux(Errno::EFAULT))),
+                }
+            }
+            SharedMmapBacking::Ext4 { .. } | SharedMmapBacking::DrmDumb { .. } => {
+                let copy_n = usize::try_from(entry.len).unwrap_or(0);
+                match copy_user_pages_to_vec(old_address, copy_n) {
+                    Ok(b) => (b, entry.rev),
+                    Err(e) => return Ok(Err(VmError::Linux(e))),
+                }
+            }
+        };
+
+        let target_addr = if fixed { new_address } else { 0 };
+        let map_flags = MAP_SHARED | if fixed { MAP_FIXED } else { 0 };
+        let new_va = match super::live_vm::handle_step31_dynamic_mmap(
+            target_addr,
+            new_size,
+            entry.orig_prot,
+            map_flags,
+            0,
+            entry.file_offset,
+            MmapFileBacking::FileSlice {
+                bytes: &bytes,
+                file_offset: entry.file_offset,
+            },
+        )? {
+            Ok(va) => va,
+            Err(e) => return Ok(Err(e)),
+        };
+
+        match super::live_vm::handle(MinimumRuntimeCall::Munmap {
+            address: old_address,
+            length: entry.len,
+        })? {
+            Ok(_) => {}
+            Err(e) => return Ok(Err(e)),
+        }
+        let _ = with_shared_mmaps(|entries| {
+            for slot in entries.iter_mut() {
+                if slot.live && slot.process == process && slot.va_start == old_address {
+                    slot.va_start = new_va;
+                    slot.len = new_len;
+                    slot.rev = new_rev;
+                }
+            }
+        });
+        return Ok(Ok(new_va));
+    }
+
+    if new_len <= old_len && !fixed {
+        if let Err(e) = copy_user_pages_to_vec(old_address, 1) {
+            return Ok(Err(VmError::Linux(e)));
+        }
+        if new_len < old_len {
+            match super::live_vm::handle(MinimumRuntimeCall::Munmap {
+                address: old_address + new_len,
+                length: old_len - new_len,
+            })? {
+                Ok(_) => {}
+                Err(e) => return Ok(Err(e)),
+            }
+        }
+        return Ok(Ok(old_address));
+    }
+    if !maymove {
+        return Ok(Err(VmError::Linux(Errno::ENOMEM)));
+    }
+    let Ok(copy_len) = usize::try_from(old_len.min(new_len)) else {
+        return Ok(Err(VmError::Linux(Errno::ENOMEM)));
+    };
+    let old_bytes = match copy_user_pages_to_vec(old_address, copy_len) {
+        Ok(b) => b,
+        Err(e) => return Ok(Err(VmError::Linux(e))),
+    };
+    let target_addr = if fixed { new_address } else { 0 };
+    let map_flags = MAP_PRIVATE | MAP_ANONYMOUS | if fixed { MAP_FIXED } else { 0 };
+    let new_va = match super::live_vm::handle_step31_dynamic_mmap(
+        target_addr,
+        new_size,
+        PROT_READ | PROT_WRITE,
+        map_flags,
+        u64::MAX,
+        0,
+        MmapFileBacking::Anonymous,
+    )? {
+        Ok(va) => va,
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut off = 0usize;
+    while off < copy_len {
+        let chunk = (copy_len - off).min(4096);
+        if let Err(e) =
+            kernal_usercopy_aarch64::copy_to_user(new_va + off as u64, &old_bytes[off..off + chunk])
+        {
+            return Ok(Err(VmError::Linux(super::map_usercopy_errno(e))));
+        }
+        off += chunk;
+    }
+    match super::live_vm::handle(MinimumRuntimeCall::Munmap {
+        address: old_address,
+        length: old_len,
+    })? {
+        Ok(_) => {}
+        Err(e) => return Ok(Err(e)),
+    }
+    Ok(Ok(new_va))
 }
 
 /// Handles glibc `_Fork`/`fork` (`CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | SIGCHLD`) and
@@ -1599,7 +1998,8 @@ pub(super) fn try_handle_debian_process_clone(
             child_stack_override,
         )
     }) else {
-        return Some(false);
+        frame.x[0] = SyscallReturn::error(Errno::EAGAIN).as_u64_bits();
+        return Some(true);
     };
     if want_pidfd {
         let Ok((parent_process, _, _)) = current_process_identity() else {

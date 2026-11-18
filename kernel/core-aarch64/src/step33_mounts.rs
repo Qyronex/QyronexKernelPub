@@ -89,6 +89,7 @@ struct VirtualDirEntry {
 pub(super) struct ProcSysFdEntry {
     live: bool,
     is_dir: bool,
+    is_symlink: bool,
     generation: u64,
     alias_refs: usize,
     owners: DirectProcessRefs<{ super::step29_runtime::STEP29_RUNTIME_PROCESS_VIEWS }>,
@@ -113,6 +114,7 @@ impl ProcSysFdEntry {
     const EMPTY: Self = Self {
         live: false,
         is_dir: false,
+        is_symlink: false,
         generation: 0,
         alias_refs: 0,
         owners: DirectProcessRefs::empty(),
@@ -646,6 +648,20 @@ pub(super) fn write_back_memfs_mmap(mount_id: u32, mem_ino: u64, file_offset: us
             }
         }
     });
+}
+
+pub(super) fn read_memfs_for_mremap(mount_id: u32, mem_ino: u64) -> Option<Vec<u8>> {
+    with_mount_state(|state| {
+        let st = state.memfs.stat_ino(mount_id, mem_ino)?;
+        let len = usize::try_from(st.size).ok()?;
+        let mut buf = alloc::vec![0u8; len];
+        if len > 0 {
+            let _ = state.memfs.read_at(mount_id, mem_ino, 0, &mut buf).ok()?;
+        }
+        Some(buf)
+    })
+    .ok()
+    .flatten()
 }
 
 pub(super) fn append_open_proc_sys_fds(process: ObjectId, out: &mut Vec<i32>) {
@@ -3108,13 +3124,18 @@ fn resolve_virtual_bytes<const M: usize>(
                 } else {
                     None
                 };
+                let node = if entry.mem_ino == 0 && entry.is_symlink {
+                    Some(VirtualNode::Symlink(entry.content.clone()))
+                } else {
+                    None
+                };
                 return Ok(Some(ResolvedVirtualTarget::Virtual {
                     mount_id: entry.mount_id,
                     is_mount_root: entry.rel_path.is_empty(),
                     fstype: entry.fstype,
                     abs_path: entry.abs_path.clone(),
                     rel_path: entry.rel_path.clone(),
-                    node: None,
+                    node,
                     mem_stat,
                 }));
             }
@@ -3947,6 +3968,11 @@ fn synthesize_proc_or_sys_node<const M: usize>(
                     node_buf[..state.len()].copy_from_slice(state);
                     return Ok(state.len());
                 }
+                if let Some(len) =
+                    super::step43_desktop::read_dynamic_input_sysfs_attr(rel, node_buf)
+                {
+                    return Ok(len);
+                }
                 match super::step37_38_systemd_udev::read_sysfs_device_attr(rel, node_buf) {
                     Ok(len) => Ok(len),
                     Err(Errno::ENOENT) => read_sysfs_node(rel, snap, node_buf).ok_or(Errno::ENOENT),
@@ -4000,7 +4026,41 @@ fn read_sysfs_symlink_target(rel: &[u8]) -> Option<&'static [u8]> {
         b"devices/virtio1/net/eth0/subsystem" => Some(b"../../../../class/net"),
         b"dev/char/204:64" => Some(b"../../devices/platform/pl011/tty/ttyAMA0"),
         b"dev/char/5:1" => Some(b"../../class/tty/console"),
+        b"dev/char/226:0" => Some(b"../../devices/virtio2/drm/card0"),
+        b"dev/char/29:0" => Some(b"../../devices/virtio2/graphics/fb0"),
+        b"dev/char/13:64" => Some(b"../../devices/virtio3/input/input0/event0"),
+        b"dev/char/13:65" => Some(b"../../devices/virtio4/input/input1/event1"),
         b"dev/block/254:0" => Some(b"../../devices/virtio0/block/vda"),
+        b"class/drm/card0" => Some(b"../../devices/virtio2/drm/card0"),
+        b"class/drm/card0-Virtual-1" => Some(b"../../devices/virtio2/drm/card0/card0-Virtual-1"),
+        b"class/drm/card0/subsystem" => Some(b"../../../class/drm"),
+        b"devices/virtio2/drm/card0/subsystem" => Some(b"../../../../class/drm"),
+        b"class/drm/card0/device" => Some(b"../../../devices/virtio2"),
+        b"devices/virtio2/drm/card0/device" => Some(b"../../../../devices/virtio2"),
+        b"class/graphics/fb0" => Some(b"../../devices/virtio2/graphics/fb0"),
+        b"class/graphics/fb0/subsystem" => Some(b"../../../class/graphics"),
+        b"devices/virtio2/graphics/fb0/subsystem" => Some(b"../../../../class/graphics"),
+        b"class/input/input0" => Some(b"../../devices/virtio3/input/input0"),
+        b"class/input/input1" => Some(b"../../devices/virtio4/input/input1"),
+        b"class/input/event0" => Some(b"../../devices/virtio3/input/input0/event0"),
+        b"class/input/event1" => Some(b"../../devices/virtio4/input/input1/event1"),
+        b"class/input/event0/subsystem"
+        | b"class/input/event1/subsystem"
+        | b"class/input/input0/subsystem"
+        | b"class/input/input1/subsystem" => Some(b"../../../class/input"),
+        b"devices/virtio3/input/input0/subsystem" | b"devices/virtio4/input/input1/subsystem" => {
+            Some(b"../../../../class/input")
+        }
+        b"devices/virtio3/input/input0/event0/subsystem"
+        | b"devices/virtio4/input/input1/event1/subsystem" => Some(b"../../../../../class/input"),
+        b"class/input/event0/device" => Some(b"../input0"),
+        b"class/input/input0/event0/device" | b"devices/virtio3/input/input0/event0/device" => {
+            Some(b"../../input0")
+        }
+        b"class/input/event1/device" => Some(b"../input1"),
+        b"class/input/input1/event1/device" | b"devices/virtio4/input/input1/event1/device" => {
+            Some(b"../../input1")
+        }
         _ => None,
     }
 }
@@ -4113,6 +4173,9 @@ fn try_delegate_dev_open(abs_path: &[u8], flags: u64) -> Result<Option<SyscallRe
     if let Some(ret) = super::step42_hardware::try_open_dev_bytes_if_block(abs_path, flags)? {
         return Ok(Some(ret));
     }
+    if let Some(ret) = super::step43_desktop::try_open_desktop_bytes(abs_path, flags)? {
+        return Ok(Some(ret));
+    }
     super::step32_dev::try_open_dev_bytes(abs_path, flags)
 }
 
@@ -4126,6 +4189,9 @@ fn try_delegate_dev_stat(abs_path: &[u8], user_statbuf: u64) -> Result<Option<Sy
     if let Some(ret) = super::step42_hardware::try_stat_hw_bytes(abs_path, user_statbuf)? {
         return Ok(Some(ret));
     }
+    if let Some(ret) = super::step43_desktop::try_stat_desktop_bytes(abs_path, user_statbuf)? {
+        return Ok(Some(ret));
+    }
     super::step32_dev::try_stat_dev_bytes(abs_path, user_statbuf)
 }
 
@@ -4137,6 +4203,9 @@ fn try_delegate_dev_statx(abs_path: &[u8], user_statx: u64) -> Result<Option<Sys
         return Ok(Some(ret));
     }
     if let Some(ret) = super::step42_hardware::try_statx_hw_bytes(abs_path, user_statx)? {
+        return Ok(Some(ret));
+    }
+    if let Some(ret) = super::step43_desktop::try_statx_desktop_bytes(abs_path, user_statx)? {
         return Ok(Some(ret));
     }
     super::step32_dev::try_statx_dev_bytes(abs_path, user_statx)
@@ -4318,6 +4387,7 @@ fn open_virtual_resolved(
             return Ok((None, Err(Errno::ELOOP)));
         }
         let mut is_dir = ms.kind == MemNodeKind::Dir;
+        let is_symlink = ms.kind == MemNodeKind::Symlink;
         if is_tmpfile {
             if !is_dir {
                 return Ok((None, Err(Errno::ENOTDIR)));
@@ -4373,6 +4443,7 @@ fn open_virtual_resolved(
         state.fds[slot_idx] = ProcSysFdEntry {
             live: true,
             is_dir,
+            is_symlink,
             generation,
             alias_refs: 0,
             owners,
@@ -4414,6 +4485,7 @@ fn open_virtual_resolved(
         }
     };
     let is_dir = matches!(node, VirtualNode::Directory(_));
+    let is_symlink = matches!(node, VirtualNode::Symlink(_));
     if (flags & O_DIRECTORY) != 0 && !is_dir {
         return Ok((None, Err(Errno::ENOTDIR)));
     }
@@ -4453,6 +4525,7 @@ fn open_virtual_resolved(
     state.fds[slot_idx] = ProcSysFdEntry {
         live: true,
         is_dir,
+        is_symlink,
         generation,
         alias_refs: 0,
         owners,
@@ -5281,7 +5354,8 @@ fn handle_newfstatat_if_proc_or_sys(
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
     let allow_empty = (flags & AT_EMPTY_PATH) != 0;
-    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let empty_path = allow_empty && read_user_cstr(user_path, &mut [0u8; 1]) == Ok(0);
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0 && !empty_path;
     let caller = CallerSnapshotData::capture();
     let cwd = cwd_if_at_fdcwd(owner, dirfd);
     let res = with_mount_state(|state| {
@@ -5321,7 +5395,8 @@ fn handle_statx_if_proc_or_sys(
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
     let allow_empty = (flags & AT_EMPTY_PATH) != 0;
-    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let empty_path = allow_empty && read_user_cstr(user_path, &mut [0u8; 1]) == Ok(0);
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0 && !empty_path;
     let caller = CallerSnapshotData::capture();
     let cwd = cwd_if_at_fdcwd(owner, dirfd);
     let res = with_mount_state(|state| {
@@ -5422,7 +5497,8 @@ fn handle_faccessat_if_proc_or_sys(
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
     let allow_empty = (flags & AT_EMPTY_PATH) != 0;
-    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let empty_path = allow_empty && read_user_cstr(user_path, &mut [0u8; 1]) == Ok(0);
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0 && !empty_path;
     let caller = CallerSnapshotData::capture();
     let cwd = cwd_if_at_fdcwd(owner, dirfd);
     let action = with_mount_state(|state| {
@@ -5508,6 +5584,8 @@ fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()
         let ino = virtual_inode(entry.fstype, &entry.rel_path);
         let (mode, nlink, size) = if entry.is_dir {
             (S_IFDIR_RX_MODE, 2, 0)
+        } else if entry.is_symlink {
+            (S_IFLNK_MODE, 1, entry.content.len() as u64)
         } else {
             (S_IFREG_RO_MODE, 1, entry.content.len() as u64)
         };
@@ -6429,7 +6507,8 @@ fn handle_fchownat_virtual(
 ) -> Result<Option<SyscallReturn>, ()> {
     let owner = current_process_id()?;
     let allow_empty = (flags & AT_EMPTY_PATH) != 0;
-    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+    let empty_path = allow_empty && read_user_cstr(user_path, &mut [0u8; 1]) == Ok(0);
+    let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0 && !empty_path;
     let caller = CallerSnapshotData::capture();
     let now = current_epoch_now_secs();
     let cwd = cwd_if_at_fdcwd(owner, dirfd);

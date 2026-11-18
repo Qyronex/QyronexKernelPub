@@ -3,10 +3,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 //! VirtIO MMIO v1/v2 transport, Split Virtqueue descriptor validation, and
-//! capability/IOMMU-mediated `virtio-blk`, `virtio-net`, and `virtio-rng` drivers.
+//! capability/IOMMU-mediated `virtio-blk`, `virtio-net`, `virtio-gpu`, `virtio-input`, and
+//! `virtio-rng` drivers.
 
 pub mod blk;
 pub mod blk_mmio;
+pub mod gpu;
+pub mod gpu_mmio;
+pub mod input;
+pub mod input_mmio;
 pub mod mmio;
 pub mod net;
 pub mod net_mmio;
@@ -20,6 +25,19 @@ pub use blk::{
 pub use blk_mmio::{
     DEFAULT_BLK_MMIO_DMA_BYTES, DEFAULT_BLK_MMIO_QUEUE_SIZE, VirtioBlkDmaBlock, VirtioBlkMmio,
 };
+pub use gpu::{
+    VIRTIO_GPU_F_EDID, VIRTIO_GPU_F_VIRGL, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+    VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM, VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM,
+    VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM, VIRTIO_GPU_MAX_SCANOUTS, VirtioGpuConfig, VirtioGpuCtrlHdr,
+    VirtioGpuDisplayOne, VirtioGpuMemEntry, VirtioGpuRect, VirtioGpuRespDisplayInfo,
+};
+pub use gpu_mmio::{
+    DEFAULT_GPU_MMIO_QUEUE_SIZE, DEFAULT_GPU_MMIO_REQ_BYTES, VirtioGpuDmaBlock, VirtioGpuMmio,
+};
+pub use input::{
+    VirtioInputAbsInfo, VirtioInputCaps, VirtioInputDevids, VirtioInputEvent, VirtioInputKind,
+};
+pub use input_mmio::{DEFAULT_INPUT_MMIO_QUEUE_SIZE, VirtioInputDmaBlock, VirtioInputMmio};
 pub use mmio::{
     MmioBus, VIRTIO_F_VERSION_1, VIRTIO_MMIO_MAGIC, VirtioDeviceId, VirtioMmioTransport,
     VolatileMmioBus,

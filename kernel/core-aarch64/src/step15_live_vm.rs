@@ -300,173 +300,47 @@ unsafe fn fork_process_inner<const THREADS: usize, const WAKES: usize>(
                     // KMap is needed only while copying the parent's anonymous snapshot. Its borrow
                     // ends before scheduler staging so the later transaction does not retain TTBR1
                     // temporary-alias authority across scheduler mutation.
-                    let staged_snapshot = unsafe {
-                        kmap::with_kmap(|zeroer| {
-                            // SAFETY: exact parent frame, runtime, page-table, frame and KMap owners
-                            // are all held for this never-published staging operation.
-                            unsafe {
-                                super::step30_fork::stage_unpublished_fork_transaction_with_child_tid(
-                                    linux,
-                                    current,
-                                    plan,
-                                    &parent_registers,
-                                    parent_return,
-                                    parent_tls,
-                                    page_tables,
-                                    frame_pool,
-                                    zeroer,
-                                    child_tid_set,
-                                )
-                            }
-                        })
-                    };
+                    let staged_snapshot = kmap::with_kmap(|zeroer| {
+                        // SAFETY: exact parent frame, runtime, page-table, frame and KMap owners
+                        // are all held for this never-published staging operation.
+                        super::step30_fork::stage_unpublished_fork_transaction_with_child_tid(
+                            linux,
+                            current,
+                            plan,
+                            &parent_registers,
+                            parent_return,
+                            parent_tls,
+                            page_tables,
+                            frame_pool,
+                            zeroer,
+                            child_tid_set,
+                        )
+                    });
                     let staged_snapshot = match staged_snapshot {
                         Ok(Ok(receipt)) => receipt,
-                        Ok(Err(error)) => {
-                            #[cfg(feature = "step31-debian-qemu")]
-                            if let Some(serial) = super::step15_svc_serial() {
-                                serial.write_str("KERNAL/D13: fork stage_unpublished failed: ");
-                                match &error {
-                                    super::step30_fork::Error::UnsupportedBacking => {
-                                        serial.write_str("UnsupportedBacking")
-                                    }
-                                    super::step30_fork::Error::ChildNotEmpty => {
-                                        serial.write_str("ChildNotEmpty")
-                                    }
-                                    super::step30_fork::Error::AddressSpace => {
-                                        serial.write_str("AddressSpace")
-                                    }
-                                    super::step30_fork::Error::Frame(_) => {
-                                        serial.write_str("Frame")
-                                    }
-                                    super::step30_fork::Error::InvalidAllocatedFrame => {
-                                        serial.write_str("InvalidAllocatedFrame")
-                                    }
-                                    super::step30_fork::Error::Invariant => {
-                                        serial.write_str("Invariant")
-                                    }
-                                    super::step30_fork::Error::UnsupportedProcessClonePlan => {
-                                        serial.write_str("UnsupportedProcessClonePlan")
-                                    }
-                                    super::step30_fork::Error::RollbackFailed => {
-                                        serial.write_str("RollbackFailed")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::ChildTidFault => {
-                                        serial.write_str("ChildTidFault")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Kmap(_) => {
-                                        serial.write_str("Kmap")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Runtime(r) => {
-                                        serial.write_str("Runtime(");
-                                        match r {
-                                            super::runtime::Error::Process(_) => {
-                                                serial.write_str("Process")
-                                            }
-                                            super::runtime::Error::AddressSpace(_) => {
-                                                serial.write_str("AddressSpace")
-                                            }
-                                            super::runtime::Error::Credentials(_) => {
-                                                serial.write_str("Credentials")
-                                            }
-                                            super::runtime::Error::Signal(_) => {
-                                                serial.write_str("Signal")
-                                            }
-                                            super::runtime::Error::Wait(_) => {
-                                                serial.write_str("Wait")
-                                            }
-                                            super::runtime::Error::Exit(_) => {
-                                                serial.write_str("Exit")
-                                            }
-                                            super::runtime::Error::AlreadyInitialized => {
-                                                serial.write_str("AlreadyInitialized")
-                                            }
-                                            super::runtime::Error::Unavailable => {
-                                                serial.write_str("Unavailable")
-                                            }
-                                            super::runtime::Error::Busy => serial.write_str("Busy"),
-                                            super::runtime::Error::Poisoned => {
-                                                serial.write_str("Poisoned")
-                                            }
-                                            super::runtime::Error::InvalidState => {
-                                                serial.write_str("InvalidState")
-                                            }
-                                            super::runtime::Error::ProcessSlotsFull => {
-                                                serial.write_str("ProcessSlotsFull")
-                                            }
-                                        }
-                                        serial.write_str(")");
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::ReturnState(_) => {
-                                        serial.write_str("ReturnState")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Stack(_) => {
-                                        serial.write_str("Stack")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Scheduler(_) => {
-                                        serial.write_str("Scheduler")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Lifecycle(_) => {
-                                        serial.write_str("Lifecycle")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Identity(_) => {
-                                        serial.write_str("Identity")
-                                    }
-                                    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-                                    super::step30_fork::Error::Process(_) => {
-                                        serial.write_str("Process")
-                                    }
-                                    #[cfg(test)]
-                                    super::step30_fork::Error::InjectedCopyFailure => {
-                                        serial.write_str("InjectedCopyFailure")
-                                    }
-                                }
-                                serial.write_str("\n");
-                            }
-                            let _ = error;
-                            return Err(());
-                        }
-                        Err(_) => {
-                            #[cfg(feature = "step31-debian-qemu")]
-                            if let Some(serial) = super::step15_svc_serial() {
-                                serial.write_str("KERNAL/D13: fork kmap borrow failed\n");
-                            }
-                            return Err(());
-                        }
+                        Ok(Err(_)) | Err(_) => return Err(()),
                     };
 
                     // SAFETY: caller still owns the scheduler/quiescent window and the exact receipt
                     // has not escaped or been published.
-                    let staged_scheduler = match unsafe {
-                        super::step30_fork::stage_fork_scheduler_generation_with_clear_child_tid(
-                            scheduler,
-                            staged_snapshot,
-                            priority,
-                            child_tid_clear,
-                        )
-                    } {
+                    let staged_scheduler = match super::step30_fork::stage_fork_scheduler_generation_with_clear_child_tid(
+                        scheduler,
+                        staged_snapshot,
+                        priority,
+                        child_tid_clear,
+                    ) {
                         Ok(receipt) => receipt,
                         Err(error) => {
                             if let Some((_scheduler_error, receipt)) = error.into_recoverable() {
                                 // SAFETY: the scheduler contract proved no generation was published;
                                 // rollback consumes the exact still-reversible snapshot receipt.
-                                unsafe {
-                                    super::step30_fork::rollback_unpublished_fork_transaction(
-                                        linux,
-                                        current,
-                                        receipt,
-                                        page_tables,
-                                        frame_pool,
-                                    )
-                                }
+                                super::step30_fork::rollback_unpublished_fork_transaction(
+                                    linux,
+                                    current,
+                                    receipt,
+                                    page_tables,
+                                    frame_pool,
+                                )
                                 .map_err(|_| ())?;
                             }
                             return Err(());
@@ -474,41 +348,35 @@ unsafe fn fork_process_inner<const THREADS: usize, const WAKES: usize>(
                     };
 
                     // SAFETY: the exact scheduler generation remains Blocked+Staged and owner-held.
-                    let staged_leader = match unsafe {
-                        super::step30_fork::stage_fork_leader_authority(
-                            scheduler,
-                            linux,
-                            staged_scheduler,
-                        )
-                    } {
+                    let staged_leader = match super::step30_fork::stage_fork_leader_authority(
+                        scheduler,
+                        linux,
+                        staged_scheduler,
+                    ) {
                         Ok(receipt) => receipt,
                         Err(_) => return Err(()),
                     };
 
                     // SAFETY: final publication consumes the exact leader receipt and performs no
                     // fallible userspace access. Any recoverable error proves Blocked+Staged state.
-                    match unsafe {
-                        super::step30_fork::publish_staged_fork_leader(
-                            scheduler,
-                            linux,
-                            staged_leader,
-                        )
-                    } {
+                    match super::step30_fork::publish_staged_fork_leader(
+                        scheduler,
+                        linux,
+                        staged_leader,
+                    ) {
                         Ok(published) => Ok(published),
                         Err(error) => {
                             if let Some((_publish_error, receipt)) = error.into_recoverable() {
                                 // SAFETY: recoverable publish failure restored the complete staged
                                 // leader receipt; owner/page-table/frame state remains unchanged.
-                                unsafe {
-                                    super::step30_fork::rollback_staged_fork_leader_authority(
-                                        scheduler,
-                                        linux,
-                                        current,
-                                        receipt,
-                                        page_tables,
-                                        frame_pool,
-                                    )
-                                }
+                                super::step30_fork::rollback_staged_fork_leader_authority(
+                                    scheduler,
+                                    linux,
+                                    current,
+                                    receipt,
+                                    page_tables,
+                                    frame_pool,
+                                )
                                 .map_err(|_| ())?;
                             }
                             Err(())
@@ -877,4 +745,60 @@ pub(super) unsafe fn reclaim_superseded_anonymous_user_frames<
             release,
         )
     }
+}
+
+/// Allocates `pages` contiguous physical 4 KiB frames and zeroes each frame before returning the
+/// physical base address.
+#[allow(dead_code)]
+pub(super) fn alloc_zeroed_contiguous_frames(pages: u64) -> Result<u64, ()> {
+    if pages == 0 {
+        return Err(());
+    }
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked window.
+    let res = unsafe {
+        RuntimeTablePool::with_live(|page_tables| {
+            memory::with_live_frame_pool(|frame_pool| {
+                kmap::with_kmap(|zeroer| {
+                    let (frames, _reserved) = frame_pool.split();
+                    let range = frames.allocate(pages, 1).map_err(|_| ())?;
+                    for page_idx in 0..pages {
+                        let phys = range.start.saturating_add(page_idx.saturating_mul(4096));
+                        if zeroer.zero_frame(page_tables, phys).is_err() {
+                            let _ = frames.free(range);
+                            return Err(());
+                        }
+                    }
+                    Ok(range.start)
+                })
+            })
+        })
+    };
+    res.map_err(|_| ())?.map_err(|_| ())?.map_err(|_| ())?
+}
+
+/// Returns `pages` contiguous physical frames back to the live frame allocator.
+#[allow(dead_code)]
+pub(super) fn free_contiguous_frames(phys_base: u64, pages: u64) -> Result<(), ()> {
+    let range = kernal_frame_allocator::FrameRange::new(phys_base, pages).map_err(|_| ())?;
+    let res = memory::with_live_frame_pool(|frame_pool| {
+        let (frames, _reserved) = frame_pool.split();
+        frames.free(range).map_err(|_| ())
+    });
+    res.map_err(|_| ())?
+}
+
+/// Writes up to one 4 KiB page into a caller-owned physical frame through KMap.
+#[allow(dead_code)]
+pub(super) fn write_phys_page_bytes(phys_page: u64, offset: usize, bytes: &[u8]) -> Result<(), ()> {
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked window and caller owns `phys_page`.
+    let res = unsafe {
+        RuntimeTablePool::with_live(|page_tables| {
+            kmap::with_kmap(|zeroer| {
+                zeroer
+                    .write_frame_bytes(page_tables, phys_page, offset, bytes)
+                    .map_err(|_| ())
+            })
+        })
+    };
+    res.map_err(|_| ())?.map_err(|_| ())?
 }

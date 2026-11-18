@@ -251,13 +251,21 @@ impl Step15LinuxRuntime {
             )
         };
 
-        if self
+        let parent_still_live = self
             .identities
             .process_object_for_pid(parent_pid)
-            .map_err(|_| Error::InvalidState)?
-            != parent_id
-        {
-            return Err(Error::InvalidState);
+            .is_ok_and(|id| id == parent_id)
+            && if self.process.id() == parent_id {
+                self.process.state() == ProcessState::Live
+            } else {
+                self.additional_processes
+                    .iter()
+                    .flatten()
+                    .find(|slot| slot.process.id() == parent_id)
+                    .is_some_and(|slot| slot.process.state() == ProcessState::Live)
+            };
+        if !parent_still_live {
+            return Ok(None);
         }
 
         // A real scheduler transition is already authoritative. Publish Wait first so artificial
@@ -450,13 +458,26 @@ impl Step15LinuxRuntime {
             )
         };
 
-        if self
+        let parent_still_live = self
             .identities
             .process_object_for_pid(parent_pid)
-            .map_err(|_| Error::InvalidState)?
-            != parent_id
-        {
-            return Err(Error::InvalidState);
+            .is_ok_and(|id| id == parent_id)
+            && if self.process.id() == parent_id {
+                self.process.state() == ProcessState::Live
+            } else {
+                self.additional_processes
+                    .iter()
+                    .flatten()
+                    .find(|slot| slot.process.id() == parent_id)
+                    .is_some_and(|slot| slot.process.state() == ProcessState::Live)
+            };
+        if !parent_still_live {
+            self.retire_exited_process_break(process_id)?;
+            return Ok(ProcessExitWaitPlan {
+                disposition: ProcessExitWaitDisposition::AutoReap(process_id),
+                signal_targets: ProcessExitSignalTargets::empty(),
+                exited_child: None,
+            });
         }
 
         let mut signal_targets = ProcessExitSignalTargets::empty();
@@ -693,6 +714,95 @@ impl Step15LinuxRuntime {
         debug_assert_eq!(removed.process.id(), process_id);
         self.clear_process_meta(process_id);
         Ok(wakes)
+    }
+
+    /// Reclaims any already-published zombie children whose parent `exited_parent` has itself exited
+    /// without reaping them, preventing orphaned zombie slots from leaking in `additional_processes`.
+    pub(super) fn reap_orphaned_zombie_children_of<B: Backend, const FRAME_EXTENTS: usize>(
+        &mut self,
+        exited_parent: ObjectId,
+        page_tables: &mut B,
+        frames: &mut kernal_frame_allocator::ExtentAllocator<FRAME_EXTENTS>,
+    ) -> [Option<ObjectId>; STEP15_RUNTIME_PROCESSES] {
+        let mut reaped = [None; STEP15_RUNTIME_PROCESSES];
+        let mut out_idx = 0usize;
+        for child_index in 0..self.additional_processes.len() {
+            let Some(child_id) = self.additional_processes[child_index]
+                .as_ref()
+                .and_then(|slot| {
+                    let pub_ref = slot.wait_publication.as_ref()?;
+                    if pub_ref.parent() == exited_parent
+                        && slot.process.state() == ProcessState::Exited
+                    {
+                        Some(slot.process.id())
+                    } else {
+                        None
+                    }
+                })
+            else {
+                continue;
+            };
+            let _ = self.retire_exited_process_break(child_id);
+            let reclaim_ok = {
+                let Some(child) = self.additional_processes[child_index].as_mut() else {
+                    continue;
+                };
+                if child
+                    .address_space
+                    .reclaim_exited_anonymous_user_frames(&child.process, page_tables, |frame| {
+                        let Ok(range) =
+                            kernal_frame_allocator::FrameRange::new(frame.start_address(), 1)
+                        else {
+                            return false;
+                        };
+                        frames.free(range).is_ok()
+                    })
+                    .is_ok()
+                {
+                    // SAFETY: `child` is already Exited, its VMA owner is empty after the frame drain
+                    // above, and the caller owns the sole live RuntimeTablePool mutation window.
+                    unsafe {
+                        child
+                            .address_space
+                            .reclaim_exited_empty_page_table_tree(&child.process, page_tables)
+                    }
+                    .is_ok()
+                } else {
+                    false
+                }
+            };
+            if !reclaim_ok {
+                continue;
+            }
+            let zombie_removed = {
+                let Self {
+                    additional_processes,
+                    credentials,
+                    signals,
+                    wait,
+                    ..
+                } = self;
+                if let Some(slot) = additional_processes[child_index].as_ref()
+                    && let Some(publication) = slot.wait_publication.as_ref()
+                    && wait.reap_orphaned_zombie(publication, &slot.process).is_ok()
+                {
+                    let _ = credentials.retire_process(&slot.process);
+                    let _ = signals.retire_process(&slot.process);
+                    true
+                } else {
+                    false
+                }
+            };
+            if zombie_removed {
+                let _ = self.additional_processes[child_index].take();
+                self.clear_process_meta(child_id);
+                if out_idx < reaped.len() {
+                    reaped[out_idx] = Some(child_id);
+                    out_idx += 1;
+                }
+            }
+        }
+        reaped
     }
 
     /// Observes one child status for the exact current scheduler generation while preserving the

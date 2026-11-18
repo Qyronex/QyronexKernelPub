@@ -25,8 +25,9 @@ use kernal_protected_boot_aarch64::{ProtectedVirtioMmioMap, runtime_kernel_alias
 use kernal_virtio::blk::VIRTIO_BLK_F_FLUSH;
 use kernal_virtio::{
     DmaBufferGrant, SECTOR_SIZE, VIRTIO_F_VERSION_1, VirtioBlkDevice, VirtioBlkDmaBlock,
-    VirtioBlkMmio, VirtioDeviceId, VirtioMmioTransport, VirtioNetDmaBlock, VirtioNetMmio,
-    VolatileMmioBus,
+    VirtioBlkMmio, VirtioDeviceId, VirtioGpuDmaBlock, VirtioGpuMmio, VirtioInputCaps,
+    VirtioInputDmaBlock, VirtioInputEvent, VirtioInputKind, VirtioInputMmio, VirtioMmioTransport,
+    VirtioNetDmaBlock, VirtioNetMmio, VolatileMmioBus,
 };
 
 /// Dedicated file-descriptor base for Step-42 server hardware, RTC, watchdog, entropy, and sysfs
@@ -142,6 +143,110 @@ static HW_NET_CELL: HwNetCell = HwNetCell {
     state: AtomicU8::new(0),
     value: UnsafeCell::new(None),
 };
+
+struct HwGpuDmaCell(UnsafeCell<VirtioGpuDmaBlock>);
+// SAFETY: all accesses to `HARDWARE_GPU_DMA` occur under `HW_GPU_CELL` after hardware ownership transfer.
+unsafe impl Sync for HwGpuDmaCell {}
+static HARDWARE_GPU_DMA: HwGpuDmaCell = HwGpuDmaCell(UnsafeCell::new(VirtioGpuDmaBlock::zeroed()));
+
+struct HwGpuSlot {
+    gpu: VirtioGpuMmio<VolatileMmioBus>,
+    scanout_w: u32,
+    scanout_h: u32,
+}
+
+struct HwGpuCell {
+    state: AtomicU8,
+    value: UnsafeCell<Option<HwGpuSlot>>,
+}
+// SAFETY: synchronous EL0 trap dispatch serializes access via atomic state `0 -> 1 -> 0`.
+unsafe impl Sync for HwGpuCell {}
+static HW_GPU_CELL: HwGpuCell = HwGpuCell {
+    state: AtomicU8::new(0),
+    value: UnsafeCell::new(None),
+};
+
+fn with_hw_gpu<R>(f: impl FnOnce(&mut Option<HwGpuSlot>) -> R) -> Result<R, ()> {
+    if HW_GPU_CELL
+        .state
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(());
+    }
+    // SAFETY: state `1` grants exclusive mutable access to the `HW_GPU_CELL` slot.
+    let gpu = unsafe { &mut *HW_GPU_CELL.value.get() };
+    let res = f(gpu);
+    HW_GPU_CELL.state.store(0, Ordering::Release);
+    Ok(res)
+}
+
+pub(super) const MAX_HW_INPUT_DEVS: usize = 4;
+
+struct HwInputDmasCell(UnsafeCell<[VirtioInputDmaBlock; MAX_HW_INPUT_DEVS]>);
+// SAFETY: each slot is accessed exclusively while `HW_INPUT_CELL` is locked.
+unsafe impl Sync for HwInputDmasCell {}
+static HARDWARE_INPUT_DMAS: HwInputDmasCell = HwInputDmasCell(UnsafeCell::new([
+    VirtioInputDmaBlock::zeroed(),
+    VirtioInputDmaBlock::zeroed(),
+    VirtioInputDmaBlock::zeroed(),
+    VirtioInputDmaBlock::zeroed(),
+]));
+
+struct HwInputTable {
+    count: usize,
+    devs: [Option<VirtioInputMmio<VolatileMmioBus>>; MAX_HW_INPUT_DEVS],
+}
+
+impl HwInputTable {
+    const fn empty() -> Self {
+        Self {
+            count: 0,
+            devs: [None, None, None, None],
+        }
+    }
+}
+
+struct HwInputCell {
+    state: AtomicU8,
+    value: UnsafeCell<HwInputTable>,
+}
+// SAFETY: synchronous EL0 trap dispatch serializes access via atomic state `0 -> 1 -> 0`.
+unsafe impl Sync for HwInputCell {}
+static HW_INPUT_CELL: HwInputCell = HwInputCell {
+    state: AtomicU8::new(0),
+    value: UnsafeCell::new(HwInputTable::empty()),
+};
+
+fn with_hw_input<R>(f: impl FnOnce(&mut HwInputTable) -> R) -> Result<R, ()> {
+    if HW_INPUT_CELL
+        .state
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(());
+    }
+    // SAFETY: state `1` grants exclusive mutable access to `HW_INPUT_CELL`.
+    let table = unsafe { &mut *HW_INPUT_CELL.value.get() };
+    let res = f(table);
+    HW_INPUT_CELL.state.store(0, Ordering::Release);
+    Ok(res)
+}
+
+fn prepare_static_dma<T>(ptr: *mut T) -> Option<(NonNull<T>, u64, DmaBufferGrant)> {
+    let dma_virt = NonNull::new(ptr)?;
+    let dma_phys = runtime_kernel_alias_physical(ptr as u64)?;
+    let grant = DmaBufferGrant {
+        base_addr: dma_phys,
+        len: size_of::<T>() as u64,
+        writable: true,
+        dma_assigned: true,
+        buffer_generation: 1,
+        expected_generation: 1,
+        revoked: false,
+    };
+    Some((dma_virt, dma_phys, grant))
+}
 
 fn with_hw_net<R>(
     f: impl FnOnce(&mut Option<VirtioNetMmio<VolatileMmioBus>>) -> R,
@@ -367,6 +472,13 @@ fn with_step42_state<R>(f: impl FnOnce(&mut Step42State) -> R) -> Result<R, ()> 
 /// from the protected-boot DTB map.
 pub(super) fn init_from_protected_virtio(map: &ProtectedVirtioMmioMap) -> Result<Option<u64>, ()> {
     let _ = with_hw_net(|slot| *slot = None);
+    let _ = with_hw_gpu(|slot| *slot = None);
+    let _ = with_hw_input(|table| {
+        table.count = 0;
+        for slot in &mut table.devs {
+            *slot = None;
+        }
+    });
     with_step42_state(|state| {
         state.ensure_initialized();
         let bootargs = map.bootargs();
@@ -398,59 +510,85 @@ pub(super) fn init_from_protected_virtio(map: &ProtectedVirtioMmioMap) -> Result
             };
             match probe.device_id {
                 VirtioDeviceId::Blk if state.hw_blk.is_none() => {
-                    let dma_ptr = HARDWARE_BLK_DMA.0.get();
-                    let Some(dma_virt) = NonNull::new(dma_ptr) else {
-                        continue;
-                    };
-                    let Some(dma_phys) = runtime_kernel_alias_physical(dma_ptr as u64) else {
-                        continue;
-                    };
-                    let grant = DmaBufferGrant {
-                        base_addr: dma_phys,
-                        len: size_of::<VirtioBlkDmaBlock>() as u64,
-                        writable: true,
-                        dma_assigned: true,
-                        buffer_generation: 1,
-                        expected_generation: 1,
-                        revoked: false,
-                    };
-                    // SAFETY: `HARDWARE_BLK_DMA` is static 4 KiB-aligned `.bss` exclusively owned under
-                    // `STEP42_STATE`, backed by `dma_phys` and covered by `grant`.
-                    if let Ok(mut blk) =
-                        unsafe { VirtioBlkMmio::initialize(info, bus, dma_virt, dma_phys, grant) }
+                    if let Some((dma_virt, dma_phys, grant)) =
+                        prepare_static_dma(HARDWARE_BLK_DMA.0.get())
                     {
-                        let mut adapter = HwBlkAdapter(&mut blk);
-                        state.partitions =
-                            parse_partitions(&mut adapter).unwrap_or(PartitionTable::EMPTY);
-                        let sectors = blk.capacity_sectors();
-                        state.hw_blk = Some(blk);
-                        attached_sectors = Some(sectors);
+                        // SAFETY: `HARDWARE_BLK_DMA` is static 4 KiB-aligned `.bss` exclusively owned under
+                        // `STEP42_STATE`, backed by `dma_phys` and covered by `grant`.
+                        if let Ok(mut blk) = unsafe {
+                            VirtioBlkMmio::initialize(info, bus, dma_virt, dma_phys, grant)
+                        } {
+                            let mut adapter = HwBlkAdapter(&mut blk);
+                            state.partitions =
+                                parse_partitions(&mut adapter).unwrap_or(PartitionTable::EMPTY);
+                            let sectors = blk.capacity_sectors();
+                            state.hw_blk = Some(blk);
+                            attached_sectors = Some(sectors);
+                        }
                     }
                 }
                 VirtioDeviceId::Net if !has_hardware_net() => {
-                    let dma_ptr = HARDWARE_NET_DMA.0.get();
-                    let Some(dma_virt) = NonNull::new(dma_ptr) else {
-                        continue;
-                    };
-                    let Some(dma_phys) = runtime_kernel_alias_physical(dma_ptr as u64) else {
-                        continue;
-                    };
-                    let grant = DmaBufferGrant {
-                        base_addr: dma_phys,
-                        len: size_of::<VirtioNetDmaBlock>() as u64,
-                        writable: true,
-                        dma_assigned: true,
-                        buffer_generation: 1,
-                        expected_generation: 1,
-                        revoked: false,
-                    };
-                    // SAFETY: `HARDWARE_NET_DMA` is static 4 KiB-aligned `.bss` exclusively owned under
-                    // `HW_NET_CELL`, backed by `dma_phys` and covered by `grant`.
-                    if let Ok(net) =
-                        unsafe { VirtioNetMmio::initialize(info, bus, dma_virt, dma_phys, grant) }
+                    if let Some((dma_virt, dma_phys, grant)) =
+                        prepare_static_dma(HARDWARE_NET_DMA.0.get())
                     {
-                        let _ = with_hw_net(|slot| *slot = Some(net));
+                        // SAFETY: `HARDWARE_NET_DMA` is static 4 KiB-aligned `.bss` exclusively owned under
+                        // `HW_NET_CELL`, backed by `dma_phys` and covered by `grant`.
+                        if let Ok(net) = unsafe {
+                            VirtioNetMmio::initialize(info, bus, dma_virt, dma_phys, grant)
+                        } {
+                            let _ = with_hw_net(|slot| *slot = Some(net));
+                        }
                     }
+                }
+                VirtioDeviceId::Gpu if !has_hardware_gpu() => {
+                    if let Some((dma_virt, dma_phys, grant)) =
+                        prepare_static_dma(HARDWARE_GPU_DMA.0.get())
+                    {
+                        // SAFETY: `HARDWARE_GPU_DMA` is static 4 KiB-aligned `.bss` exclusively owned under
+                        // `HW_GPU_CELL`, backed by `dma_phys` and covered by `grant`.
+                        if let Ok(mut gpu) = unsafe {
+                            VirtioGpuMmio::initialize(info, bus, dma_virt, dma_phys, grant)
+                        } {
+                            let (scanout_w, scanout_h) = gpu
+                                .get_display_info()
+                                .ok()
+                                .and_then(|info| {
+                                    info.pmodes.iter().find_map(|m| {
+                                        (m.enabled != 0 && m.r.width > 0 && m.r.height > 0)
+                                            .then_some((m.r.width, m.r.height))
+                                    })
+                                })
+                                .unwrap_or((1280, 800));
+                            let _ = with_hw_gpu(|slot| {
+                                *slot = Some(HwGpuSlot {
+                                    gpu,
+                                    scanout_w,
+                                    scanout_h,
+                                });
+                            });
+                        }
+                    }
+                }
+                VirtioDeviceId::Input => {
+                    let _ = with_hw_input(|table| {
+                        if table.count >= MAX_HW_INPUT_DEVS {
+                            return;
+                        }
+                        let idx = table.count;
+                        // SAFETY: `HW_INPUT_CELL` is locked and `idx < MAX_HW_INPUT_DEVS`.
+                        let dma_ptr = unsafe { (&raw mut (*HARDWARE_INPUT_DMAS.0.get())[idx]) };
+                        let Some((dma_virt, dma_phys, grant)) = prepare_static_dma(dma_ptr) else {
+                            return;
+                        };
+                        // SAFETY: `HARDWARE_INPUT_DMAS[idx]` is static 4 KiB-aligned `.bss` owned
+                        // under `HW_INPUT_CELL`, backed by `dma_phys` and covered by `grant`.
+                        if let Ok(input_dev) = unsafe {
+                            VirtioInputMmio::initialize(info, bus, dma_virt, dma_phys, grant)
+                        } {
+                            table.devs[idx] = Some(input_dev);
+                            table.count += 1;
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -468,6 +606,68 @@ pub(super) fn rtc_epoch_base_seconds() -> u64 {
 #[allow(dead_code)]
 pub(super) fn has_hardware_net() -> bool {
     with_hw_net(|slot| slot.is_some()).unwrap_or(false)
+}
+
+/// Returns whether a real VirtIO-MMIO GPU device (`virtio-gpu`) is initialized.
+#[allow(dead_code)]
+pub(super) fn has_hardware_gpu() -> bool {
+    with_hw_gpu(|slot| slot.is_some()).unwrap_or(false)
+}
+
+/// Returns the probed active scanout dimensions `(width, height)` for the hardware `virtio-gpu`.
+#[allow(dead_code)]
+pub(super) fn hardware_gpu_dimensions() -> Option<(u32, u32)> {
+    with_hw_gpu(|slot| slot.as_ref().map(|g| (g.scanout_w, g.scanout_h)))
+        .ok()
+        .flatten()
+}
+
+/// Runs `f` with exclusive access to the attached hardware `virtio-gpu` controller.
+#[allow(dead_code)]
+pub(super) fn with_hardware_gpu<R>(
+    f: impl FnOnce(&mut VirtioGpuMmio<VolatileMmioBus>) -> R,
+) -> Result<R, Errno> {
+    with_hw_gpu(|slot| match slot.as_mut() {
+        Some(gpu_slot) => Ok(f(&mut gpu_slot.gpu)),
+        None => Err(Errno::ENODEV),
+    })
+    .map_err(|_| Errno::EAGAIN)?
+}
+
+/// Returns the number of initialized VirtIO-MMIO input devices (`virtio-input`).
+#[allow(dead_code)]
+pub(super) fn hardware_input_count() -> usize {
+    with_hw_input(|table| table.count).unwrap_or(0)
+}
+
+/// Returns `(kind, caps)` for hardware `virtio-input` slot `idx`, if initialized.
+#[allow(dead_code)]
+pub(super) fn hardware_input_info(idx: usize) -> Option<(VirtioInputKind, VirtioInputCaps)> {
+    if idx >= MAX_HW_INPUT_DEVS {
+        return None;
+    }
+    with_hw_input(|table| {
+        table.devs[idx]
+            .as_ref()
+            .map(|dev| (dev.kind(), *dev.caps()))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Polls one completed input event from hardware `virtio-input` slot `idx`.
+#[allow(dead_code)]
+pub(super) fn hardware_input_poll_event(idx: usize) -> Option<VirtioInputEvent> {
+    if idx >= MAX_HW_INPUT_DEVS {
+        return None;
+    }
+    with_hw_input(|table| {
+        let dev = table.devs[idx].as_mut()?;
+        let _ = dev.ack_interrupt();
+        dev.poll_event().ok().flatten()
+    })
+    .ok()
+    .flatten()
 }
 
 /// Returns the hardware MAC address of the attached `virtio-net` controller, if any.

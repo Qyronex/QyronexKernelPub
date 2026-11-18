@@ -18,7 +18,14 @@ pub(super) mod pipe_blocking;
 #[path = "step30_pipe_wait.rs"]
 pub(super) mod pipe_wait;
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub const STEP15_FUTEX_BUCKETS: usize = 32;
+#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 pub const STEP15_FUTEX_BUCKETS: usize = 16;
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub const STEP15_FUTEX_WAITERS: usize = 32;
+#[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 pub const STEP15_FUTEX_WAITERS: usize = 16;
 
 static STEP15_FUTEXES: SerializedFutexTable<STEP15_FUTEX_BUCKETS, STEP15_FUTEX_WAITERS> =

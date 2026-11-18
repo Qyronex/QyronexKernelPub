@@ -17,7 +17,7 @@ pub const STEP29_RUNTIME_PIPES: usize = STEP29_RUNTIME_FDS / 2;
 pub const STEP29_RUNTIME_PIPE_CAPACITY: usize = PIPE_BUF;
 /// Step 30+/Debian runtime admits sixteen simultaneous Linux Process generations, partitioned cleanly
 /// below `DEV_FD_BASE` (`64..96`).
-pub const STEP29_RUNTIME_PROCESS_VIEWS: usize = 16;
+pub const STEP29_RUNTIME_PROCESS_VIEWS: usize = 24;
 
 // Final Step-29 filesystem integration owns one bounded mutable Overlay namespace. These capacities
 // are deliberately process-local and finite: the VFS remains the sole namespace/data/lifetime owner

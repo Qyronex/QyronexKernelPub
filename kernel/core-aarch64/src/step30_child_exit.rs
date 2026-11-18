@@ -682,7 +682,7 @@ pub(super) fn complete_process_exit_wait_after_lifecycle(
         super::step35_events_cgroup::on_child_process_exited(parent_id, child_pid, child_uid);
     }
 
-    match plan.disposition() {
+    let result = match plan.disposition() {
         super::runtime::ProcessExitWaitDisposition::NoParentPublication => Ok(None),
         super::runtime::ProcessExitWaitDisposition::ZombiePublished(wakes) => Ok(Some(wakes)),
         super::runtime::ProcessExitWaitDisposition::AutoReap(process_id) => {
@@ -717,5 +717,36 @@ pub(super) fn complete_process_exit_wait_after_lifecycle(
 
             Ok(Some(wakes))
         }
+    };
+
+    if matches!(
+        completion,
+        kernal_linux_exit_lifecycle::Completion::ProcessExited { .. }
+    ) {
+        // Reclaim any already-published zombie children whose parent `process_id` just exited
+        // without reaping them, so orphaned zombies cannot exhaust `additional_processes`.
+        // SAFETY: same synchronous IRQ-masked owner window and global lock order as AutoReap above.
+        if let Ok(Ok(Ok(orphans))) = unsafe {
+            kernal_protected_boot_aarch64::RuntimeTablePool::with_live(|page_tables| {
+                super::memory::with_live_frame_pool(|pool| {
+                    super::runtime::with_linux_runtime(|state| {
+                        state.reap_orphaned_zombie_children_of(
+                            process_id,
+                            page_tables,
+                            pool.allocator_mut(),
+                        )
+                    })
+                })
+            })
+        } {
+            #[cfg(feature = "step29-qemu-proof")]
+            for orphan_id in orphans.into_iter().flatten() {
+                let _ = super::step29_runtime::retire_process(orphan_id);
+            }
+            #[cfg(not(feature = "step29-qemu-proof"))]
+            let _ = orphans;
+        }
     }
+
+    result
 }

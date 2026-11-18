@@ -8,6 +8,9 @@
 //! (`inotify_init1`, `inotify_add_watch`, `inotify_rm_watch`), `memfd_create` with
 //! `F_ADD_SEALS`/`F_GET_SEALS`, `pidfd_open`, and `close_range`.
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use kernal_linux_abi::Errno;
 
 pub const O_NONBLOCK: u32 = 0o000_4000; // 0x800
@@ -164,8 +167,8 @@ impl InotifyWatch {
 pub const MAX_EPOLL_WATCHES: usize = 64;
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Copy)]
-pub enum EventObject<const MEMFD_CAP: usize> {
+#[derive(Clone)]
+pub enum EventObject {
     Empty,
     Epoll {
         cloexec: bool,
@@ -206,9 +209,10 @@ pub enum EventObject<const MEMFD_CAP: usize> {
         cloexec: bool,
         allow_sealing: bool,
         seals: u32,
+        rev: u64,
         offset: usize,
         len: usize,
-        data: [u8; MEMFD_CAP],
+        data: Vec<u8>,
     },
     PidFd {
         target_pid: u32,
@@ -220,7 +224,7 @@ pub enum EventObject<const MEMFD_CAP: usize> {
 
 /// Bounded table of Step-35 event, notification, memfd, and pidfd descriptors.
 pub struct EventTable<const MAX_FDS: usize, const MEMFD_CAP: usize> {
-    slots: [EventObject<MEMFD_CAP>; MAX_FDS],
+    slots: [EventObject; MAX_FDS],
 }
 
 impl<const MAX_FDS: usize, const MEMFD_CAP: usize> Default for EventTable<MAX_FDS, MEMFD_CAP> {
@@ -232,11 +236,11 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> Default for EventTable<MAX_FD
 impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP> {
     pub const fn new() -> Self {
         Self {
-            slots: [EventObject::Empty; MAX_FDS],
+            slots: [const { EventObject::Empty }; MAX_FDS],
         }
     }
 
-    fn alloc_slot(&mut self, obj: EventObject<MEMFD_CAP>) -> Result<usize, Errno> {
+    fn alloc_slot(&mut self, obj: EventObject) -> Result<usize, Errno> {
         let (idx, slot) = self
             .slots
             .iter_mut()
@@ -992,9 +996,10 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             cloexec: (flags & (MFD_CLOEXEC | MFD_NOEXEC_SEAL)) != 0,
             allow_sealing,
             seals: if allow_sealing { 0 } else { F_SEAL_SEAL },
+            rev: 1,
             offset: 0,
             len: 0,
-            data: [0u8; MEMFD_CAP],
+            data: Vec::new(),
         })
     }
 
@@ -1048,6 +1053,15 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         Ok((&data[..*len], *seals))
     }
 
+    /// Returns the current content revision of a `memfd`.
+    pub fn memfd_rev(&self, idx: usize) -> Result<u64, Errno> {
+        let slot = self.slots.get(idx).ok_or(Errno::EBADF)?;
+        let EventObject::MemFd { rev, .. } = slot else {
+            return Err(Errno::EINVAL);
+        };
+        Ok(*rev)
+    }
+
     /// Writes `input` into an existing `memfd` at explicit `file_offset` without mutating its cursor.
     pub fn memfd_write_at(
         &mut self,
@@ -1057,7 +1071,11 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
     ) -> Result<usize, Errno> {
         let slot = self.slots.get_mut(idx).ok_or(Errno::EBADF)?;
         let EventObject::MemFd {
-            seals, len, data, ..
+            seals,
+            rev,
+            len,
+            data,
+            ..
         } = slot
         else {
             return Err(Errno::EINVAL);
@@ -1069,7 +1087,11 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             return Ok(0);
         }
         let take = (*len - file_offset).min(input.len());
-        data[file_offset..file_offset + take].copy_from_slice(&input[..take]);
+        let dst = &mut data[file_offset..file_offset + take];
+        if dst != &input[..take] {
+            dst.copy_from_slice(&input[..take]);
+            *rev = rev.wrapping_add(1);
+        }
         Ok(take)
     }
 
@@ -1080,7 +1102,11 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         }
         let slot = self.slots.get_mut(idx).ok_or(Errno::EBADF)?;
         let EventObject::MemFd {
-            seals, len, data, ..
+            seals,
+            rev,
+            len,
+            data,
+            ..
         } = slot
         else {
             return Err(Errno::EINVAL);
@@ -1091,12 +1117,11 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         if new_len > *len && (*seals & F_SEAL_GROW) != 0 {
             return Err(Errno::EPERM);
         }
-        if new_len > *len {
-            for b in &mut data[*len..new_len] {
-                *b = 0;
-            }
+        if new_len != *len {
+            data.resize(new_len, 0);
+            *len = new_len;
+            *rev = rev.wrapping_add(1);
         }
-        *len = new_len;
         Ok(())
     }
 
@@ -1257,6 +1282,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             }
             EventObject::MemFd {
                 seals,
+                rev,
                 offset,
                 len,
                 data,
@@ -1272,10 +1298,16 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
                 if end > MEMFD_CAP {
                     return Err(Errno::ENOSPC);
                 }
+                if end > data.len() {
+                    data.resize(end, 0);
+                }
                 data[*offset..end].copy_from_slice(input);
                 *offset = end;
                 if end > *len {
                     *len = end;
+                }
+                if !input.is_empty() {
+                    *rev = rev.wrapping_add(1);
                 }
                 Ok(input.len())
             }

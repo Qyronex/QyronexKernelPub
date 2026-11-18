@@ -106,6 +106,8 @@ pub enum DeviceNodeKind {
     Urandom,
     /// `/dev/tty` (`5:0`, process controlling terminal)
     Tty,
+    /// `/dev/tty0..7` (`4:0..7`, virtual console terminals)
+    Vt(u8),
     /// `/dev/console` (`5:1`)
     Console,
     /// `/dev/ttyAMA0` (`204:64`, PL011 UART serial console)
@@ -126,6 +128,7 @@ impl DeviceNodeKind {
             Self::Random => (1, 8),
             Self::Urandom => (1, 9),
             Self::Tty => (5, 0),
+            Self::Vt(index) => (4, index as u32),
             Self::Console => (5, 1),
             Self::TtyAma0 => (204, 64),
             Self::Ptmx => (5, 2),
@@ -179,6 +182,14 @@ fn classify_dev_subpath(subpath: &[u8]) -> Option<DeviceNodeKind> {
         b"random" => Some(DeviceNodeKind::Random),
         b"urandom" => Some(DeviceNodeKind::Urandom),
         b"tty" => Some(DeviceNodeKind::Tty),
+        b"tty0" => Some(DeviceNodeKind::Vt(0)),
+        b"tty1" => Some(DeviceNodeKind::Vt(1)),
+        b"tty2" => Some(DeviceNodeKind::Vt(2)),
+        b"tty3" => Some(DeviceNodeKind::Vt(3)),
+        b"tty4" => Some(DeviceNodeKind::Vt(4)),
+        b"tty5" => Some(DeviceNodeKind::Vt(5)),
+        b"tty6" => Some(DeviceNodeKind::Vt(6)),
+        b"tty7" => Some(DeviceNodeKind::Vt(7)),
         b"console" => Some(DeviceNodeKind::Console),
         b"ttyAMA0" => Some(DeviceNodeKind::TtyAma0),
         b"ptmx" | b"pts/ptmx" => Some(DeviceNodeKind::Ptmx),
@@ -227,6 +238,7 @@ pub const fn poll_pseudo_device_readable(
             Some(matches!(entropy_readiness, EntropyReadiness::Ready))
         }
         DeviceNodeKind::Tty
+        | DeviceNodeKind::Vt(_)
         | DeviceNodeKind::Console
         | DeviceNodeKind::TtyAma0
         | DeviceNodeKind::Ptmx
@@ -276,6 +288,7 @@ where
             Ok(dest.len())
         }
         DeviceNodeKind::Tty
+        | DeviceNodeKind::Vt(_)
         | DeviceNodeKind::Console
         | DeviceNodeKind::TtyAma0
         | DeviceNodeKind::Ptmx
@@ -295,6 +308,7 @@ pub const fn write_pseudo_device(node: DeviceNodeKind, src: &[u8]) -> Result<usi
         | DeviceNodeKind::Urandom => Ok(src.len()),
         DeviceNodeKind::Full => Err(Error::NoSpace),
         DeviceNodeKind::Tty
+        | DeviceNodeKind::Vt(_)
         | DeviceNodeKind::Console
         | DeviceNodeKind::TtyAma0
         | DeviceNodeKind::Ptmx

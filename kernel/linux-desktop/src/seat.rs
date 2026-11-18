@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
 use crate::drm::DrmDevice;
-use crate::input::EvdevDevice;
+use crate::input::{EvdevDevice, MAX_INPUT_DEVICES};
 use kernal_capability::{CapRights, Capability};
 use kernal_linux_abi::Errno;
 
@@ -40,7 +40,7 @@ impl SessionRecord {
 #[derive(Clone, Debug)]
 pub struct SeatManager {
     pub drm: DrmDevice,
-    pub evdev: EvdevDevice,
+    pub evdevs: [EvdevDevice; MAX_INPUT_DEVICES],
     sessions: [SessionRecord; MAX_SEAT_SESSIONS],
     active_session: Option<(u32, u32)>,
     next_session_id: u32,
@@ -57,7 +57,12 @@ impl SeatManager {
     pub const fn new() -> Self {
         Self {
             drm: DrmDevice::new(),
-            evdev: EvdevDevice::new(),
+            evdevs: [
+                EvdevDevice::new(),
+                EvdevDevice::new(),
+                EvdevDevice::new(),
+                EvdevDevice::new(),
+            ],
             sessions: [SessionRecord::EMPTY; MAX_SEAT_SESSIONS],
             active_session: None,
             next_session_id: 1,
@@ -125,7 +130,9 @@ impl SeatManager {
         self.seat_generation = self.seat_generation.wrapping_add(1).max(1);
         let new_gen = self.seat_generation;
         self.drm.revoke_master_for_seat_switch(new_gen);
-        self.evdev.revoke_on_seat_switch(new_gen);
+        for evdev in &mut self.evdevs {
+            evdev.revoke_on_seat_switch(new_gen);
+        }
 
         let mut activated = None;
         for slot in &mut self.sessions {

@@ -396,6 +396,14 @@ fn uevent_device_from_sysfs_rel(rel: &[u8]) -> Option<&'static [u8]> {
         b"class/tty/ttyAMA0/uevent" | b"devices/platform/pl011/tty/ttyAMA0/uevent" => {
             Some(b"ttyAMA0")
         }
+        b"class/drm/card0/uevent" | b"devices/virtio2/drm/card0/uevent" => Some(b"dri/card0"),
+        b"class/graphics/fb0/uevent" | b"devices/virtio2/graphics/fb0/uevent" => Some(b"fb0"),
+        b"class/input/event0/uevent"
+        | b"class/input/input0/event0/uevent"
+        | b"devices/virtio3/input/input0/event0/uevent" => Some(b"input/event0"),
+        b"class/input/event1/uevent"
+        | b"class/input/input1/event1/uevent"
+        | b"devices/virtio4/input/input1/event1/uevent" => Some(b"input/event1"),
         _ => None,
     }
 }
@@ -408,6 +416,9 @@ pub(super) fn is_sysfs_uevent_trigger_rel(rel: &[u8]) -> bool {
 /// Synthesizes `/sys/class/...`, `/sys/devices/...`, and `/sys/kernel/uevent_seqnum` attributes
 /// from the live Step-38 device registry.
 pub(super) fn read_sysfs_device_attr(rel_path: &[u8], out: &mut [u8]) -> Result<usize, Errno> {
+    if let Some(n) = super::step43_desktop::read_dynamic_input_sysfs_attr(rel_path, out) {
+        return Ok(n);
+    }
     with_systemd_udev_state(|state| {
         state.ensure_initialized();
         state.udev.read_sysfs_device_attr(rel_path, out)

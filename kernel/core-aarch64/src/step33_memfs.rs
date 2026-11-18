@@ -7,7 +7,7 @@ use kernal_linux_abi::Errno;
 use kernal_linux_mounts::FilesystemType;
 
 const MAX_MEMFS_NODES: usize = 4096;
-const MAX_MEMFS_FILE_BYTES: usize = 1024 * 1024;
+const MAX_MEMFS_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_NAME_LEN: usize = 255;
 
 const S_IFMT: u32 = 0o170_000;
@@ -41,6 +41,14 @@ pub(super) const fn dev_path_for_rdev(rdev: u64) -> Option<&'static [u8]> {
         x if x == makedev(1, 7) => Some(b"/dev/full"),
         x if x == makedev(1, 8) => Some(b"/dev/random"),
         x if x == makedev(1, 9) => Some(b"/dev/urandom"),
+        x if x == makedev(4, 0) => Some(b"/dev/tty0"),
+        x if x == makedev(4, 1) => Some(b"/dev/tty1"),
+        x if x == makedev(4, 2) => Some(b"/dev/tty2"),
+        x if x == makedev(4, 3) => Some(b"/dev/tty3"),
+        x if x == makedev(4, 4) => Some(b"/dev/tty4"),
+        x if x == makedev(4, 5) => Some(b"/dev/tty5"),
+        x if x == makedev(4, 6) => Some(b"/dev/tty6"),
+        x if x == makedev(4, 7) => Some(b"/dev/tty7"),
         x if x == makedev(5, 0) => Some(b"/dev/tty"),
         x if x == makedev(5, 1) => Some(b"/dev/console"),
         x if x == makedev(5, 2) => Some(b"/dev/ptmx"),
@@ -48,6 +56,13 @@ pub(super) const fn dev_path_for_rdev(rdev: u64) -> Option<&'static [u8]> {
         x if x == makedev(1, 11) => Some(b"/dev/kmsg"),
         x if x == makedev(254, 0) => Some(b"/dev/vda"),
         x if x == makedev(254, 1) => Some(b"/dev/vda1"),
+        x if x == makedev(226, 0) => Some(b"/dev/dri/card0"),
+        x if x == makedev(29, 0) => Some(b"/dev/fb0"),
+        x if x == makedev(13, 64) => Some(b"/dev/input/event0"),
+        x if x == makedev(13, 65) => Some(b"/dev/input/event1"),
+        x if x == makedev(13, 66) => Some(b"/dev/input/event2"),
+        x if x == makedev(13, 67) => Some(b"/dev/input/event3"),
+        x if x == makedev(116, 16) => Some(b"/dev/snd/pcmC0D0p"),
         _ => None,
     }
 }
@@ -333,6 +348,14 @@ impl MemFs {
             (b"full", 1, 7, 0o666),
             (b"random", 1, 8, 0o666),
             (b"urandom", 1, 9, 0o666),
+            (b"tty0", 4, 0, 0o620),
+            (b"tty1", 4, 1, 0o620),
+            (b"tty2", 4, 2, 0o620),
+            (b"tty3", 4, 3, 0o620),
+            (b"tty4", 4, 4, 0o620),
+            (b"tty5", 4, 5, 0o620),
+            (b"tty6", 4, 6, 0o620),
+            (b"tty7", 4, 7, 0o620),
             (b"tty", 5, 0, 0o666),
             (b"console", 5, 1, 0o600),
             (b"ptmx", 5, 2, 0o666),
@@ -359,6 +382,85 @@ impl MemFs {
                 name,
                 MemNodeKind::BlkDev(rdev),
                 S_IFBLK | 0o660,
+                rdev,
+                b"",
+                now,
+            );
+        }
+        let fb_rdev = makedev(29, 0);
+        let _ = self.seed_node(
+            mount_id,
+            root_ino,
+            b"fb0",
+            MemNodeKind::ChrDev(fb_rdev),
+            S_IFCHR | 0o660,
+            fb_rdev,
+            b"",
+            now,
+        );
+        if let Some(dri_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"dri",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            let rdev = makedev(226, 0);
+            let _ = self.seed_node(
+                mount_id,
+                dri_ino,
+                b"card0",
+                MemNodeKind::ChrDev(rdev),
+                S_IFCHR | 0o660,
+                rdev,
+                b"",
+                now,
+            );
+        }
+        if let Some(inp_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"input",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            for (name, min) in [(&b"event0"[..], 64u32), (b"event1", 65)] {
+                let rdev = makedev(13, min);
+                let _ = self.seed_node(
+                    mount_id,
+                    inp_ino,
+                    name,
+                    MemNodeKind::ChrDev(rdev),
+                    S_IFCHR | 0o660,
+                    rdev,
+                    b"",
+                    now,
+                );
+            }
+        }
+        if let Some(snd_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"snd",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            let rdev = makedev(116, 16);
+            let _ = self.seed_node(
+                mount_id,
+                snd_ino,
+                b"pcmC0D0p",
+                MemNodeKind::ChrDev(rdev),
+                S_IFCHR | 0o660,
                 rdev,
                 b"",
                 now,

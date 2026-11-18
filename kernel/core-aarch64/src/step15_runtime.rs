@@ -26,10 +26,10 @@ use kernal_scheduler_smp::GlobalThreadId;
 pub const STEP15_RUNTIME_CAPS: usize = 32;
 pub const STEP15_RUNTIME_OBJECTS: usize = 128;
 pub const STEP15_RUNTIME_VMAS: usize = 256;
-pub const STEP15_RUNTIME_THREADS: usize = 16;
-/// Fixed process capacity for interactive Debian workloads and child pipelines. Sixteen concurrent
+pub const STEP15_RUNTIME_THREADS: usize = 32;
+/// Fixed process capacity for interactive Debian workloads and child pipelines. Twenty-four concurrent
 /// Process generations fit cleanly within the 128-object budget.
-pub const STEP15_RUNTIME_PROCESSES: usize = 16;
+pub const STEP15_RUNTIME_PROCESSES: usize = 24;
 const STEP15_RUNTIME_ADDITIONAL_PROCESSES: usize = STEP15_RUNTIME_PROCESSES - 1;
 pub const STEP15_RUNTIME_GROUPS: usize = STEP15_RUNTIME_PROCESSES;
 pub const STEP15_RUNTIME_SIGNAL_PENDING: usize = 64;

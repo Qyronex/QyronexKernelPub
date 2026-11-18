@@ -1078,8 +1078,16 @@ fn handle_bind(raw_fd: u64, user_addr: u64, addrlen: u64) -> Result<Result<i64, 
         Ok(a) => a,
         Err(e) => return Ok(Err(e)),
     };
+    let unix_path = match &addr {
+        SockAddr::Unix {
+            abstract_ns: false,
+            path,
+            len,
+        } if *len > 0 => Some(path[..*len].to_vec()),
+        _ => None,
+    };
     let process = current_process_object().unwrap_or(ObjectId(1));
-    with_net_full(|state| {
+    let res = with_net_full(|state| {
         state.check_slot(process, idx, alias_gen)?;
         let m = state.meta[idx];
         if let Some((ip, port)) = extract_ipv4(&addr, m.domain, m.ipv6_v6only) {
@@ -1140,7 +1148,18 @@ fn handle_bind(raw_fd: u64, user_addr: u64, addrlen: u64) -> Result<Result<i64, 
         let _ = state.table.set_peer_cred(idx, current_ucred());
         state.meta[idx].bound_local = state.table.getsockname(idx).ok();
         Ok(0)
-    })
+    })?;
+    if res.is_ok()
+        && let Some(sock_path) = unix_path
+    {
+        let _ = super::step33_mounts::try_mknod_virtual_abs(
+            process,
+            &sock_path,
+            u64::from(S_IFSOCK_MODE),
+            0,
+        );
+    }
+    Ok(res)
 }
 
 fn assign_netlink_portid(
@@ -1544,6 +1563,7 @@ fn send_payload_blocking(
     sender_cred: Option<Ucred>,
 ) -> Result<SyscallReturn, ()> {
     let process = current_process_object().unwrap_or(ObjectId(1));
+    super::step31_runtime::sync_shared_ipc_mmaps_for_current();
     let (idx, alias_gen) = match resolve_socket_target(raw_fd) {
         Ok(pair) => pair,
         Err(e) => return Ok(SyscallReturn::error(e)),
@@ -1864,7 +1884,12 @@ fn recv_payload_blocking(
         }
 
         match res {
-            Ok(tuple) => return Ok(Ok(tuple)),
+            Ok(tuple) => {
+                if !tuple.data.is_empty() || !tuple.handles.is_empty() {
+                    super::step31_runtime::refresh_shared_memfd_mmaps_for_current();
+                }
+                return Ok(Ok(tuple));
+            }
             Err(Errno::EAGAIN) if !is_nonblock => {
                 if let Some(tmo) = rcv_timeout_ns
                     && net_now_ns().saturating_sub(start_ns) >= tmo

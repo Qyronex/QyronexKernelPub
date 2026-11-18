@@ -939,8 +939,8 @@ pub fn enumerate_sysfs_dir(rel_dir: &[u8], emit: impl FnMut(&[u8], bool)) -> boo
         b"fs" => b"cgroup:D",
         b"dev" => b"block:D|char:D",
         b"dev/block" => b"254:0:R",
-        b"dev/char" => b"5:1:R|204:64:R",
-        b"devices" => b"system:D|virtio0:D|virtio1:D|platform:D",
+        b"dev/char" => b"5:1:R|204:64:R|226:0:R|29:0:R|13:64:R|13:65:R",
+        b"devices" => b"system:D|virtio0:D|virtio1:D|virtio2:D|virtio3:D|virtio4:D|platform:D",
         b"devices/system" => b"cpu:D",
         b"devices/system/cpu" => b"online:R|present:R",
         b"devices/virtio0" => b"block:D",
@@ -949,19 +949,57 @@ pub fn enumerate_sysfs_dir(rel_dir: &[u8], emit: impl FnMut(&[u8], bool)) -> boo
         b"devices/virtio1" => b"net:D",
         b"devices/virtio1/net" => b"eth0:D",
         b"devices/virtio1/net/eth0" => b"ifindex:R|address:R|operstate:R|uevent:R|subsystem:R",
+        b"devices/virtio2" => b"drm:D|graphics:D|uevent:R",
+        b"devices/virtio2/drm" => b"card0:D|card0-Virtual-1:D|version:R",
+        b"devices/virtio2/drm/card0" => b"dev:R|uevent:R|subsystem:R|device:R|card0-Virtual-1:D",
+        b"devices/virtio2/drm/card0-Virtual-1" | b"devices/virtio2/drm/card0/card0-Virtual-1" => {
+            b"status:R|enabled:R|modes:R"
+        }
+        b"devices/virtio2/graphics" => b"fb0:D",
+        b"devices/virtio2/graphics/fb0" => b"dev:R|uevent:R|name:R|subsystem:R",
+        b"devices/virtio3" => b"input:D",
+        b"devices/virtio3/input" => b"input0:D",
+        b"devices/virtio3/input/input0" => b"name:R|uevent:R|subsystem:R|event0:D|capabilities:D",
+        b"devices/virtio3/input/input0/capabilities" => b"ev:R|key:R|rel:R|abs:R",
+        b"devices/virtio3/input/input0/event0" => b"dev:R|uevent:R|subsystem:R|device:R",
+        b"devices/virtio4" => b"input:D",
+        b"devices/virtio4/input" => b"input1:D",
+        b"devices/virtio4/input/input1" => b"name:R|uevent:R|subsystem:R|event1:D|capabilities:D",
+        b"devices/virtio4/input/input1/capabilities" => b"ev:R|key:R|rel:R|abs:R",
+        b"devices/virtio4/input/input1/event1" => b"dev:R|uevent:R|subsystem:R|device:R",
         b"devices/platform" => b"pl011:D",
         b"devices/platform/pl011" => b"tty:D",
         b"devices/platform/pl011/tty" => b"ttyAMA0:D",
         b"devices/platform/pl011/tty/ttyAMA0" => b"dev:R|uevent:R|subsystem:R",
-        b"class" => b"tty:D|net:D|block:D",
-        b"class/tty" => b"console:D|ttyAMA0:D",
+        b"class" => b"tty:D|net:D|block:D|drm:D|graphics:D|input:D",
+        b"class/tty" => b"console:D|tty0:D|tty1:D|ttyAMA0:D",
         b"class/tty/console" => b"active:R|dev:R|uevent:R|subsystem:R",
+        b"class/tty/tty0" => b"active:R|dev:R|uevent:R|subsystem:R",
+        b"class/tty/tty1" => b"dev:R|uevent:R|subsystem:R",
         b"class/tty/ttyAMA0" => b"dev:R|uevent:R|subsystem:R",
         b"class/net" => b"lo:D|eth0:D",
         b"class/net/lo" => b"operstate:R|mtu:R|ifindex:R|uevent:R|subsystem:R",
         b"class/net/eth0" => b"ifindex:R|address:R|operstate:R|uevent:R|subsystem:R",
         b"class/block" => b"vda:D",
         b"class/block/vda" => b"dev:R|size:R|ro:R|uevent:R|subsystem:R",
+        b"class/drm" => b"card0:R|card0-Virtual-1:R|version:R",
+        b"class/drm/card0" => b"dev:R|uevent:R|subsystem:R|device:R|card0-Virtual-1:D",
+        b"class/drm/card0-Virtual-1" | b"class/drm/card0/card0-Virtual-1" => {
+            b"status:R|enabled:R|modes:R"
+        }
+        b"class/graphics" => b"fb0:R",
+        b"class/graphics/fb0" => b"dev:R|uevent:R|name:R|subsystem:R",
+        b"class/input" => b"input0:R|input1:R|event0:R|event1:R",
+        b"class/input/event0" | b"class/input/input0/event0" => {
+            b"dev:R|uevent:R|subsystem:R|device:R"
+        }
+        b"class/input/event1" | b"class/input/input1/event1" => {
+            b"dev:R|uevent:R|subsystem:R|device:R"
+        }
+        b"class/input/input0" => b"name:R|uevent:R|subsystem:R|event0:D|capabilities:D",
+        b"class/input/input0/capabilities" => b"ev:R|key:R|rel:R|abs:R",
+        b"class/input/input1" => b"name:R|uevent:R|subsystem:R|event1:D|capabilities:D",
+        b"class/input/input1/capabilities" => b"ev:R|key:R|rel:R|abs:R",
         _ => return false,
     };
     emit_sysfs_spec(spec, emit)
@@ -1080,11 +1118,75 @@ pub fn read_sysfs_node(
         b"class/tty/console/uevent" => {
             Some(copy_slice(out, b"MAJOR=5\nMINOR=1\nDEVNAME=console\n"))
         }
+        b"class/tty/tty0/active" => Some(copy_slice(out, b"tty1\n")),
+        b"class/tty/tty0/dev" => Some(copy_slice(out, b"4:0\n")),
+        b"class/tty/tty0/uevent" => Some(copy_slice(out, b"MAJOR=4\nMINOR=0\nDEVNAME=tty0\n")),
+        b"class/tty/tty1/dev" => Some(copy_slice(out, b"4:1\n")),
+        b"class/tty/tty1/uevent" => Some(copy_slice(out, b"MAJOR=4\nMINOR=1\nDEVNAME=tty1\n")),
         b"class/net/lo/operstate" => Some(copy_slice(out, b"unknown\n")),
         b"class/net/lo/mtu" => Some(copy_slice(out, b"65536\n")),
         b"class/net/lo/ifindex" => Some(copy_slice(out, b"1\n")),
         b"class/net/lo/uevent" => Some(copy_slice(out, b"INTERFACE=lo\nIFINDEX=1\n")),
         b"class/block/vda/ro" => Some(copy_slice(out, b"0\n")),
+        b"class/drm/version" | b"devices/virtio2/drm/version" => {
+            Some(copy_slice(out, b"drm 1.1.0 20060810\n"))
+        }
+        b"devices/virtio2/uevent" => Some(copy_slice(out, b"DRIVER=virtio_gpu\n")),
+        b"class/drm/card0-Virtual-1/status"
+        | b"class/drm/card0/card0-Virtual-1/status"
+        | b"devices/virtio2/drm/card0-Virtual-1/status"
+        | b"devices/virtio2/drm/card0/card0-Virtual-1/status" => {
+            Some(copy_slice(out, b"connected\n"))
+        }
+        b"class/drm/card0-Virtual-1/enabled"
+        | b"class/drm/card0/card0-Virtual-1/enabled"
+        | b"devices/virtio2/drm/card0-Virtual-1/enabled"
+        | b"devices/virtio2/drm/card0/card0-Virtual-1/enabled" => {
+            Some(copy_slice(out, b"enabled\n"))
+        }
+        b"class/drm/card0-Virtual-1/modes"
+        | b"class/drm/card0/card0-Virtual-1/modes"
+        | b"devices/virtio2/drm/card0-Virtual-1/modes"
+        | b"devices/virtio2/drm/card0/card0-Virtual-1/modes" => {
+            Some(copy_slice(out, b"1280x800\n"))
+        }
+        b"class/graphics/fb0/name" | b"devices/virtio2/graphics/fb0/name" => {
+            Some(copy_slice(out, b"virtiodrmfb\n"))
+        }
+        b"class/input/input0/name" | b"devices/virtio3/input/input0/name" => {
+            Some(copy_slice(out, b"QEMU Virtio Keyboard\n"))
+        }
+        b"class/input/input0/uevent" | b"devices/virtio3/input/input0/uevent" => Some(copy_slice(
+            out,
+            b"PRODUCT=6/627/1/100\nNAME=\"QEMU Virtio Keyboard\"\nEV=100003\nKEY=fffffffffffffffe\n",
+        )),
+        b"class/input/input0/capabilities/ev"
+        | b"devices/virtio3/input/input0/capabilities/ev" => Some(copy_slice(out, b"100003\n")),
+        b"class/input/input0/capabilities/key"
+        | b"devices/virtio3/input/input0/capabilities/key" => {
+            Some(copy_slice(out, b"fffffffffffffffe\n"))
+        }
+        b"class/input/input0/capabilities/rel"
+        | b"devices/virtio3/input/input0/capabilities/rel"
+        | b"class/input/input0/capabilities/abs"
+        | b"devices/virtio3/input/input0/capabilities/abs" => Some(copy_slice(out, b"0\n")),
+        b"class/input/input1/name" | b"devices/virtio4/input/input1/name" => {
+            Some(copy_slice(out, b"QEMU Virtio Tablet\n"))
+        }
+        b"class/input/input1/uevent" | b"devices/virtio4/input/input1/uevent" => Some(copy_slice(
+            out,
+            b"PRODUCT=6/627/2/100\nNAME=\"QEMU Virtio Tablet\"\nEV=b\nKEY=70000 0 0 0 0\nABS=3\n",
+        )),
+        b"class/input/input1/capabilities/ev"
+        | b"devices/virtio4/input/input1/capabilities/ev" => Some(copy_slice(out, b"b\n")),
+        b"class/input/input1/capabilities/key"
+        | b"devices/virtio4/input/input1/capabilities/key" => {
+            Some(copy_slice(out, b"70000 0 0 0 0\n"))
+        }
+        b"class/input/input1/capabilities/abs"
+        | b"devices/virtio4/input/input1/capabilities/abs" => Some(copy_slice(out, b"3\n")),
+        b"class/input/input1/capabilities/rel"
+        | b"devices/virtio4/input/input1/capabilities/rel" => Some(copy_slice(out, b"0\n")),
         _ => None,
     }
 }

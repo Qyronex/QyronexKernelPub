@@ -19,6 +19,9 @@ pub enum DeviceSubsystem {
     Block,
     Net,
     Tty,
+    Drm,
+    Graphics,
+    Input,
 }
 
 impl DeviceSubsystem {
@@ -27,6 +30,9 @@ impl DeviceSubsystem {
             Self::Block => b"block",
             Self::Net => b"net",
             Self::Tty => b"tty",
+            Self::Drm => b"drm",
+            Self::Graphics => b"graphics",
+            Self::Input => b"input",
         }
     }
 }
@@ -158,6 +164,42 @@ impl<const MAX_DEVS: usize> UdevDeviceRegistry<MAX_DEVS> {
             0,
             0,
         )?;
+        let _ = self.register_device(
+            DeviceSubsystem::Drm,
+            b"dri/card0",
+            b"/devices/virtio2/drm/card0",
+            226,
+            0,
+            0,
+            0,
+        );
+        let _ = self.register_device(
+            DeviceSubsystem::Graphics,
+            b"fb0",
+            b"/devices/virtio2/graphics/fb0",
+            29,
+            0,
+            0,
+            0,
+        );
+        let _ = self.register_device(
+            DeviceSubsystem::Input,
+            b"input/event0",
+            b"/devices/virtio3/input/input0/event0",
+            13,
+            64,
+            0,
+            0,
+        );
+        let _ = self.register_device(
+            DeviceSubsystem::Input,
+            b"input/event1",
+            b"/devices/virtio4/input/input1/event1",
+            13,
+            65,
+            0,
+            0,
+        );
         Ok(())
     }
 
@@ -314,6 +356,9 @@ impl<const MAX_DEVS: usize> UdevDeviceRegistry<MAX_DEVS> {
         if dev.subsystem != DeviceSubsystem::Net {
             cursor += push_bytes(out, cursor, b"\0DEVNAME=");
             cursor += push_bytes(out, cursor, dev.name());
+            if dev.subsystem == DeviceSubsystem::Drm {
+                cursor += push_bytes(out, cursor, b"\0DEVTYPE=drm_minor");
+            }
             cursor += push_bytes(out, cursor, b"\0MAJOR=");
             cursor += push_u64(out, cursor, u64::from(dev.major));
             cursor += push_bytes(out, cursor, b"\0MINOR=");
@@ -385,6 +430,40 @@ impl<const MAX_DEVS: usize> UdevDeviceRegistry<MAX_DEVS> {
                     b"MAJOR=204\nMINOR=64\nDEVNAME=ttyAMA0\n",
                 ))
             }
+            b"class/drm/card0/dev" | b"devices/virtio2/drm/card0/dev" => {
+                Ok(push_bytes(out, 0, b"226:0\n"))
+            }
+            b"class/drm/card0/uevent" | b"devices/virtio2/drm/card0/uevent" => Ok(push_bytes(
+                out,
+                0,
+                b"MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n",
+            )),
+            b"class/graphics/fb0/dev" | b"devices/virtio2/graphics/fb0/dev" => {
+                Ok(push_bytes(out, 0, b"29:0\n"))
+            }
+            b"class/graphics/fb0/uevent" | b"devices/virtio2/graphics/fb0/uevent" => {
+                Ok(push_bytes(out, 0, b"MAJOR=29\nMINOR=0\nDEVNAME=fb0\n"))
+            }
+            b"class/input/event0/dev"
+            | b"class/input/input0/event0/dev"
+            | b"devices/virtio3/input/input0/event0/dev" => Ok(push_bytes(out, 0, b"13:64\n")),
+            b"class/input/event0/uevent"
+            | b"class/input/input0/event0/uevent"
+            | b"devices/virtio3/input/input0/event0/uevent" => Ok(push_bytes(
+                out,
+                0,
+                b"MAJOR=13\nMINOR=64\nDEVNAME=input/event0\n",
+            )),
+            b"class/input/event1/dev"
+            | b"class/input/input1/event1/dev"
+            | b"devices/virtio4/input/input1/event1/dev" => Ok(push_bytes(out, 0, b"13:65\n")),
+            b"class/input/event1/uevent"
+            | b"class/input/input1/event1/uevent"
+            | b"devices/virtio4/input/input1/event1/uevent" => Ok(push_bytes(
+                out,
+                0,
+                b"MAJOR=13\nMINOR=65\nDEVNAME=input/event1\n",
+            )),
             b"kernel/uevent_seqnum" => {
                 let mut pos = push_u64(out, 0, self.seqnum);
                 pos += push_bytes(out, pos, b"\n");

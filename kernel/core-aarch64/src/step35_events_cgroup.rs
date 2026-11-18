@@ -30,7 +30,8 @@ use super::step_fd_util::{
 /// partitioned cleanly above `PROC_SYS_FD_BASE` (`416..672`).
 pub(super) const EVENT_FD_BASE: i32 = 672;
 const MAX_EVENT_FDS: usize = 64;
-const MEMFD_CAP: usize = 32768;
+const MEMFD_CAP: usize = 16 * 1024 * 1024;
+const MAX_EVENT_IO_CHUNK: usize = 65536;
 const MAX_CGROUPS: usize = 64;
 const ARM64_STAT_BYTES: usize = 128;
 const S_IFREG_MODE: u32 = 0o100_600;
@@ -1026,6 +1027,7 @@ fn poll_wait_step(
 ) -> Result<WaitTick, ()> {
     super::step32_dev::poll_console_rx_and_deliver_signals();
     super::step34_net::pump_hardware_net();
+    super::step43_desktop::poll_hardware_input_into_rings();
     if super::step30_runtime::check_pending_signal_during_wait(frame.as_deref_mut())? {
         if let (Some(prev), Some(frame_ref)) = (old_sigmask, frame.as_deref_mut()) {
             let saved_pc = frame_ref.elr_el1;
@@ -1074,6 +1076,9 @@ fn probe_external_fd_readiness(process: ObjectId, raw_fd: u64) -> Result<u32, Er
         return res;
     }
     if let Some(res) = super::step33_ext4_vfs::probe_ext4_fd_readiness(process, raw_fd) {
+        return res;
+    }
+    if let Some(res) = super::step43_desktop::probe_desktop_fd_readiness(process, raw_fd) {
         return res;
     }
 
@@ -2086,7 +2091,9 @@ fn handle_read(
         Ok(pair) => pair,
         Err(e) => return Ok(BlockingCallResult::Err(e)),
     };
-    let take = usize::try_from(count).unwrap_or(MEMFD_CAP).min(MEMFD_CAP);
+    let take = usize::try_from(count)
+        .unwrap_or(MAX_EVENT_IO_CHUNK)
+        .min(MAX_EVENT_IO_CHUNK);
     if take == 0 {
         return Ok(BlockingCallResult::Value(0));
     }
@@ -2131,7 +2138,9 @@ fn handle_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Er
         Ok(pair) => pair,
         Err(e) => return Ok(Err(e)),
     };
-    let take = usize::try_from(count).unwrap_or(MEMFD_CAP).min(MEMFD_CAP);
+    let take = usize::try_from(count)
+        .unwrap_or(MAX_EVENT_IO_CHUNK)
+        .min(MAX_EVENT_IO_CHUNK);
     if take == 0 {
         return Ok(Ok(0));
     }
@@ -2182,7 +2191,7 @@ pub(super) fn try_read_memfd_for_mmap(
     process: ObjectId,
     raw_fd: u64,
     require_writable: bool,
-) -> Result<Option<(alloc::vec::Vec<u8>, usize, u64)>, Errno> {
+) -> Result<Option<(alloc::vec::Vec<u8>, usize, u64, u64)>, Errno> {
     let is_ev = is_event_fd(raw_fd)
         || lookup_aliased_subsystem(process, raw_fd).is_some_and(|h| h.kind == SUBSYS_EVENT);
     if !is_ev {
@@ -2199,8 +2208,9 @@ pub(super) fn try_read_memfd_for_mmap(
         {
             return Err(Errno::EPERM);
         }
+        let rev = state.events.memfd_rev(idx)?;
         let gen_id = state.meta[idx].generation;
-        Ok((slice.to_vec(), idx, gen_id))
+        Ok((slice.to_vec(), idx, gen_id, rev))
     })
     .map_err(|()| Errno::EIO)?;
     res.map(Some)
@@ -2221,6 +2231,50 @@ pub(super) fn write_back_memfd_mmap(
             let _ = state.events.memfd_write_at(idx, file_offset, data);
         }
     });
+}
+
+pub(super) fn read_memfd_if_changed(
+    idx: usize,
+    expected_gen: u64,
+    last_rev: u64,
+) -> Option<(alloc::vec::Vec<u8>, u64)> {
+    with_step35_state(|state| {
+        if !state
+            .meta
+            .get(idx)
+            .is_some_and(|m| m.live && m.generation == expected_gen)
+        {
+            return None;
+        }
+        let cur_rev = state.events.memfd_rev(idx).ok()?;
+        if cur_rev == last_rev {
+            return None;
+        }
+        let (slice, _) = state.events.memfd_snapshot(idx).ok()?;
+        Some((slice.to_vec(), cur_rev))
+    })
+    .ok()
+    .flatten()
+}
+
+pub(super) fn read_memfd_for_mremap(
+    idx: usize,
+    expected_gen: u64,
+) -> Option<(alloc::vec::Vec<u8>, u64)> {
+    with_step35_state(|state| {
+        if !state
+            .meta
+            .get(idx)
+            .is_some_and(|m| m.live && m.generation == expected_gen)
+        {
+            return None;
+        }
+        let cur_rev = state.events.memfd_rev(idx).ok()?;
+        let (slice, _) = state.events.memfd_snapshot(idx).ok()?;
+        Some((slice.to_vec(), cur_rev))
+    })
+    .ok()
+    .flatten()
 }
 
 pub(super) fn open_pidfd_for_process(process: ObjectId, pid: u32) -> Result<i32, Errno> {

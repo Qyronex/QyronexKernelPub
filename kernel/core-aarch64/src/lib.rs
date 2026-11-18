@@ -43,7 +43,7 @@ mod clone_stack {
         Error as InitialUserContextError, PreparedInitialUserContext, prepare_initial_user_context,
     };
 
-    pub const CLONE_STACK_CAPACITY: usize = 16;
+    pub const CLONE_STACK_CAPACITY: usize = 32;
 
     const POOL_EMPTY: u8 = 0;
     const POOL_INITIALIZING: u8 = 1;
