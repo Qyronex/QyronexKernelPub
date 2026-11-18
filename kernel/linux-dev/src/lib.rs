@@ -108,6 +108,8 @@ pub enum DeviceNodeKind {
     Tty,
     /// `/dev/console` (`5:1`)
     Console,
+    /// `/dev/ttyAMA0` (`204:64`, PL011 UART serial console)
+    TtyAma0,
     /// `/dev/ptmx` (`5:2`, PTY multiplexor)
     Ptmx,
     /// `/dev/pts/<N>` (`136:<N>`, PTY slave)
@@ -125,6 +127,7 @@ impl DeviceNodeKind {
             Self::Urandom => (1, 9),
             Self::Tty => (5, 0),
             Self::Console => (5, 1),
+            Self::TtyAma0 => (204, 64),
             Self::Ptmx => (5, 2),
             Self::Pts(index) => (136, index),
         }
@@ -176,7 +179,8 @@ fn classify_dev_subpath(subpath: &[u8]) -> Option<DeviceNodeKind> {
         b"random" => Some(DeviceNodeKind::Random),
         b"urandom" => Some(DeviceNodeKind::Urandom),
         b"tty" => Some(DeviceNodeKind::Tty),
-        b"console" | b"ttyAMA0" => Some(DeviceNodeKind::Console),
+        b"console" => Some(DeviceNodeKind::Console),
+        b"ttyAMA0" => Some(DeviceNodeKind::TtyAma0),
         b"ptmx" | b"pts/ptmx" => Some(DeviceNodeKind::Ptmx),
         _ => {
             let digits = subpath.strip_prefix(b"pts/")?;
@@ -224,6 +228,7 @@ pub const fn poll_pseudo_device_readable(
         }
         DeviceNodeKind::Tty
         | DeviceNodeKind::Console
+        | DeviceNodeKind::TtyAma0
         | DeviceNodeKind::Ptmx
         | DeviceNodeKind::Pts(_) => None,
     }
@@ -272,6 +277,7 @@ where
         }
         DeviceNodeKind::Tty
         | DeviceNodeKind::Console
+        | DeviceNodeKind::TtyAma0
         | DeviceNodeKind::Ptmx
         | DeviceNodeKind::Pts(_) => Err(Error::InvalidArgument),
     }
@@ -290,6 +296,7 @@ pub const fn write_pseudo_device(node: DeviceNodeKind, src: &[u8]) -> Result<usi
         DeviceNodeKind::Full => Err(Error::NoSpace),
         DeviceNodeKind::Tty
         | DeviceNodeKind::Console
+        | DeviceNodeKind::TtyAma0
         | DeviceNodeKind::Ptmx
         | DeviceNodeKind::Pts(_) => Err(Error::InvalidArgument),
     }
@@ -444,6 +451,18 @@ impl TtySessionState {
         caller_sid: NonZeroU32,
         caller_pgid: NonZeroU32,
     ) -> Result<(), Error> {
+        self.attach_controlling_session_with_force(caller_pid, caller_sid, caller_pgid, false)
+    }
+
+    /// Implements `TIOCSCTTY` (`0x540e`) with explicit `force` (`arg == 1`), detaching any prior
+    /// controlling session when `force` is true (Linux `tiocsctty` `CAP_SYS_ADMIN` semantics).
+    pub fn attach_controlling_session_with_force(
+        &mut self,
+        caller_pid: NonZeroU32,
+        caller_sid: NonZeroU32,
+        caller_pgid: NonZeroU32,
+        force: bool,
+    ) -> Result<(), Error> {
         if caller_pid != caller_sid {
             return Err(Error::OperationNotPermitted);
         }
@@ -451,11 +470,31 @@ impl TtySessionState {
             if existing == caller_sid {
                 return Ok(());
             }
-            return Err(Error::OperationNotPermitted);
+            if !force {
+                return Err(Error::OperationNotPermitted);
+            }
         }
         self.controlling_session = Some(caller_sid);
         self.foreground_pgid = Some(caller_pgid);
         Ok(())
+    }
+
+    /// Implements `TIOCNOTTY` (`0x5422`): detaches the calling session from this TTY.
+    pub fn detach_controlling_session(&mut self, caller_sid: NonZeroU32) -> Result<(), Error> {
+        if self.controlling_session != Some(caller_sid) {
+            return Err(Error::NotControllingTty);
+        }
+        self.controlling_session = None;
+        self.foreground_pgid = None;
+        Ok(())
+    }
+
+    /// Releases the pre-attached PID 1 session marker when PID 1 execs a real `/sbin/init`.
+    pub fn clear_pid1_controlling_session(&mut self) {
+        if self.controlling_session == Some(NonZeroU32::MIN) {
+            self.controlling_session = None;
+            self.foreground_pgid = None;
+        }
     }
 
     /// Implements `TIOCGPGRP` (`0x540f`).
@@ -1205,7 +1244,7 @@ mod tests {
         );
         assert_eq!(
             classify_dev_path(b"/dev/ttyAMA0"),
-            Some(DeviceNodeKind::Console)
+            Some(DeviceNodeKind::TtyAma0)
         );
         assert_eq!(classify_dev_path(b"/dev/ptmx"), Some(DeviceNodeKind::Ptmx));
         assert_eq!(
@@ -1226,6 +1265,7 @@ mod tests {
         assert_eq!(DeviceNodeKind::Urandom.major_minor(), (1, 9));
         assert_eq!(DeviceNodeKind::Tty.major_minor(), (5, 0));
         assert_eq!(DeviceNodeKind::Console.major_minor(), (5, 1));
+        assert_eq!(DeviceNodeKind::TtyAma0.major_minor(), (204, 64));
         assert_eq!(DeviceNodeKind::Ptmx.major_minor(), (5, 2));
         assert_eq!(DeviceNodeKind::Pts(3).major_minor(), (136, 3));
 
@@ -1471,5 +1511,38 @@ mod tests {
             Ok(u32::from(POLLIN | POLLHUP))
         );
         ptys.close_slave(slave2).unwrap();
+    }
+
+    #[test]
+    fn tty_session_supports_tiocsctty_force_tiocnotty_and_clear_pid1() {
+        let sid1 = NonZeroU32::new(1).unwrap();
+        let sid42 = NonZeroU32::new(42).unwrap();
+        let mut sess = TtySessionState::with_session(sid1, sid1);
+
+        assert_eq!(
+            sess.attach_controlling_session_with_force(sid42, sid42, sid42, false),
+            Err(Error::OperationNotPermitted)
+        );
+        sess.clear_pid1_controlling_session();
+        assert_eq!(sess.controlling_session(), None);
+
+        sess.attach_controlling_session_with_force(sid42, sid42, sid42, false)
+            .unwrap();
+        assert_eq!(sess.controlling_session(), Some(sid42));
+
+        let sid99 = NonZeroU32::new(99).unwrap();
+        assert_eq!(
+            sess.attach_controlling_session_with_force(sid99, sid99, sid99, true),
+            Ok(())
+        );
+        assert_eq!(sess.controlling_session(), Some(sid99));
+
+        assert_eq!(
+            sess.detach_controlling_session(sid42),
+            Err(Error::NotControllingTty)
+        );
+        sess.detach_controlling_session(sid99).unwrap();
+        assert_eq!(sess.controlling_session(), None);
+        assert_eq!(sess.foreground_pgid(), None);
     }
 }

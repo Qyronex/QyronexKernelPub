@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -14,7 +15,8 @@ use kernal_linux_abi::{
 use kernal_linux_fd::SubsystemHandle;
 use kernal_linux_mounts::{
     BlockDevice, Ext4DurableJournal, Ext4StatFsInfo, Ext4Volume, FilesystemType, MAX_MOUNT_PATH,
-    MS_BIND, MS_MOVE, MS_RDONLY, MS_REMOUNT, MountTable, ProcPidSelector, ProcProcessInfo,
+    MS_BIND, MS_MOVE, MS_NODEV, MS_NOEXEC, MS_NOSUID, MS_PROPAGATION_MASK, MS_RDONLY, MS_REC,
+    MS_REMOUNT, MS_SLAVE, MS_UNBINDABLE, MountEntry, MountTable, ProcPidSelector, ProcProcessInfo,
     ProcSysSnapshot, UMOUNT_NOFOLLOW, enumerate_sysfs_dir, parse_proc_pid_subpath,
     read_procfs_node, read_procfs_process_node, read_sysfs_node,
 };
@@ -29,15 +31,18 @@ use super::step_fd_util::{
 };
 use super::step33_memfs::{MemFs, MemNodeKind, MemStat};
 
-/// Dedicated file-descriptor base for Step-33 virtual mounts and filesystems (`416..480`),
+/// Dedicated file-descriptor base for Step-33 virtual mounts and filesystems (`416..672`),
 /// partitioned cleanly above `EXT4_FD_BASE` (`288..416`).
 pub(super) const PROC_SYS_FD_BASE: i32 = 416;
-const MAX_PROC_SYS_FDS: usize = 64;
-const MAX_MOUNTS: usize = 64;
+const MAX_PROC_SYS_FDS: usize = 256;
+const MAX_MOUNTS: usize = 128;
+const INIT_MNT_NS_ID: u32 = 0xf000_0001;
 pub(super) const MAX_EXT4_MOUNTS: usize = 4;
 const MAX_JOURNAL_ENTRIES: usize = 16;
 const MAX_JOURNAL_DATA: usize = 256;
-const MAX_VIRTUAL_NODE_BYTES: usize = 4096;
+// `/proc/self/mountinfo` with the full systemd mount set (cgroup2, credentials, run-lock, tmp,
+// ...) exceeds 4 KiB, and truncation hides the newest mounts from `libmount` observers.
+const MAX_VIRTUAL_NODE_BYTES: usize = 16384;
 const MAX_HOSTNAME_BYTES: usize = 64;
 const ARM64_STATFS_BYTES: usize = 120;
 const S_IFREG_RO_MODE: u32 = 0o100_444;
@@ -88,6 +93,7 @@ pub(super) struct ProcSysFdEntry {
     alias_refs: usize,
     owners: DirectProcessRefs<{ super::step29_runtime::STEP29_RUNTIME_PROCESS_VIEWS }>,
     mount_id: u32,
+    mnt_ns_id: u32,
     fstype: FilesystemType,
     mem_ino: u64,
     readable: bool,
@@ -100,6 +106,7 @@ pub(super) struct ProcSysFdEntry {
     content: Vec<u8>,
     dir_entries: Vec<VirtualDirEntry>,
     last_mount_gen: u64,
+    last_poll_gen: u64,
 }
 
 impl ProcSysFdEntry {
@@ -110,6 +117,7 @@ impl ProcSysFdEntry {
         alias_refs: 0,
         owners: DirectProcessRefs::empty(),
         mount_id: 0,
+        mnt_ns_id: INIT_MNT_NS_ID,
         fstype: FilesystemType::Procfs,
         mem_ino: 0,
         readable: false,
@@ -122,6 +130,7 @@ impl ProcSysFdEntry {
         content: Vec::new(),
         dir_entries: Vec::new(),
         last_mount_gen: 0,
+        last_poll_gen: 0,
     };
 }
 
@@ -155,12 +164,66 @@ impl Ext4MountSlot {
 
 static HAS_LIVE_EXT4_MOUNTS: AtomicBool = AtomicBool::new(false);
 
+#[derive(Clone, Copy)]
+struct BindMountMeta {
+    live: bool,
+    mount_id: u32,
+    backing_mount_id: u32,
+    backing_ext4_id: u32,
+    bind_root_ino: u64,
+    bind_prefix: [u8; MAX_MOUNT_PATH],
+    bind_prefix_len: usize,
+}
+
+impl BindMountMeta {
+    const EMPTY: Self = Self {
+        live: false,
+        mount_id: 0,
+        backing_mount_id: 0,
+        backing_ext4_id: 0,
+        bind_root_ino: 0,
+        bind_prefix: [0u8; MAX_MOUNT_PATH],
+        bind_prefix_len: 0,
+    };
+
+    fn bind_prefix(&self) -> &[u8] {
+        &self.bind_prefix[..self.bind_prefix_len]
+    }
+}
+
+struct MountNsSlot {
+    mnt_ns_id: u32,
+    mounts_gen: u64,
+    mounts: MountTable<MAX_MOUNTS>,
+    bind_meta: [BindMountMeta; MAX_MOUNTS],
+}
+
+fn find_bind_meta(meta: &[BindMountMeta; MAX_MOUNTS], mount_id: u32) -> Option<&BindMountMeta> {
+    meta.iter().find(|m| m.live && m.mount_id == mount_id)
+}
+
+fn upsert_bind_meta(meta: &mut [BindMountMeta; MAX_MOUNTS], item: BindMountMeta) {
+    if let Some(slot) = meta
+        .iter_mut()
+        .find(|m| m.live && m.mount_id == item.mount_id)
+    {
+        *slot = item;
+        return;
+    }
+    if let Some(slot) = meta.iter_mut().find(|m| !m.live) {
+        *slot = item;
+    }
+}
+
 struct Step33MountState {
     initialized: bool,
     next_generation: u64,
     mounts_gen: u64,
+    next_global_mount_id: u32,
     next_ext4_mount_id: u32,
     mounts: MountTable<MAX_MOUNTS>,
+    bind_meta: [BindMountMeta; MAX_MOUNTS],
+    child_ns_mounts: Vec<Box<MountNsSlot>>,
     ext4_mounts: [Ext4MountSlot; MAX_EXT4_MOUNTS],
     initramfs_prefix: [u8; MAX_MOUNT_PATH],
     initramfs_prefix_len: usize,
@@ -189,8 +252,11 @@ impl Step33MountState {
             initialized: false,
             next_generation: 1,
             mounts_gen: 1,
+            next_global_mount_id: 1,
             next_ext4_mount_id: 1,
             mounts: MountTable::new(),
+            bind_meta: [const { BindMountMeta::EMPTY }; MAX_MOUNTS],
+            child_ns_mounts: Vec::new(),
             ext4_mounts: [const { Ext4MountSlot::EMPTY }; MAX_EXT4_MOUNTS],
             initramfs_prefix,
             initramfs_prefix_len: 1,
@@ -207,8 +273,62 @@ impl Step33MountState {
         }
     }
 
-    fn bump_mounts_gen(&mut self) {
-        self.mounts_gen = self.mounts_gen.wrapping_add(1).max(1);
+    fn ns_view(
+        &self,
+        mnt_ns_id: u32,
+    ) -> (&MountTable<MAX_MOUNTS>, &[BindMountMeta; MAX_MOUNTS], u64) {
+        if mnt_ns_id != INIT_MNT_NS_ID
+            && let Some(slot) = self
+                .child_ns_mounts
+                .iter()
+                .find(|s| s.mnt_ns_id == mnt_ns_id)
+        {
+            return (&slot.mounts, &slot.bind_meta, slot.mounts_gen);
+        }
+        (&self.mounts, &self.bind_meta, self.mounts_gen)
+    }
+
+    fn ns_mounts_gen(&self, mnt_ns_id: u32) -> u64 {
+        self.ns_view(mnt_ns_id).2
+    }
+
+    fn ns_view_mut(
+        &mut self,
+        mnt_ns_id: u32,
+    ) -> (
+        &mut MountTable<MAX_MOUNTS>,
+        &mut [BindMountMeta; MAX_MOUNTS],
+        &mut u64,
+    ) {
+        if mnt_ns_id != INIT_MNT_NS_ID {
+            if let Some(pos) = self
+                .child_ns_mounts
+                .iter()
+                .position(|s| s.mnt_ns_id == mnt_ns_id)
+            {
+                let slot = &mut self.child_ns_mounts[pos];
+                return (&mut slot.mounts, &mut slot.bind_meta, &mut slot.mounts_gen);
+            }
+        }
+        (&mut self.mounts, &mut self.bind_meta, &mut self.mounts_gen)
+    }
+
+    fn bump_ns_mounts_gen(&mut self, mnt_ns_id: u32) {
+        let (_, _, gen_ref) = self.ns_view_mut(mnt_ns_id);
+        *gen_ref = gen_ref.wrapping_add(1).max(1);
+    }
+
+    fn sync_next_mount_id_before(&mut self, mnt_ns_id: u32) {
+        let next = self.next_global_mount_id;
+        let (mounts, _, _) = self.ns_view_mut(mnt_ns_id);
+        mounts.set_next_mount_id(next);
+    }
+
+    fn sync_next_mount_id_after(&mut self, mnt_ns_id: u32) {
+        let after = self.ns_view(mnt_ns_id).0.next_mount_id();
+        if after > self.next_global_mount_id {
+            self.next_global_mount_id = after;
+        }
     }
 
     fn refresh_live_ext4_flag(&self) {
@@ -220,6 +340,9 @@ impl Step33MountState {
         let now = current_epoch_now_secs();
         let memfs = &mut self.memfs;
         self.mounts.for_each_live(|mnt| {
+            if (mnt.flags() & MS_BIND) != 0 {
+                return;
+            }
             let perm = override_perm
                 .filter(|(id, _)| *id == mnt.mount_id())
                 .map(|(_, p)| p);
@@ -239,6 +362,7 @@ impl Step33MountState {
         }
         self.try_auto_mount_boot_root();
         self.sync_memfs_mounts(None);
+        self.next_global_mount_id = self.next_global_mount_id.max(self.mounts.next_mount_id());
     }
 
     fn try_auto_mount_boot_root(&mut self) {
@@ -264,8 +388,14 @@ impl Step33MountState {
             return;
         };
         let flags = if req_ro { MS_RDONLY } else { 0 };
-        if mount_ext4_slot(self, source, b"/", flags).is_ok() {
-            let _ = self.mounts.mount(source, b"/", Some(b"ext4"), flags);
+        if let Ok(ext4_id) = mount_ext4_slot(self, source, b"/", flags) {
+            if let Ok(tbl_id) = self.mounts.mount(source, b"/", Some(b"ext4"), flags) {
+                let mut meta = BindMountMeta::EMPTY;
+                meta.live = true;
+                meta.mount_id = tbl_id;
+                meta.backing_ext4_id = ext4_id;
+                upsert_bind_meta(&mut self.bind_meta, meta);
+            }
             self.initramfs_unmounted = true;
         }
     }
@@ -414,9 +544,10 @@ pub(super) fn probe_proc_sys_readiness(
                 && !entry.is_dir
                 && entry.mem_ino == 0
                 && is_live_mountinfo_proc_path(&entry.rel_path)
-                && entry.last_mount_gen != state.mounts_gen
             {
-                mask |= u32::from(POLLPRI) | u32::from(POLLERR);
+                if entry.last_poll_gen != state.mounts_gen {
+                    mask |= u32::from(POLLPRI) | u32::from(POLLERR);
+                }
             }
             Ok(mask)
         })
@@ -425,13 +556,13 @@ pub(super) fn probe_proc_sys_readiness(
     Some(res)
 }
 
-/// Consumes a pending `POLLPRI` change notification on an open `/proc/*/mountinfo` or
-/// `/proc/mounts` descriptor once `epoll`/`poll` has delivered the event to userspace.
-pub(super) fn ack_mountinfo_poll_change(process: ObjectId, raw_fd: u64) {
+/// Consumes a pending `POLLPRI`/`POLLERR` change notification on an open `/proc/*/mountinfo`
+/// or `/proc/mounts` descriptor once `epoll`/`poll` has delivered the event to userspace.
+pub(super) fn ack_mountinfo_poll_change(process: ObjectId, raw_fd: u64) -> bool {
     let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(process, raw_fd) else {
-        return;
+        return false;
     };
-    let _ = with_mount_state(|state| {
+    with_mount_state(|state| {
         let cur_gen = state.mounts_gen;
         if let Some(entry) = resolve_proc_sys_entry_mut(state, process, idx, alias_gen)
             && entry.fstype == FilesystemType::Procfs
@@ -439,9 +570,12 @@ pub(super) fn ack_mountinfo_poll_change(process: ObjectId, raw_fd: u64) {
             && entry.mem_ino == 0
             && is_live_mountinfo_proc_path(&entry.rel_path)
         {
-            entry.last_mount_gen = cur_gen;
+            entry.last_poll_gen = cur_gen;
+            return true;
         }
-    });
+        false
+    })
+    .unwrap_or(false)
 }
 
 pub(super) fn try_read_proc_sys_fd_for_mmap(
@@ -586,19 +720,19 @@ fn is_aliased_proc_sys_fd(raw_fd: u64) -> bool {
     lookup_aliased_subsystem_current(raw_fd).is_some_and(|h| h.kind == SUBSYS_PROC_SYS)
 }
 
-pub(super) fn retain_alias_handle(
-    process: ObjectId,
-    raw_fd: u64,
+fn retain_mount_slot(
+    idx: usize,
+    owner: Option<ObjectId>,
+    expected_gen: Option<u64>,
 ) -> Result<(SubsystemHandle, u64), Errno> {
-    if !is_proc_sys_fd(raw_fd) {
-        return Err(Errno::EBADF);
-    }
-    let idx = (linux_signed_int(raw_fd) - PROC_SYS_FD_BASE) as usize;
     with_mount_state(|state| {
         let Some(entry) = state.fds.get_mut(idx) else {
             return Err(Errno::EBADF);
         };
-        if !entry.live || !entry.owners.has_owner(process) {
+        let valid = entry.live
+            && owner.map_or(true, |p| entry.owners.has_owner(p))
+            && expected_gen.map_or(true, |g| entry.generation == g);
+        if !valid {
             return Err(Errno::EBADF);
         }
         entry.alias_refs += 1;
@@ -613,6 +747,26 @@ pub(super) fn retain_alias_handle(
         ))
     })
     .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn retain_alias_handle(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if !is_proc_sys_fd(raw_fd) {
+        return Err(Errno::EBADF);
+    }
+    let idx = (linux_signed_int(raw_fd) - PROC_SYS_FD_BASE) as usize;
+    retain_mount_slot(idx, Some(process), None)
+}
+
+pub(super) fn retain_existing_handle(
+    handle: SubsystemHandle,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if handle.kind != SUBSYS_PROC_SYS {
+        return Err(Errno::EBADF);
+    }
+    retain_mount_slot(handle.slot as usize, None, Some(handle.generation))
 }
 
 pub(super) fn release_alias_handle(handle: SubsystemHandle) {
@@ -794,6 +948,13 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
         46 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_ftruncate(
             request.args[0],
             request.args[1] as i64,
+        )?))),
+        // fallocate(fd, mode, offset, len)
+        47 if owns_fd(request.args[0]) => Ok(Some(encode_result(handle_fallocate(
+            request.args[0],
+            request.args[1],
+            request.args[2] as i64,
+            request.args[3] as i64,
         )?))),
         // faccessat(dirfd, pathname, mode)
         48 => handle_faccessat_if_proc_or_sys(request.args[0], request.args[1], request.args[2], 0),
@@ -997,6 +1158,7 @@ struct CallerSnapshotData {
     sid: u32,
     uid: u32,
     gid: u32,
+    mnt_ns_id: u32,
     comm: [u8; 16],
     comm_len: usize,
     total_pages: u64,
@@ -1015,6 +1177,9 @@ impl CallerSnapshotData {
         let mut comm = [0u8; 16];
         comm[..4].copy_from_slice(b"init");
         let mut comm_len = 4usize;
+        let mnt_ns_id = current_process_id()
+            .map(super::step41_container::process_mnt_ns_id)
+            .unwrap_or(INIT_MNT_NS_ID);
 
         if let Some(current) = current_scheduler_thread() {
             let _ = super::runtime::with_linux_runtime(|state| {
@@ -1046,6 +1211,7 @@ impl CallerSnapshotData {
             sid,
             uid,
             gid,
+            mnt_ns_id,
             comm,
             comm_len,
             total_pages,
@@ -1070,7 +1236,7 @@ impl CallerSnapshotData {
             total_pages: self.total_pages,
             free_pages: self.free_pages,
             uptime_seconds: self.uptime_seconds,
-            online_cpus: super::super::MAX_PROOF_CPUS as u32,
+            online_cpus: u32::from(super::super::online_cpu_count()),
             hostname,
             boot_id_seed,
         }
@@ -1235,13 +1401,17 @@ pub(super) const fn is_virtual_fstype(fstype: FilesystemType) -> bool {
             | FilesystemType::Devpts
             | FilesystemType::Cgroup2
             | FilesystemType::Tmpfs
+            | FilesystemType::Ramfs
     )
 }
 
 pub(super) const fn is_memfs_fstype(fstype: FilesystemType) -> bool {
     matches!(
         fstype,
-        FilesystemType::Tmpfs | FilesystemType::Devtmpfs | FilesystemType::Devpts
+        FilesystemType::Tmpfs
+            | FilesystemType::Ramfs
+            | FilesystemType::Devtmpfs
+            | FilesystemType::Devpts
     )
 }
 
@@ -1261,27 +1431,124 @@ pub(super) fn dev_and_mnt_id_for_fstype(fstype: FilesystemType) -> (u64, u32, u3
         FilesystemType::Procfs => 4,
         FilesystemType::Sysfs => 5,
         FilesystemType::Tmpfs => 6,
+        FilesystemType::Ramfs => 7,
         _ => 1,
     });
     let (maj, min) = fstype.st_dev_pair(mnt_id);
     (fstype.st_dev(mnt_id), maj, min, mnt_id)
 }
 
-pub(super) fn ext4_table_mount_id(ext4_slot_id: u32) -> u32 {
-    let mut mnt_id = ext4_slot_id;
+pub(super) fn clone_mount_ns(old_mnt_id: u32, new_mnt_id: u32) {
+    if new_mnt_id == INIT_MNT_NS_ID || old_mnt_id == new_mnt_id {
+        return;
+    }
+    let existing_ids: Vec<u32> =
+        with_mount_state(|state| state.child_ns_mounts.iter().map(|s| s.mnt_ns_id).collect())
+            .unwrap_or_default();
+    let dead_ids: Vec<u32> = existing_ids
+        .into_iter()
+        .filter(|&id| id != old_mnt_id && !super::step41_container::is_mnt_ns_in_use(id))
+        .collect();
     let _ = with_mount_state(|state| {
+        state.ensure_initialized();
+        for dead in &dead_ids {
+            if let Some(pos) = state
+                .child_ns_mounts
+                .iter()
+                .position(|s| s.mnt_ns_id == *dead)
+            {
+                let removed = state.child_ns_mounts.swap_remove(pos);
+                for meta in &removed.bind_meta {
+                    if meta.live && meta.backing_mount_id != 0 && meta.bind_root_ino != 0 {
+                        state
+                            .memfs
+                            .release_fd(meta.backing_mount_id, meta.bind_root_ino);
+                    }
+                }
+            }
+        }
+        if state
+            .child_ns_mounts
+            .iter()
+            .any(|s| s.mnt_ns_id == new_mnt_id)
+        {
+            return;
+        }
+        let (cloned_mounts, cloned_meta) = {
+            let (src_mounts, src_meta, _) = state.ns_view(old_mnt_id);
+            (src_mounts.clone_into_child_namespace(true), *src_meta)
+        };
+        for meta in &cloned_meta {
+            if meta.live && meta.backing_mount_id != 0 && meta.bind_root_ino != 0 {
+                state
+                    .memfs
+                    .retain_fd(meta.backing_mount_id, meta.bind_root_ino);
+            }
+        }
+        state.child_ns_mounts.push(Box::new(MountNsSlot {
+            mnt_ns_id: new_mnt_id,
+            mounts_gen: 1,
+            mounts: cloned_mounts,
+            bind_meta: cloned_meta,
+        }));
+    });
+}
+
+fn resolve_ext4_entry_backing(
+    state: &Step33MountState,
+    bind_meta: &[BindMountMeta; MAX_MOUNTS],
+    entry: &MountEntry,
+) -> Option<(u32, u32)> {
+    if entry.fstype() != FilesystemType::Ext4 {
+        return None;
+    }
+    if let Some(meta) = find_bind_meta(bind_meta, entry.mount_id())
+        && meta.backing_ext4_id != 0
+    {
+        if state
+            .ext4_mounts
+            .iter()
+            .any(|m| m.live && m.mount_id == meta.backing_ext4_id)
+        {
+            return Some((meta.backing_ext4_id, meta.bind_root_ino as u32));
+        }
+    }
+    state
+        .ext4_mounts
+        .iter()
+        .find(|m| m.live && &m.mount_path[..m.mount_path_len] == entry.target())
+        .map(|m| (m.mount_id, 0))
+}
+
+pub(super) fn ext4_table_mount_id_for_path(
+    process: ObjectId,
+    abs_path: &[u8],
+    ext4_slot_id: u32,
+) -> (u32, bool) {
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(process);
+    let mut out = (ext4_slot_id, false);
+    let _ = with_mount_state(|state| {
+        state.ensure_initialized();
+        let (mounts, _, _) = state.ns_view(mnt_ns_id);
+        if !abs_path.is_empty()
+            && let Ok((entry, rel)) = mounts.resolve(abs_path)
+            && entry.fstype() == FilesystemType::Ext4
+        {
+            out = (entry.mount_id(), rel.is_empty());
+            return;
+        }
         if let Some(slot) = state
             .ext4_mounts
             .iter()
             .find(|m| m.live && m.mount_id == ext4_slot_id)
         {
             let mp = &slot.mount_path[..slot.mount_path_len];
-            if let Ok((entry, _)) = state.mounts.resolve(mp) {
-                mnt_id = entry.mount_id();
+            if let Ok((entry, _)) = mounts.resolve(mp) {
+                out = (entry.mount_id(), false);
             }
         }
     });
-    mnt_id
+    out
 }
 
 pub(super) fn fd_dir_abs_path(process: ObjectId, raw_fd: u64) -> Option<Result<Vec<u8>, Errno>> {
@@ -1307,51 +1574,89 @@ pub(super) fn has_live_ext4_mounts() -> bool {
     HAS_LIVE_EXT4_MOUNTS.load(Ordering::Acquire)
 }
 
-pub(super) fn has_virtual_mount_prefix(abs_path: &[u8]) -> bool {
+pub(super) fn has_virtual_mount_prefix(process: ObjectId, abs_path: &[u8]) -> bool {
     if !abs_path.starts_with(b"/") {
         return false;
     }
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(process);
     let mut result = false;
     let _ = with_mount_state(|state| {
         state.ensure_initialized();
-        let Ok((entry, _)) = state.mounts.resolve(abs_path) else {
+        let (mounts, _, _) = state.ns_view(mnt_ns_id);
+        let Ok((entry, _)) = mounts.resolve(abs_path) else {
             return;
         };
         if is_virtual_fstype(entry.fstype()) {
             let virt_len = entry.target().len();
-            let ext4_len = state
-                .ext4_mounts
-                .iter()
-                .filter(|m| {
-                    m.live && path_matches_prefix(abs_path, &m.mount_path[..m.mount_path_len])
-                })
-                .map(|m| m.mount_path_len)
-                .max()
-                .unwrap_or(0);
+            let ext4_len = if mnt_ns_id == INIT_MNT_NS_ID {
+                state
+                    .ext4_mounts
+                    .iter()
+                    .filter(|m| {
+                        m.live && path_matches_prefix(abs_path, &m.mount_path[..m.mount_path_len])
+                    })
+                    .map(|m| m.mount_path_len)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             result = virt_len >= ext4_len;
         }
     });
     result
 }
 
-pub(super) fn resolve_ext4_mount(abs_path: &[u8]) -> Option<(u32, usize)> {
+pub(super) fn has_ext4_descendant_under(process: ObjectId, dir_abs: &[u8]) -> bool {
+    if !dir_abs.starts_with(b"/") {
+        return false;
+    }
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(process);
+    let mut found = false;
+    let _ = with_mount_state(|state| {
+        state.ensure_initialized();
+        let (mounts, _, _) = state.ns_view(mnt_ns_id);
+        mounts.for_each_live(|e| {
+            if e.fstype() == FilesystemType::Ext4
+                && e.target().len() > dir_abs.len()
+                && path_starts_with_mount(e.target(), dir_abs)
+            {
+                found = true;
+            }
+        });
+    });
+    found
+}
+
+pub(super) fn resolve_ext4_mount(process: ObjectId, abs_path: &[u8]) -> Option<(u32, usize, u32)> {
     if !has_live_ext4_mounts() || !abs_path.starts_with(b"/") {
         return None;
     }
-    if has_virtual_mount_prefix(abs_path) {
-        return None;
-    }
-    let mut best: Option<(u32, usize)> = None;
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(process);
+    let mut best: Option<(u32, usize, u32)> = None;
     let _ = with_mount_state(|state| {
         state.ensure_initialized();
-        for slot in &state.ext4_mounts {
-            if !slot.live {
-                continue;
+        let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+        if let Ok((entry, _)) = mounts.resolve(abs_path) {
+            if is_virtual_fstype(entry.fstype()) {
+                return;
             }
-            let mp = &slot.mount_path[..slot.mount_path_len];
-            if path_matches_prefix(abs_path, mp) {
-                if best.is_none_or(|(_, blen)| slot.mount_path_len >= blen) {
-                    best = Some((slot.mount_id, slot.mount_path_len));
+            if let Some((ext4_id, start_ino)) = resolve_ext4_entry_backing(state, bind_meta, &entry)
+            {
+                best = Some((ext4_id, entry.target().len(), start_ino));
+                return;
+            }
+        }
+        if mnt_ns_id == INIT_MNT_NS_ID {
+            for slot in &state.ext4_mounts {
+                if !slot.live {
+                    continue;
+                }
+                let mp = &slot.mount_path[..slot.mount_path_len];
+                if path_matches_prefix(abs_path, mp)
+                    && best.is_none_or(|(_, blen, _)| slot.mount_path_len >= blen)
+                {
+                    best = Some((slot.mount_id, slot.mount_path_len, 0));
                 }
             }
         }
@@ -1359,17 +1664,30 @@ pub(super) fn resolve_ext4_mount(abs_path: &[u8]) -> Option<(u32, usize)> {
     best
 }
 
-pub(super) fn ext4_mount_at_exact(abs_path: &[u8]) -> Option<u32> {
+pub(super) fn ext4_mount_at_exact(process: ObjectId, abs_path: &[u8]) -> Option<(u32, u32)> {
     if !has_live_ext4_mounts() {
         return None;
     }
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(process);
     let mut found = None;
     let _ = with_mount_state(|state| {
         state.ensure_initialized();
-        for slot in &state.ext4_mounts {
-            if slot.live && &slot.mount_path[..slot.mount_path_len] == abs_path {
-                found = Some(slot.mount_id);
-                break;
+        let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+        if let Ok((entry, rel)) = mounts.resolve(abs_path)
+            && rel.is_empty()
+            && entry.fstype() == FilesystemType::Ext4
+        {
+            found = resolve_ext4_entry_backing(state, bind_meta, &entry);
+            if found.is_some() {
+                return;
+            }
+        }
+        if mnt_ns_id == INIT_MNT_NS_ID {
+            for slot in &state.ext4_mounts {
+                if slot.live && &slot.mount_path[..slot.mount_path_len] == abs_path {
+                    found = Some((slot.mount_id, 0));
+                    break;
+                }
             }
         }
     });
@@ -1539,6 +1857,224 @@ fn resolve_mount_syscall_path(
     Err(Errno::ELOOP)
 }
 
+fn walk_memfs_ino_from(
+    memfs: &MemFs,
+    mount_id: u32,
+    start_ino: u64,
+    parts: &[Vec<u8>],
+) -> Result<u64, Errno> {
+    let mut ino = if start_ino != 0 {
+        memfs
+            .stat_ino(mount_id, start_ino)
+            .ok_or(Errno::ENOENT)?
+            .ino
+    } else {
+        memfs.root_stat(mount_id).ok_or(Errno::ENOENT)?.ino
+    };
+    for seg in parts {
+        let child = memfs
+            .lookup_child_stat(mount_id, ino, seg)
+            .ok_or(Errno::ENOENT)?;
+        ino = child.ino;
+    }
+    Ok(ino)
+}
+
+fn apply_bind_mount_in_state(
+    state: &mut Step33MountState,
+    mnt_ns_id: u32,
+    source_slice: &[u8],
+    target_slice: &[u8],
+    flags: u64,
+    ext4_bind_src: Option<(u32, u32)>,
+) -> Result<i64, Errno> {
+    let mut norm_src_buf = [0u8; MAX_MOUNT_PATH];
+    let norm_src_len = normalize_mount_path_slice(source_slice, &mut norm_src_buf)?;
+    let norm_src = &norm_src_buf[..norm_src_len];
+    let mut norm_tgt_buf = [0u8; MAX_MOUNT_PATH];
+    let norm_tgt_len = normalize_mount_path_slice(target_slice, &mut norm_tgt_buf)?;
+    let norm_tgt = &norm_tgt_buf[..norm_tgt_len];
+
+    struct RecSub {
+        sub_src: Vec<u8>,
+        sub_tgt: Vec<u8>,
+        fstype: FilesystemType,
+        flags: u64,
+        meta: BindMountMeta,
+    }
+
+    let (root_fstype, root_flags, mut root_meta, rec_subs) = {
+        let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+        let (src_entry, src_rel) = mounts.resolve(norm_src)?;
+        if (src_entry.flags() & MS_UNBINDABLE) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let src_meta = find_bind_meta(bind_meta, src_entry.mount_id()).copied();
+        let base_prefix = src_meta.as_ref().map(|m| m.bind_prefix()).unwrap_or(b"");
+        let full_prefix = if src_rel.is_empty() {
+            base_prefix.to_vec()
+        } else {
+            join_rel(base_prefix, src_rel)
+        };
+        if full_prefix.len() > MAX_MOUNT_PATH {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let mut meta = BindMountMeta::EMPTY;
+        meta.live = true;
+        meta.bind_prefix[..full_prefix.len()].copy_from_slice(&full_prefix);
+        meta.bind_prefix_len = full_prefix.len();
+
+        if src_entry.fstype() == FilesystemType::Ext4 {
+            let Some((ext4_id, ino)) = ext4_bind_src else {
+                return Err(Errno::ENOENT);
+            };
+            meta.backing_ext4_id = ext4_id;
+            meta.bind_root_ino = u64::from(ino);
+        } else if is_memfs_fstype(src_entry.fstype()) {
+            let mem_id = src_meta
+                .as_ref()
+                .and_then(|m| {
+                    if m.backing_mount_id != 0 {
+                        Some(m.backing_mount_id)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| src_entry.mount_id());
+            let start_ino = src_meta.as_ref().map_or(0, |m| m.bind_root_ino);
+            let parts = split_nonempty_segments(src_rel);
+            let target_ino = walk_memfs_ino_from(&state.memfs, mem_id, start_ino, &parts)?;
+            meta.backing_mount_id = mem_id;
+            meta.bind_root_ino = target_ino;
+        } else {
+            meta.backing_mount_id = src_meta
+                .as_ref()
+                .and_then(|m| {
+                    if m.backing_mount_id != 0 {
+                        Some(m.backing_mount_id)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| src_entry.mount_id());
+        }
+
+        let rflags = (src_entry.flags() & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC))
+            | MS_BIND
+            | MS_SLAVE
+            | (flags & MS_RDONLY);
+
+        let mut subs: Vec<RecSub> = Vec::new();
+        if (flags & MS_REC) != 0 {
+            let strip_len = if norm_src == b"/" { 0 } else { norm_src.len() };
+            mounts.for_each_live(|sub| {
+                let stgt = sub.target();
+                let is_desc = if norm_src == b"/" {
+                    stgt != b"/"
+                } else {
+                    stgt.len() > norm_src.len()
+                        && stgt.starts_with(norm_src)
+                        && stgt[norm_src.len()] == b'/'
+                };
+                if !is_desc || path_starts_with_mount(stgt, norm_tgt) {
+                    return;
+                }
+                let suffix = &stgt[strip_len..];
+                let mut new_tgt = Vec::with_capacity(norm_tgt.len() + suffix.len());
+                if norm_tgt != b"/" {
+                    new_tgt.extend_from_slice(norm_tgt);
+                }
+                new_tgt.extend_from_slice(suffix);
+                if new_tgt.is_empty() || new_tgt.len() > MAX_MOUNT_PATH {
+                    return;
+                }
+                let mut smeta = find_bind_meta(bind_meta, sub.mount_id())
+                    .copied()
+                    .unwrap_or(BindMountMeta::EMPTY);
+                smeta.live = true;
+                smeta.mount_id = 0;
+                if sub.fstype() == FilesystemType::Ext4 && smeta.backing_ext4_id == 0 {
+                    if let Some((eid, eino)) = resolve_ext4_entry_backing(state, bind_meta, sub) {
+                        smeta.backing_ext4_id = eid;
+                        smeta.bind_root_ino = u64::from(eino);
+                    }
+                } else if is_memfs_fstype(sub.fstype()) && smeta.backing_mount_id == 0 {
+                    smeta.backing_mount_id = sub.mount_id();
+                } else if !is_memfs_fstype(sub.fstype())
+                    && sub.fstype() != FilesystemType::Ext4
+                    && smeta.backing_mount_id == 0
+                {
+                    smeta.backing_mount_id = sub.mount_id();
+                }
+                let sflags = (sub.flags() & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC))
+                    | MS_BIND
+                    | MS_SLAVE;
+                subs.push(RecSub {
+                    sub_src: stgt.to_vec(),
+                    sub_tgt: new_tgt,
+                    fstype: sub.fstype(),
+                    flags: sflags,
+                    meta: smeta,
+                });
+            });
+            subs.sort_by_key(|s| s.sub_tgt.len());
+        }
+        (src_entry.fstype(), rflags, meta, subs)
+    };
+
+    if root_meta.backing_mount_id != 0 && root_meta.bind_root_ino != 0 {
+        state
+            .memfs
+            .retain_fd(root_meta.backing_mount_id, root_meta.bind_root_ino);
+    }
+    state.sync_next_mount_id_before(mnt_ns_id);
+    let new_root_id = {
+        let (mounts, bind_meta, _) = state.ns_view_mut(mnt_ns_id);
+        match mounts.insert_exact_mount(norm_src, norm_tgt, root_fstype, root_flags) {
+            Ok(id) => {
+                root_meta.mount_id = id;
+                upsert_bind_meta(bind_meta, root_meta);
+                id
+            }
+            Err(e) => {
+                if root_meta.backing_mount_id != 0 && root_meta.bind_root_ino != 0 {
+                    state
+                        .memfs
+                        .release_fd(root_meta.backing_mount_id, root_meta.bind_root_ino);
+                }
+                return Err(e);
+            }
+        }
+    };
+    let _ = new_root_id;
+
+    for mut sub in rec_subs {
+        if sub.meta.backing_mount_id != 0 && sub.meta.bind_root_ino != 0 {
+            state
+                .memfs
+                .retain_fd(sub.meta.backing_mount_id, sub.meta.bind_root_ino);
+        }
+        let ins_res = {
+            let (mounts, bind_meta, _) = state.ns_view_mut(mnt_ns_id);
+            match mounts.insert_exact_mount(&sub.sub_src, &sub.sub_tgt, sub.fstype, sub.flags) {
+                Ok(id) => {
+                    sub.meta.mount_id = id;
+                    upsert_bind_meta(bind_meta, sub.meta);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
+        };
+        if ins_res.is_err() && sub.meta.backing_mount_id != 0 && sub.meta.bind_root_ino != 0 {
+            state
+                .memfs
+                .release_fd(sub.meta.backing_mount_id, sub.meta.bind_root_ino);
+        }
+    }
+    state.sync_next_mount_id_after(mnt_ns_id);
+    Ok(0)
+}
+
 fn handle_mount(
     user_source: u64,
     user_target: u64,
@@ -1612,15 +2148,24 @@ fn handle_mount(
     };
 
     let mut moved_pair: Option<(u32, [u8; MAX_MOUNT_PATH], usize)> = None;
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(owner);
+    let is_init_ns = mnt_ns_id == INIT_MNT_NS_ID;
+    let ext4_bind_src = if (flags & MS_BIND) != 0 && (flags & MS_REMOUNT) == 0 {
+        super::step33_ext4_vfs::resolve_ext4_bind_source(owner, &abs_source_buf[..abs_source_len])
+    } else {
+        None
+    };
     let res = with_mount_state(|state| {
         state.ensure_initialized();
         let fstype_slice = fstype_opt.map(|n| &fstype_buf[..n]);
         let mnt_res: Result<i64, Errno> = (|| {
             if (flags & MS_REMOUNT) != 0 {
-                if let Some(slot) = state
-                    .ext4_mounts
-                    .iter_mut()
-                    .find(|m| m.live && &m.mount_path[..m.mount_path_len] == target_slice)
+                if is_init_ns
+                    && (flags & MS_BIND) == 0
+                    && let Some(slot) = state
+                        .ext4_mounts
+                        .iter_mut()
+                        .find(|m| m.live && &m.mount_path[..m.mount_path_len] == target_slice)
                 {
                     let ro = (flags & MS_RDONLY) != 0;
                     if let Some(ref mut vol) = slot.vol {
@@ -1632,17 +2177,18 @@ fn handle_mount(
                     }
                     slot.flags = flags & !MS_REMOUNT;
                 }
-                return state
-                    .mounts
+                let (mounts, _, _) = state.ns_view_mut(mnt_ns_id);
+                return mounts
                     .mount(source_slice, target_slice, fstype_slice, flags)
                     .map(|_| 0);
             }
 
             if (flags & MS_MOVE) != 0 {
-                if let Some(slot) = state
-                    .ext4_mounts
-                    .iter_mut()
-                    .find(|m| m.live && &m.mount_path[..m.mount_path_len] == source_slice)
+                if is_init_ns
+                    && let Some(slot) = state
+                        .ext4_mounts
+                        .iter_mut()
+                        .find(|m| m.live && &m.mount_path[..m.mount_path_len] == source_slice)
                 {
                     let old_mp_len = slot.mount_path_len;
                     let mut old_mp = [0u8; MAX_MOUNT_PATH];
@@ -1652,33 +2198,111 @@ fn handle_mount(
                     slot.mount_path_len = target_len;
                     moved_pair = Some((slot.mount_id, old_mp, old_mp_len));
                 }
-                return state
-                    .mounts
-                    .mount(source_slice, target_slice, fstype_slice, flags)
-                    .map(|_| 0);
+                let mut release_pairs: Vec<(u32, u64)> = Vec::new();
+                let mut detach_ids: Vec<u32> = Vec::new();
+                {
+                    let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+                    if target_slice == b"/" {
+                        mounts.for_each_live(|e| {
+                            let t = e.target();
+                            let keep = t == source_slice || path_starts_with_mount(t, source_slice);
+                            if !keep {
+                                detach_ids.push(e.mount_id());
+                                if let Some(meta) = find_bind_meta(bind_meta, e.mount_id())
+                                    && meta.backing_mount_id != 0
+                                    && meta.bind_root_ino != 0
+                                {
+                                    release_pairs.push((meta.backing_mount_id, meta.bind_root_ino));
+                                }
+                            }
+                        });
+                    }
+                }
+                let mv_res = {
+                    let (mounts, bind_meta, _) = state.ns_view_mut(mnt_ns_id);
+                    let r = mounts.mount(source_slice, target_slice, fstype_slice, flags);
+                    if r.is_ok() {
+                        for id in detach_ids {
+                            if let Some(m) =
+                                bind_meta.iter_mut().find(|m| m.live && m.mount_id == id)
+                            {
+                                *m = BindMountMeta::EMPTY;
+                            }
+                        }
+                    }
+                    r
+                };
+                if mv_res.is_ok() {
+                    for (mid, ino) in release_pairs {
+                        state.memfs.release_fd(mid, ino);
+                    }
+                }
+                return mv_res.map(|_| 0);
             }
 
-            if (flags & MS_BIND) == 0 {
-                let wants_ext4 = matches!(fstype_slice, Some(b"ext4" | b"ext3" | b"ext2"))
+            if (flags & MS_BIND) != 0 {
+                return apply_bind_mount_in_state(
+                    state,
+                    mnt_ns_id,
+                    source_slice,
+                    target_slice,
+                    flags,
+                    ext4_bind_src,
+                );
+            }
+
+            let is_prop_only = (flags & MS_PROPAGATION_MASK) != 0
+                && fstype_slice.is_none_or(|f| f.is_empty())
+                && (source_slice.is_empty() || source_slice == b"none");
+
+            let wants_ext4 = !is_prop_only
+                && (matches!(fstype_slice, Some(b"ext4" | b"ext3" | b"ext2"))
                     || ((fstype_slice.is_none() || fstype_slice == Some(b""))
-                        && source_slice.starts_with(b"/dev/vda"));
+                        && source_slice.starts_with(b"/dev/vda")));
+            let mut ext4_slot_id = 0u32;
+            if wants_ext4 {
+                if !is_init_ns {
+                    return Err(Errno::EPERM);
+                }
+                ext4_slot_id = mount_ext4_slot(state, source_slice, target_slice, flags)?;
+            }
+
+            let eff_fstype = if wants_ext4 {
+                Some(&b"ext4"[..])
+            } else {
+                fstype_slice
+            };
+            state.sync_next_mount_id_before(mnt_ns_id);
+            let mnt_id = {
+                let (mounts, bind_meta, _) = state.ns_view_mut(mnt_ns_id);
+                let id = mounts.mount(source_slice, target_slice, eff_fstype, flags)?;
                 if wants_ext4 {
-                    mount_ext4_slot(state, source_slice, target_slice, flags)?;
-                    return state
-                        .mounts
-                        .mount(source_slice, target_slice, Some(b"ext4"), flags)
-                        .map(|_| 0);
+                    let mut meta = BindMountMeta::EMPTY;
+                    meta.live = true;
+                    meta.mount_id = id;
+                    meta.backing_ext4_id = ext4_slot_id;
+                    upsert_bind_meta(bind_meta, meta);
+                }
+                id
+            };
+            state.sync_next_mount_id_after(mnt_ns_id);
+            if !is_prop_only && !wants_ext4 {
+                let perm = mode_opt;
+                let fs_ty = {
+                    let (mounts, _, _) = state.ns_view(mnt_ns_id);
+                    mounts.entry_by_id(mnt_id).map(|e| e.fstype())
+                };
+                if let Some(ft) = fs_ty
+                    && is_memfs_fstype(ft)
+                {
+                    let now = current_epoch_now_secs();
+                    state.memfs.ensure_mount(mnt_id, ft, perm, now);
                 }
             }
-
-            let mnt_id = state
-                .mounts
-                .mount(source_slice, target_slice, fstype_slice, flags)?;
-            state.sync_memfs_mounts(mode_opt.map(|m| (mnt_id, m)));
             Ok(0)
         })();
         if mnt_res.is_ok() {
-            state.bump_mounts_gen();
+            state.bump_ns_mounts_gen(mnt_ns_id);
         }
         mnt_res
     })?;
@@ -1686,6 +2310,9 @@ fn handle_mount(
         && let Some((mount_id, old_mp, old_len)) = moved_pair
     {
         super::step33_ext4_vfs::on_mount_moved(mount_id, &old_mp[..old_len], target_slice);
+    }
+    if res.is_ok() && (flags & MS_MOVE) != 0 {
+        super::step33_ext4_vfs::on_mount_moved_for_process(owner, source_slice, target_slice);
     }
     Ok(res)
 }
@@ -1714,6 +2341,8 @@ fn handle_umount2(user_target: u64, raw_flags: u64) -> Result<Result<i64, Errno>
         Err(errno) => return Ok(Err(errno)),
     };
     let target_slice = &abs_target_buf[..target_len];
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(owner);
+    let is_init_ns = mnt_ns_id == INIT_MNT_NS_ID;
 
     let mut removed_mount_id: Option<u32> = None;
     let res = with_mount_state(|state| {
@@ -1721,41 +2350,72 @@ fn handle_umount2(user_target: u64, raw_flags: u64) -> Result<Result<i64, Errno>
         if target_slice == b"/" {
             return Err(Errno::EBUSY);
         }
-        if let Some(slot) = state
-            .ext4_mounts
-            .iter_mut()
-            .find(|m| m.live && &m.mount_path[..m.mount_path_len] == target_slice)
-        {
-            if let Some(ref mut vol) = slot.vol {
-                super::step42_hardware::with_active_block_device(|dev, _| {
-                    vol.sync(dev)?;
-                    dev.flush()
-                })?;
-            }
-            removed_mount_id = Some(slot.mount_id);
-            *slot = Ext4MountSlot::EMPTY;
-            state.refresh_live_ext4_flag();
-        } else if !state.initramfs_unmounted
-            && &state.initramfs_prefix[..state.initramfs_prefix_len] == target_slice
-        {
-            state.initramfs_unmounted = true;
-        }
-        let umount_mem_id = state
-            .mounts
-            .resolve(target_slice)
-            .ok()
-            .and_then(|(m, rel)| {
-                if rel.is_empty() && is_memfs_fstype(m.fstype()) {
+        let (target_was_bind, bind_mem_release, umount_mem_id) = {
+            let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+            let resolved = mounts.resolve(target_slice).ok();
+            let was_bind = resolved
+                .as_ref()
+                .is_some_and(|(m, rel)| rel.is_empty() && (m.flags() & MS_BIND) != 0);
+            let bind_rel = resolved.as_ref().and_then(|(m, rel)| {
+                if rel.is_empty() {
+                    find_bind_meta(bind_meta, m.mount_id()).and_then(|bm| {
+                        if bm.backing_mount_id != 0 && bm.bind_root_ino != 0 {
+                            Some((bm.backing_mount_id, bm.bind_root_ino))
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            });
+            let mem_id = resolved.and_then(|(m, rel)| {
+                if rel.is_empty() && (m.flags() & MS_BIND) == 0 && is_memfs_fstype(m.fstype()) {
                     Some(m.mount_id())
                 } else {
                     None
                 }
             });
-        state.mounts.umount2(target_slice, flags)?;
+            (was_bind, bind_rel, mem_id)
+        };
+
+        if is_init_ns && !target_was_bind {
+            if let Some(slot) = state
+                .ext4_mounts
+                .iter_mut()
+                .find(|m| m.live && &m.mount_path[..m.mount_path_len] == target_slice)
+            {
+                if let Some(ref mut vol) = slot.vol {
+                    super::step42_hardware::with_active_block_device(|dev, _| {
+                        vol.sync(dev)?;
+                        dev.flush()
+                    })?;
+                }
+                removed_mount_id = Some(slot.mount_id);
+                *slot = Ext4MountSlot::EMPTY;
+                state.refresh_live_ext4_flag();
+            } else if !state.initramfs_unmounted
+                && &state.initramfs_prefix[..state.initramfs_prefix_len] == target_slice
+            {
+                state.initramfs_unmounted = true;
+            }
+        }
+        let removed_tbl_id = {
+            let (mounts, bind_meta, _) = state.ns_view_mut(mnt_ns_id);
+            let id = mounts.umount2_returning_id(target_slice, flags)?;
+            if let Some(bm) = bind_meta.iter_mut().find(|m| m.live && m.mount_id == id) {
+                *bm = BindMountMeta::EMPTY;
+            }
+            id
+        };
+        let _ = removed_tbl_id;
+        if let Some((mid, ino)) = bind_mem_release {
+            state.memfs.release_fd(mid, ino);
+        }
         if let Some(mem_id) = umount_mem_id {
             state.memfs.unmount(mem_id);
         }
-        state.bump_mounts_gen();
+        state.bump_ns_mounts_gen(mnt_ns_id);
         Ok(0)
     })?;
     if res.is_ok()
@@ -1825,39 +2485,49 @@ fn handle_pivot_root(user_new_root: u64, user_put_old: u64) -> Result<Result<i64
         put_old
     };
 
+    let mnt_ns_id = current_process_id()
+        .map(super::step41_container::process_mnt_ns_id)
+        .unwrap_or(INIT_MNT_NS_ID);
+    let is_init_ns = mnt_ns_id == INIT_MNT_NS_ID;
     let res = with_mount_state(|state| {
         state.ensure_initialized();
-        state.mounts.pivot_root(new_root, put_old)?;
-        let mut next_ext4_buf = [0u8; MAX_MOUNT_PATH];
-        for slot in &mut state.ext4_mounts {
-            if !slot.live {
-                continue;
+        {
+            let (mounts, _, _) = state.ns_view_mut(mnt_ns_id);
+            mounts.pivot_root(new_root, put_old)?;
+        }
+        if is_init_ns {
+            let mut next_ext4_buf = [0u8; MAX_MOUNT_PATH];
+            for slot in &mut state.ext4_mounts {
+                if !slot.live {
+                    continue;
+                }
+                let new_mp_len = remap_path_across_pivot(
+                    &slot.mount_path[..slot.mount_path_len],
+                    new_root,
+                    rel_put_old_slice,
+                    &mut next_ext4_buf,
+                );
+                slot.mount_path = [0u8; MAX_MOUNT_PATH];
+                slot.mount_path[..new_mp_len].copy_from_slice(&next_ext4_buf[..new_mp_len]);
+                slot.mount_path_len = new_mp_len;
             }
-            let new_mp_len = remap_path_across_pivot(
-                &slot.mount_path[..slot.mount_path_len],
-                new_root,
-                rel_put_old_slice,
-                &mut next_ext4_buf,
-            );
-            slot.mount_path = [0u8; MAX_MOUNT_PATH];
-            slot.mount_path[..new_mp_len].copy_from_slice(&next_ext4_buf[..new_mp_len]);
-            slot.mount_path_len = new_mp_len;
+            if !state.initramfs_unmounted {
+                let mut next_initramfs = [0u8; MAX_MOUNT_PATH];
+                let next_len = remap_path_across_pivot(
+                    &state.initramfs_prefix[..state.initramfs_prefix_len],
+                    new_root,
+                    rel_put_old_slice,
+                    &mut next_initramfs,
+                );
+                state.initramfs_prefix = next_initramfs;
+                state.initramfs_prefix_len = next_len;
+            }
+            state.refresh_live_ext4_flag();
         }
-        if !state.initramfs_unmounted {
-            let mut next_initramfs = [0u8; MAX_MOUNT_PATH];
-            let next_len = remap_path_across_pivot(
-                &state.initramfs_prefix[..state.initramfs_prefix_len],
-                new_root,
-                rel_put_old_slice,
-                &mut next_initramfs,
-            );
-            state.initramfs_prefix = next_initramfs;
-            state.initramfs_prefix_len = next_len;
-        }
-        state.refresh_live_ext4_flag();
+        state.bump_ns_mounts_gen(mnt_ns_id);
         Ok(0)
     })?;
-    if res.is_ok() {
+    if res.is_ok() && is_init_ns {
         super::step33_ext4_vfs::on_pivot_root(new_root, rel_put_old_slice);
     }
     Ok(res)
@@ -1890,29 +2560,47 @@ fn handle_statfs(user_path: u64, user_buf: u64) -> Result<Result<i64, Errno>, ()
         },
     }
 
+    let mnt_ns_id = super::step41_container::process_mnt_ns_id(owner);
     let resolved = with_mount_state(|state| {
         state.ensure_initialized();
-        let mut virt_len = 0usize;
-        let virt = state.mounts.resolve(abs_slice);
-        if let Ok((entry, _)) = virt
-            && is_virtual_fstype(entry.fstype())
-        {
-            virt_len = entry.target().len();
+        let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+        let virt = mounts.resolve(abs_slice);
+        if let Ok((entry, _)) = virt {
+            if entry.fstype() == FilesystemType::Ext4
+                && let Some((ext4_id, _)) = resolve_ext4_entry_backing(state, bind_meta, &entry)
+                && let Some(slot) = state
+                    .ext4_mounts
+                    .iter()
+                    .find(|m| m.live && m.mount_id == ext4_id)
+                && let Some(ref vol) = slot.vol
+            {
+                return Ok(StatfsInfo::Ext4 {
+                    info: vol.statfs(),
+                    flags: slot.flags | (entry.flags() & MS_RDONLY),
+                    ro: vol.is_read_only() || entry.is_readonly(),
+                });
+            }
+            if is_virtual_fstype(entry.fstype()) {
+                return Ok(StatfsInfo::Virtual(entry.fstype(), entry.flags()));
+            }
         }
-        let best_ext4 = state
-            .ext4_mounts
-            .iter()
-            .filter(|m| m.live && path_matches_prefix(abs_slice, &m.mount_path[..m.mount_path_len]))
-            .max_by_key(|m| m.mount_path_len);
-        if let Some(slot) = best_ext4
-            && slot.mount_path_len >= virt_len
-            && let Some(ref vol) = slot.vol
-        {
-            return Ok(StatfsInfo::Ext4 {
-                info: vol.statfs(),
-                flags: slot.flags,
-                ro: vol.is_read_only(),
-            });
+        if mnt_ns_id == INIT_MNT_NS_ID {
+            let best_ext4 = state
+                .ext4_mounts
+                .iter()
+                .filter(|m| {
+                    m.live && path_matches_prefix(abs_slice, &m.mount_path[..m.mount_path_len])
+                })
+                .max_by_key(|m| m.mount_path_len);
+            if let Some(slot) = best_ext4
+                && let Some(ref vol) = slot.vol
+            {
+                return Ok(StatfsInfo::Ext4 {
+                    info: vol.statfs(),
+                    flags: slot.flags,
+                    ro: vol.is_read_only(),
+                });
+            }
         }
         virt.map(|(entry, _)| StatfsInfo::Virtual(entry.fstype(), entry.flags()))
     })?;
@@ -2064,8 +2752,10 @@ enum ResolvedVirtualTarget {
 
 enum WalkState {
     Virtual {
+        table_mount_id: u32,
         mount_id: u32,
         mount_target: Vec<u8>,
+        bind_prefix: Vec<u8>,
         fstype: FilesystemType,
         parts: Vec<Vec<u8>>,
         mem_ino: u64,
@@ -2156,6 +2846,9 @@ fn join_rel(prefix: &[u8], child: &[u8]) -> Vec<u8> {
     if prefix.is_empty() {
         return child.to_vec();
     }
+    if child.is_empty() {
+        return prefix.to_vec();
+    }
     let mut out = Vec::with_capacity(prefix.len() + 1 + child.len());
     out.extend_from_slice(prefix);
     out.push(b'/');
@@ -2197,37 +2890,70 @@ fn path_starts_with_mount(path: &[u8], tgt: &[u8]) -> bool {
             || (path.len() > tgt.len() && path.starts_with(tgt) && path[tgt.len()] == b'/'))
 }
 
-fn find_virtual_mount_for_path(
+struct VirtualMountResolved {
+    table_mount_id: u32,
+    backing_mount_id: u32,
+    fstype: FilesystemType,
+    target: Vec<u8>,
+    bind_root_ino: u64,
+    bind_prefix: Vec<u8>,
+}
+
+fn resolve_virtual_mount_entry(
     state: &Step33MountState,
+    mnt_ns_id: u32,
     abs_path: &[u8],
-) -> Option<(u32, FilesystemType, Vec<u8>)> {
+) -> Option<VirtualMountResolved> {
     if !abs_path.starts_with(b"/") {
         return None;
     }
-    let mut best: Option<(u32, FilesystemType, Vec<u8>)> = None;
-    state.mounts.for_each_live(|entry| {
-        if is_virtual_fstype(entry.fstype()) && path_starts_with_mount(abs_path, entry.target()) {
-            let replace = match &best {
-                None => true,
-                Some((_, _, prev)) => entry.target().len() > prev.len(),
-            };
-            if replace {
-                best = Some((entry.mount_id(), entry.fstype(), entry.target().to_vec()));
-            }
-        }
-    });
-    let (id, fs, tgt) = best?;
-    let ext4_len = state
-        .ext4_mounts
-        .iter()
-        .filter(|m| m.live && path_matches_prefix(abs_path, &m.mount_path[..m.mount_path_len]))
-        .map(|m| m.mount_path_len)
-        .max()
-        .unwrap_or(0);
-    if ext4_len > tgt.len() {
+    let (mounts, bind_meta, _) = state.ns_view(mnt_ns_id);
+    let Ok((entry, _)) = mounts.resolve(abs_path) else {
+        return None;
+    };
+    if !is_virtual_fstype(entry.fstype()) {
         return None;
     }
-    Some((id, fs, tgt))
+    if mnt_ns_id == INIT_MNT_NS_ID {
+        let ext4_len = state
+            .ext4_mounts
+            .iter()
+            .filter(|m| m.live && path_matches_prefix(abs_path, &m.mount_path[..m.mount_path_len]))
+            .map(|m| m.mount_path_len)
+            .max()
+            .unwrap_or(0);
+        if ext4_len > entry.target().len() {
+            return None;
+        }
+    }
+    let meta = find_bind_meta(bind_meta, entry.mount_id());
+    let backing_mount_id = meta
+        .and_then(|m| {
+            if m.backing_mount_id != 0 {
+                Some(m.backing_mount_id)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| entry.mount_id());
+    let bind_root_ino = meta.map_or(0, |m| m.bind_root_ino);
+    let bind_prefix = meta.map(|m| m.bind_prefix().to_vec()).unwrap_or_default();
+    Some(VirtualMountResolved {
+        table_mount_id: entry.mount_id(),
+        backing_mount_id,
+        fstype: entry.fstype(),
+        target: entry.target().to_vec(),
+        bind_root_ino,
+        bind_prefix,
+    })
+}
+
+fn memfs_start_stat(memfs: &MemFs, mount_id: u32, bind_root_ino: u64) -> Result<MemStat, Errno> {
+    if bind_root_ino != 0 {
+        memfs.stat_ino(mount_id, bind_root_ino).ok_or(Errno::ENOENT)
+    } else {
+        memfs.root_stat(mount_id).ok_or(Errno::ENOENT)
+    }
 }
 
 fn walk_memfs_ino(memfs: &MemFs, mount_id: u32, parts: &[Vec<u8>]) -> Result<u64, Errno> {
@@ -2285,7 +3011,7 @@ fn resolve_virtual_path<const M: usize>(
 #[allow(clippy::too_many_arguments)]
 fn resolve_virtual_bytes<const M: usize>(
     state: &Step33MountState,
-    mounts: &kernal_linux_mounts::MountTable<M>,
+    _mounts: &kernal_linux_mounts::MountTable<M>,
     owner: ObjectId,
     dirfd: u64,
     raw_path: &[u8],
@@ -2297,6 +3023,9 @@ fn resolve_virtual_bytes<const M: usize>(
     hostname: &[u8],
     boot_id_seed: [u8; 16],
 ) -> Result<Option<ResolvedVirtualTarget>, Errno> {
+    let mnt_ns_id = caller.mnt_ns_id;
+    let ns_mounts = state.ns_view(mnt_ns_id).0;
+    let ns_bind_meta = state.ns_view(mnt_ns_id).1;
     let mut path = raw_path;
     while path.starts_with(b"//") {
         path = &path[1..];
@@ -2306,26 +3035,34 @@ fn resolve_virtual_bytes<const M: usize>(
     let mut last_mem_stat: Option<MemStat> = None;
 
     let mut walk_state = if path.starts_with(b"/") {
-        let Some((mount_id, fstype, mount_target)) = find_virtual_mount_for_path(state, path)
-        else {
+        let Some(vm) = resolve_virtual_mount_entry(state, mnt_ns_id, path) else {
             return Ok(None);
         };
-        if path.len() > mount_target.len() {
-            push_segments_back(&mut queue, &path[mount_target.len() + 1..]);
+        if path.len() > vm.target.len() {
+            let suffix = if vm.target == b"/" {
+                &path[1..]
+            } else {
+                &path[vm.target.len() + 1..]
+            };
+            push_segments_back(&mut queue, suffix);
         }
-        let mem_ino = if is_memfs_fstype(fstype) {
-            let root = state.memfs.root_stat(mount_id).ok_or(Errno::ENOENT)?;
+        let mem_ino = if is_memfs_fstype(vm.fstype) {
+            let root = memfs_start_stat(&state.memfs, vm.backing_mount_id, vm.bind_root_ino)?;
             if queue.is_empty() {
                 last_mem_stat = Some(root);
+            } else if root.kind != MemNodeKind::Dir {
+                return Err(Errno::ENOTDIR);
             }
             root.ino
         } else {
             0
         };
         WalkState::Virtual {
-            mount_id,
-            mount_target,
-            fstype,
+            table_mount_id: vm.table_mount_id,
+            mount_id: vm.backing_mount_id,
+            mount_target: vm.target,
+            bind_prefix: vm.bind_prefix,
+            fstype: vm.fstype,
             parts: Vec::new(),
             mem_ino,
         }
@@ -2336,16 +3073,34 @@ fn resolve_virtual_bytes<const M: usize>(
         let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
             return Err(Errno::EBADF);
         };
-        let mount_target = mounts
-            .entry_by_id(entry.mount_id)
-            .map(|m| m.target().to_vec())
-            .unwrap_or_else(|| match entry.fstype {
-                FilesystemType::Procfs => b"/proc".to_vec(),
-                FilesystemType::Cgroup2 => b"/sys/fs/cgroup".to_vec(),
-                FilesystemType::Devtmpfs => b"/dev".to_vec(),
-                FilesystemType::Devpts => b"/dev/pts".to_vec(),
-                _ => b"/sys".to_vec(),
-            });
+        let (table_mount_id, mount_target, bind_prefix, init_parts) =
+            if let Ok((m_ent, m_rel)) = ns_mounts.resolve(&entry.abs_path) {
+                let bmeta = find_bind_meta(ns_bind_meta, m_ent.mount_id());
+                let bp = bmeta.map(|m| m.bind_prefix().to_vec()).unwrap_or_default();
+                (
+                    m_ent.mount_id(),
+                    m_ent.target().to_vec(),
+                    bp,
+                    split_nonempty_segments(m_rel),
+                )
+            } else {
+                let fallback_tgt = ns_mounts
+                    .entry_by_id(entry.mount_id)
+                    .map(|m| m.target().to_vec())
+                    .unwrap_or_else(|| match entry.fstype {
+                        FilesystemType::Procfs => b"/proc".to_vec(),
+                        FilesystemType::Cgroup2 => b"/sys/fs/cgroup".to_vec(),
+                        FilesystemType::Devtmpfs => b"/dev".to_vec(),
+                        FilesystemType::Devpts => b"/dev/pts".to_vec(),
+                        _ => b"/sys".to_vec(),
+                    });
+                (
+                    entry.mount_id,
+                    fallback_tgt,
+                    Vec::new(),
+                    split_nonempty_segments(&entry.rel_path),
+                )
+            };
         if path.is_empty() {
             if allow_empty {
                 let mem_stat = if entry.mem_ino != 0 {
@@ -2372,44 +3127,52 @@ fn resolve_virtual_bytes<const M: usize>(
         let mem_ino = if entry.mem_ino != 0 {
             entry.mem_ino
         } else if is_memfs_fstype(entry.fstype) {
-            let parts = split_nonempty_segments(&entry.rel_path);
-            walk_memfs_ino(&state.memfs, entry.mount_id, &parts)?
+            walk_memfs_ino(&state.memfs, entry.mount_id, &init_parts)?
         } else {
             0
         };
         WalkState::Virtual {
+            table_mount_id,
             mount_id: entry.mount_id,
             mount_target,
+            bind_prefix,
             fstype: entry.fstype,
-            parts: split_nonempty_segments(&entry.rel_path),
+            parts: init_parts,
             mem_ino,
         }
     } else if linux_signed_int(dirfd) == AT_FDCWD_I32 {
         let Some(cwd) = cwd_if_fdc else {
             return Ok(None);
         };
-        let Some((mount_id, fstype, mount_target)) = find_virtual_mount_for_path(state, cwd) else {
+        let Some(vm) = resolve_virtual_mount_entry(state, mnt_ns_id, cwd) else {
             return Ok(None);
         };
         if path.is_empty() {
             return Err(Errno::ENOENT);
         }
-        let cwd_rel = if cwd.len() > mount_target.len() {
-            &cwd[mount_target.len() + 1..]
+        let cwd_rel = if cwd.len() > vm.target.len() {
+            if vm.target == b"/" {
+                &cwd[1..]
+            } else {
+                &cwd[vm.target.len() + 1..]
+            }
         } else {
             b""
         };
         let parts = split_nonempty_segments(cwd_rel);
-        let mem_ino = if is_memfs_fstype(fstype) {
-            walk_memfs_ino(&state.memfs, mount_id, &parts)?
+        let mem_ino = if is_memfs_fstype(vm.fstype) {
+            let start = memfs_start_stat(&state.memfs, vm.backing_mount_id, vm.bind_root_ino)?;
+            walk_memfs_ino_from(&state.memfs, vm.backing_mount_id, start.ino, &parts)?
         } else {
             0
         };
         push_segments_back(&mut queue, path);
         WalkState::Virtual {
-            mount_id,
-            mount_target,
-            fstype,
+            table_mount_id: vm.table_mount_id,
+            mount_id: vm.backing_mount_id,
+            mount_target: vm.target,
+            bind_prefix: vm.bind_prefix,
+            fstype: vm.fstype,
             parts,
             mem_ino,
         }
@@ -2426,8 +3189,10 @@ fn resolve_virtual_bytes<const M: usize>(
         last_mem_stat = None;
         match &mut walk_state {
             WalkState::Virtual {
+                table_mount_id,
                 mount_id,
                 mount_target,
+                bind_prefix,
                 fstype,
                 parts,
                 mem_ino,
@@ -2442,23 +3207,38 @@ fn resolve_virtual_bytes<const M: usize>(
                         }
                     } else {
                         let parent_abs = parent_abs_path(mount_target);
-                        if let Some((pm_id, p_fs, p_tgt)) =
-                            find_virtual_mount_for_path(state, parent_abs)
+                        if let Some(pvm) = resolve_virtual_mount_entry(state, mnt_ns_id, parent_abs)
                         {
-                            let p_rel = if parent_abs.len() > p_tgt.len() {
-                                &parent_abs[p_tgt.len() + 1..]
+                            let p_rel = if parent_abs.len() > pvm.target.len() {
+                                if pvm.target == b"/" {
+                                    &parent_abs[1..]
+                                } else {
+                                    &parent_abs[pvm.target.len() + 1..]
+                                }
                             } else {
                                 b""
                             };
                             let p_parts = split_nonempty_segments(p_rel);
-                            let p_mem_ino = if is_memfs_fstype(p_fs) {
-                                walk_memfs_ino(&state.memfs, pm_id, &p_parts)?
+                            let p_mem_ino = if is_memfs_fstype(pvm.fstype) {
+                                let start = memfs_start_stat(
+                                    &state.memfs,
+                                    pvm.backing_mount_id,
+                                    pvm.bind_root_ino,
+                                )?;
+                                walk_memfs_ino_from(
+                                    &state.memfs,
+                                    pvm.backing_mount_id,
+                                    start.ino,
+                                    &p_parts,
+                                )?
                             } else {
                                 0
                             };
-                            *mount_id = pm_id;
-                            *mount_target = p_tgt;
-                            *fstype = p_fs;
+                            *table_mount_id = pvm.table_mount_id;
+                            *mount_id = pvm.backing_mount_id;
+                            *mount_target = pvm.target;
+                            *bind_prefix = pvm.bind_prefix;
+                            *fstype = pvm.fstype;
                             *parts = p_parts;
                             *mem_ino = p_mem_ino;
                         } else {
@@ -2472,30 +3252,51 @@ fn resolve_virtual_bytes<const M: usize>(
                 let cand_abs = join_abs_from_mount(mount_target, parts);
 
                 // Check crossing into a child mountpoint.
-                if let Some((cm_id, c_fs, c_tgt)) = find_virtual_mount_for_path(state, &cand_abs)
-                    && cm_id != *mount_id
-                    && c_tgt.len() > mount_target.len()
-                    && c_tgt == cand_abs.as_slice()
+                if let Ok((c_ent, c_rel)) = ns_mounts.resolve(&cand_abs)
+                    && c_rel.is_empty()
+                    && c_ent.mount_id() != *table_mount_id
+                    && c_ent.target().len() > mount_target.len()
                 {
-                    *mount_id = cm_id;
-                    *mount_target = c_tgt;
-                    *fstype = c_fs;
-                    parts.clear();
-                    *mem_ino = if is_memfs_fstype(c_fs) {
-                        let root = state.memfs.root_stat(cm_id).ok_or(Errno::ENOENT)?;
-                        if is_final {
-                            last_mem_stat = Some(root);
-                        }
-                        root.ino
-                    } else {
-                        0
-                    };
+                    if is_virtual_fstype(c_ent.fstype()) {
+                        let cmeta = find_bind_meta(ns_bind_meta, c_ent.mount_id());
+                        let c_back = cmeta
+                            .and_then(|m| {
+                                if m.backing_mount_id != 0 {
+                                    Some(m.backing_mount_id)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or_else(|| c_ent.mount_id());
+                        let c_ino = cmeta.map_or(0, |m| m.bind_root_ino);
+                        let c_bp = cmeta.map(|m| m.bind_prefix().to_vec()).unwrap_or_default();
+                        *table_mount_id = c_ent.mount_id();
+                        *mount_id = c_back;
+                        *mount_target = c_ent.target().to_vec();
+                        *bind_prefix = c_bp;
+                        *fstype = c_ent.fstype();
+                        parts.clear();
+                        *mem_ino = if is_memfs_fstype(*fstype) {
+                            let root = memfs_start_stat(&state.memfs, c_back, c_ino)?;
+                            if is_final {
+                                last_mem_stat = Some(root);
+                            } else if root.kind != MemNodeKind::Dir {
+                                return Err(Errno::ENOTDIR);
+                            }
+                            root.ino
+                        } else {
+                            0
+                        };
+                        continue;
+                    }
+                    walk_state = WalkState::Host(split_nonempty_segments(&cand_abs));
                     continue;
                 }
-                if state
-                    .ext4_mounts
-                    .iter()
-                    .any(|m| m.live && &m.mount_path[..m.mount_path_len] == cand_abs.as_slice())
+                if mnt_ns_id == INIT_MNT_NS_ID
+                    && state
+                        .ext4_mounts
+                        .iter()
+                        .any(|m| m.live && &m.mount_path[..m.mount_path_len] == cand_abs.as_slice())
                 {
                     walk_state = WalkState::Host(split_nonempty_segments(&cand_abs));
                     continue;
@@ -2572,11 +3373,12 @@ fn resolve_virtual_bytes<const M: usize>(
                     continue;
                 }
 
-                let rel = join_part_slices(parts);
+                let rel_under = join_part_slices(parts);
+                let rel = join_rel(bind_prefix, &rel_under);
                 let node = match synthesize_virtual_node(
                     *fstype,
                     &rel,
-                    mounts,
+                    ns_mounts,
                     Some(&state.fds),
                     caller,
                     hostname,
@@ -2644,23 +3446,30 @@ fn resolve_virtual_bytes<const M: usize>(
                 } else {
                     parts.push(seg);
                     let cand_abs = host_absolute_from_parts(parts);
-                    if let Some((vm_id, v_fs, v_tgt)) =
-                        find_virtual_mount_for_path(state, &cand_abs)
-                        && v_tgt == cand_abs.as_slice()
+                    if let Some(vm) = resolve_virtual_mount_entry(state, mnt_ns_id, &cand_abs)
+                        && vm.target == cand_abs.as_slice()
                     {
-                        let mem_ino = if is_memfs_fstype(v_fs) {
-                            let root = state.memfs.root_stat(vm_id).ok_or(Errno::ENOENT)?;
+                        let mem_ino = if is_memfs_fstype(vm.fstype) {
+                            let root = memfs_start_stat(
+                                &state.memfs,
+                                vm.backing_mount_id,
+                                vm.bind_root_ino,
+                            )?;
                             if is_final {
                                 last_mem_stat = Some(root);
+                            } else if root.kind != MemNodeKind::Dir {
+                                return Err(Errno::ENOTDIR);
                             }
                             root.ino
                         } else {
                             0
                         };
                         walk_state = WalkState::Virtual {
-                            mount_id: vm_id,
-                            mount_target: v_tgt,
-                            fstype: v_fs,
+                            table_mount_id: vm.table_mount_id,
+                            mount_id: vm.backing_mount_id,
+                            mount_target: vm.target,
+                            bind_prefix: vm.bind_prefix,
+                            fstype: vm.fstype,
                             parts: Vec::new(),
                             mem_ino,
                         };
@@ -2672,15 +3481,22 @@ fn resolve_virtual_bytes<const M: usize>(
 
     Ok(Some(match walk_state {
         WalkState::Virtual {
+            table_mount_id: _,
             mount_id,
             mount_target,
+            bind_prefix,
             fstype,
             parts,
             mem_ino,
         } => {
-            let rel_path = join_part_slices(&parts);
-            let abs_path = join_mount_and_rel(&mount_target, &rel_path);
-            let is_mount_root = rel_path.is_empty();
+            let rel_under = join_part_slices(&parts);
+            let abs_path = join_mount_and_rel(&mount_target, &rel_under);
+            let rel_path = if is_memfs_fstype(fstype) {
+                rel_under.clone()
+            } else {
+                join_rel(&bind_prefix, &rel_under)
+            };
+            let is_mount_root = parts.is_empty();
             if is_memfs_fstype(fstype) {
                 let mem_stat = match last_mem_stat {
                     Some(st) => Some(st),
@@ -2704,7 +3520,7 @@ fn resolve_virtual_bytes<const M: usize>(
                     None => Some(synthesize_virtual_node(
                         fstype,
                         &rel_path,
-                        mounts,
+                        ns_mounts,
                         Some(&state.fds),
                         caller,
                         hostname,
@@ -2959,6 +3775,12 @@ fn synthesize_proc_virtual_node<const M: usize>(
                 make_dir_entry(FilesystemType::Procfs, rel, b".", NodeKind::Directory),
                 make_dir_entry(FilesystemType::Procfs, rel, b"..", NodeKind::Directory),
                 make_dir_entry(FilesystemType::Procfs, rel, b"hostname", NodeKind::Regular),
+                make_dir_entry(
+                    FilesystemType::Procfs,
+                    rel,
+                    b"domainname",
+                    NodeKind::Regular,
+                ),
                 make_dir_entry(FilesystemType::Procfs, rel, b"osrelease", NodeKind::Regular),
                 make_dir_entry(FilesystemType::Procfs, rel, b"random", NodeKind::Directory),
             ]));
@@ -3280,13 +4102,13 @@ fn cwd_if_at_fdcwd(owner: ObjectId, dirfd: u64) -> Option<Vec<u8>> {
 }
 
 fn try_delegate_dev_open(abs_path: &[u8], flags: u64) -> Result<Option<SyscallReturn>, ()> {
-    if !abs_path.starts_with(b"/dev/") {
-        return Ok(None);
-    }
     if let Some(ret) =
         super::step37_38_systemd_udev::try_open_kmsg_or_uevent_bytes(abs_path, flags)?
     {
         return Ok(Some(ret));
+    }
+    if !abs_path.starts_with(b"/dev/") {
+        return Ok(None);
     }
     if let Some(ret) = super::step42_hardware::try_open_dev_bytes_if_block(abs_path, flags)? {
         return Ok(Some(ret));
@@ -3483,8 +4305,13 @@ fn open_virtual_resolved(
             if (flags & O_DIRECTORY) != 0 {
                 return Ok((None, Err(Errno::ENOTDIR)));
             }
-            if !is_path && abs_path.starts_with(b"/dev/") {
-                return Ok((Some(abs_path), Err(Errno::ENOENT)));
+            if !is_path {
+                if abs_path.starts_with(b"/dev/") {
+                    return Ok((Some(abs_path), Err(Errno::ENOENT)));
+                }
+                if let Some(dev_path) = super::step33_memfs::dev_path_for_rdev(ms.rdev) {
+                    return Ok((Some(dev_path.to_vec()), Err(Errno::ENOENT)));
+                }
             }
         }
         if ms.kind == MemNodeKind::Symlink && (flags & O_NOFOLLOW) != 0 && !is_path {
@@ -3542,6 +4369,7 @@ fn open_virtual_resolved(
         state.next_generation = state.next_generation.wrapping_add(1).max(1);
         let mut owners = DirectProcessRefs::empty();
         owners.init(owner, close_on_exec);
+        let cur_ns_gen = state.ns_mounts_gen(caller.mnt_ns_id);
         state.fds[slot_idx] = ProcSysFdEntry {
             live: true,
             is_dir,
@@ -3549,6 +4377,7 @@ fn open_virtual_resolved(
             alias_refs: 0,
             owners,
             mount_id,
+            mnt_ns_id: caller.mnt_ns_id,
             fstype,
             mem_ino: ms.ino,
             readable,
@@ -3560,25 +4389,29 @@ fn open_virtual_resolved(
             offset: 0,
             content: Vec::new(),
             dir_entries,
-            last_mount_gen: state.mounts_gen,
+            last_mount_gen: cur_ns_gen,
+            last_poll_gen: cur_ns_gen,
         };
         return Ok((None, Ok(i64::from(PROC_SYS_FD_BASE + (slot_idx as i32)))));
     }
 
     let node = match virt_node_opt {
         Some(n) => n,
-        None => match synthesize_virtual_node(
-            fstype,
-            &rel_path,
-            &state.mounts,
-            Some(&state.fds),
-            caller,
-            &state.hostname[..state.hostname_len],
-            state.boot_id_seed,
-        ) {
-            Ok(n) => n,
-            Err(e) => return Ok((None, Err(e))),
-        },
+        None => {
+            let ns_mounts = state.ns_view(caller.mnt_ns_id).0;
+            match synthesize_virtual_node(
+                fstype,
+                &rel_path,
+                ns_mounts,
+                Some(&state.fds),
+                caller,
+                &state.hostname[..state.hostname_len],
+                state.boot_id_seed,
+            ) {
+                Ok(n) => n,
+                Err(e) => return Ok((None, Err(e))),
+            }
+        }
     };
     let is_dir = matches!(node, VirtualNode::Directory(_));
     if (flags & O_DIRECTORY) != 0 && !is_dir {
@@ -3616,6 +4449,7 @@ fn open_virtual_resolved(
         VirtualNode::Regular(bytes) => (bytes, Vec::new()),
         VirtualNode::Symlink(bytes) => (bytes, Vec::new()),
     };
+    let cur_ns_gen = state.ns_mounts_gen(caller.mnt_ns_id);
     state.fds[slot_idx] = ProcSysFdEntry {
         live: true,
         is_dir,
@@ -3623,6 +4457,7 @@ fn open_virtual_resolved(
         alias_refs: 0,
         owners,
         mount_id,
+        mnt_ns_id: caller.mnt_ns_id,
         fstype,
         mem_ino: 0,
         readable,
@@ -3634,9 +4469,11 @@ fn open_virtual_resolved(
         offset: 0,
         content,
         dir_entries,
-        last_mount_gen: state.mounts_gen,
+        last_mount_gen: cur_ns_gen,
+        last_poll_gen: cur_ns_gen,
     };
-    Ok((None, Ok(i64::from(PROC_SYS_FD_BASE + (slot_idx as i32)))))
+    let fd_num = i64::from(PROC_SYS_FD_BASE + (slot_idx as i32));
+    Ok((None, Ok(fd_num)))
 }
 
 fn finish_open_action(
@@ -3821,25 +4658,27 @@ fn is_live_mountinfo_proc_path(rel_path: &[u8]) -> bool {
 
 fn refresh_procfs_fd_entry(state: &mut Step33MountState, idx: usize, caller: &CallerSnapshotData) {
     let entry = &state.fds[idx];
+    let cur_ns_gen = state.ns_mounts_gen(entry.mnt_ns_id);
     if entry.mem_ino != 0
         || entry.is_dir
         || entry.fstype != FilesystemType::Procfs
         || !is_live_mountinfo_proc_path(&entry.rel_path)
-        || entry.last_mount_gen == state.mounts_gen
+        || entry.last_mount_gen == cur_ns_gen
     {
         return;
     }
+    let ns_mounts = state.ns_view(entry.mnt_ns_id).0;
     if let Ok(VirtualNode::Regular(bytes)) = synthesize_virtual_node(
         entry.fstype,
         &entry.rel_path,
-        &state.mounts,
+        ns_mounts,
         Some(&state.fds),
         caller,
         &state.hostname[..state.hostname_len],
         state.boot_id_seed,
     ) {
         state.fds[idx].content = bytes;
-        state.fds[idx].last_mount_gen = state.mounts_gen;
+        state.fds[idx].last_mount_gen = cur_ns_gen;
     }
 }
 
@@ -4095,6 +4934,7 @@ fn handle_writev(raw_fd: u64, user_iov: u64, raw_iovcnt: u64) -> Result<Result<i
 
 fn virtual_target_stat_meta(
     mount_id: u32,
+    mnt_id: u32,
     is_mount_root: bool,
     fstype: FilesystemType,
     rel_path: &[u8],
@@ -4126,7 +4966,7 @@ fn virtual_target_stat_meta(
             mtime_nsec: 0,
             ctime_sec: i64::from(ms.ctime),
             ctime_nsec: 0,
-            mnt_id: mount_id,
+            mnt_id,
             is_mount_root,
         };
     }
@@ -4152,7 +4992,7 @@ fn virtual_target_stat_meta(
         mtime_nsec: 0,
         ctime_sec: i64::from(EPOCH_BASE_SECONDS),
         ctime_nsec: 0,
-        mnt_id: mount_id,
+        mnt_id,
         is_mount_root,
     }
 }
@@ -4306,9 +5146,16 @@ fn stat_res_from_resolved(
             node,
             mem_stat,
         } => {
+            let ns_mounts = state.ns_view(caller.mnt_ns_id).0;
+            let (table_mnt_id, exact_mnt) = ns_mounts
+                .resolve(&abs_path)
+                .map(|(e, r)| (e.mount_id(), r.is_empty()))
+                .unwrap_or((mount_id, is_mount_root));
+            let is_mount_root = is_mount_root || exact_mnt;
             if let Some(ms) = mem_stat {
                 let meta = virtual_target_stat_meta(
                     mount_id,
+                    table_mnt_id,
                     is_mount_root,
                     fstype,
                     &rel_path,
@@ -4328,7 +5175,7 @@ fn stat_res_from_resolved(
                 None => match synthesize_virtual_node(
                     fstype,
                     &rel_path,
-                    &state.mounts,
+                    ns_mounts,
                     Some(&state.fds),
                     caller,
                     &state.hostname[..state.hostname_len],
@@ -4340,6 +5187,7 @@ fn stat_res_from_resolved(
             };
             StatRes::Ok(virtual_target_stat_meta(
                 mount_id,
+                table_mnt_id,
                 is_mount_root,
                 fstype,
                 &rel_path,
@@ -4633,7 +5481,13 @@ fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()
         let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
             return Err(Errno::EBADF);
         };
-        let is_mount_root = entry.rel_path.is_empty();
+        let (table_mnt_id, exact_mnt) = state
+            .ns_view(entry.mnt_ns_id)
+            .0
+            .resolve(&entry.abs_path)
+            .map(|(e, r)| (e.mount_id(), r.is_empty()))
+            .unwrap_or((entry.mount_id, entry.rel_path.is_empty()));
+        let is_mount_root = entry.rel_path.is_empty() || exact_mnt;
         if entry.mem_ino != 0 {
             let ms = state
                 .memfs
@@ -4641,6 +5495,7 @@ fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()
                 .ok_or(Errno::EBADF)?;
             return Ok(virtual_target_stat_meta(
                 entry.mount_id,
+                table_mnt_id,
                 is_mount_root,
                 entry.fstype,
                 &entry.rel_path,
@@ -4673,7 +5528,7 @@ fn handle_fstat(raw_fd: u64, user_statbuf: u64) -> Result<Result<i64, Errno>, ()
             mtime_nsec: 0,
             ctime_sec: i64::from(EPOCH_BASE_SECONDS),
             ctime_nsec: 0,
-            mnt_id: entry.mount_id,
+            mnt_id: table_mnt_id,
             is_mount_root,
         })
     })?;
@@ -5382,7 +6237,36 @@ fn handle_ftruncate(raw_fd: u64, length: i64) -> Result<Result<i64, Errno>, ()> 
     })
 }
 
-fn handle_fchmod(raw_fd: u64, raw_mode: u64) -> Result<Result<i64, Errno>, ()> {
+/// Linux `FALLOC_FL_KEEP_SIZE`: reserve space without changing the visible file size.
+pub(super) const FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+
+/// Validates `fallocate(2)` arguments shared by every backing store and returns the
+/// requested end offset. Only plain allocation (`mode == 0`) and `FALLOC_FL_KEEP_SIZE` are
+/// supported; hole punching / range collapsing report `EOPNOTSUPP` exactly like a filesystem
+/// lacking those operations, which lets glibc `posix_fallocate` keep its documented semantics.
+pub(super) fn validate_fallocate_args(raw_mode: u64, offset: i64, len: i64) -> Result<u64, Errno> {
+    let mode = u64::from(linux_unsigned_int(raw_mode));
+    if (mode & !FALLOC_FL_KEEP_SIZE) != 0 {
+        return Err(Errno::EOPNOTSUPP);
+    }
+    if offset < 0 || len <= 0 {
+        return Err(Errno::EINVAL);
+    }
+    let end = offset.checked_add(len).ok_or(Errno::EFBIG)?;
+    Ok(end as u64)
+}
+
+fn handle_fallocate(
+    raw_fd: u64,
+    raw_mode: u64,
+    offset: i64,
+    len: i64,
+) -> Result<Result<i64, Errno>, ()> {
+    let end = match validate_fallocate_args(raw_mode, offset, len) {
+        Ok(end) => end,
+        Err(e) => return Ok(Err(e)),
+    };
+    let keep_size = (u64::from(linux_unsigned_int(raw_mode)) & FALLOC_FL_KEEP_SIZE) != 0;
     let owner = current_process_id()?;
     let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
         return Ok(Err(Errno::EBADF));
@@ -5392,7 +6276,43 @@ fn handle_fchmod(raw_fd: u64, raw_mode: u64) -> Result<Result<i64, Errno>, ()> {
         let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
             return Err(Errno::EBADF);
         };
-        if entry.path_only {
+        if entry.path_only || !entry.writable {
+            return Err(Errno::EBADF);
+        }
+        if entry.is_dir {
+            return Err(Errno::EISDIR);
+        }
+        if entry.mem_ino == 0 {
+            return Err(Errno::ENODEV);
+        }
+        let (mount_id, ino) = (entry.mount_id, entry.mem_ino);
+        let st = state.memfs.stat_ino(mount_id, ino).ok_or(Errno::EBADF)?;
+        if st.kind != MemNodeKind::File {
+            return Err(Errno::ENODEV);
+        }
+        let end = usize::try_from(end).map_err(|_| Errno::EFBIG)?;
+        if !keep_size && (end as u64) > st.size {
+            state.memfs.truncate(mount_id, ino, end, now)?;
+        }
+        Ok(0)
+    })
+}
+
+fn fchmod_virtual_fd(
+    owner: ObjectId,
+    raw_fd: u64,
+    raw_mode: u64,
+    allow_path_fd: bool,
+) -> Result<Result<i64, Errno>, ()> {
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, raw_fd) else {
+        return Ok(Err(Errno::EBADF));
+    };
+    let now = current_epoch_now_secs();
+    with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.path_only && !allow_path_fd {
             return Err(Errno::EBADF);
         }
         if entry.mem_ino != 0 {
@@ -5405,19 +6325,32 @@ fn handle_fchmod(raw_fd: u64, raw_mode: u64) -> Result<Result<i64, Errno>, ()> {
     })
 }
 
+fn handle_fchmod(raw_fd: u64, raw_mode: u64) -> Result<Result<i64, Errno>, ()> {
+    let owner = current_process_id()?;
+    fchmod_virtual_fd(owner, raw_fd, raw_mode, false)
+}
+
 fn handle_fchmodat_virtual(
     dirfd: u64,
     user_path: u64,
     raw_mode: u64,
     flags: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
-    if (flags & !AT_SYMLINK_NOFOLLOW) != 0 {
+    if (flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0 {
         return Ok(None);
     }
     let owner = current_process_id()?;
     let Ok(raw) = read_user_path_vec(user_path) else {
         return Ok(None);
     };
+    if raw.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        if resolve_proc_sys_slot_idx(owner, dirfd).is_ok() {
+            return Ok(Some(encode_result(fchmod_virtual_fd(
+                owner, dirfd, raw_mode, true,
+            )?)));
+        }
+        return Ok(None);
+    }
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let caller = CallerSnapshotData::capture();
     let now = current_epoch_now_secs();
@@ -5545,6 +6478,36 @@ fn handle_fchownat_virtual(
     Ok(res.map(encode_result))
 }
 
+fn handle_utimens_on_fd(
+    owner: ObjectId,
+    dirfd: u64,
+    user_times: u64,
+    now: u32,
+) -> Result<Option<SyscallReturn>, ()> {
+    if !is_proc_sys_fd(dirfd) && !is_aliased_proc_sys_fd(dirfd) {
+        return Ok(None);
+    }
+    let (atime, mtime) = match parse_utimens_pair(user_times, now) {
+        Ok(v) => v,
+        Err(e) => return Ok(Some(SyscallReturn::error(e))),
+    };
+    let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, dirfd) else {
+        return Ok(Some(SyscallReturn::error(Errno::EBADF)));
+    };
+    let res = with_mount_state(|state| {
+        let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
+            return Err(Errno::EBADF);
+        };
+        if entry.mem_ino != 0 {
+            state
+                .memfs
+                .utimens(entry.mount_id, entry.mem_ino, atime, mtime, now)?;
+        }
+        Ok(0)
+    })?;
+    Ok(Some(encode_result(res)))
+}
+
 fn handle_utimensat_virtual(
     dirfd: u64,
     user_path: u64,
@@ -5554,32 +6517,14 @@ fn handle_utimensat_virtual(
     let owner = current_process_id()?;
     let now = current_epoch_now_secs();
     if user_path == 0 {
-        if !is_proc_sys_fd(dirfd) && !is_aliased_proc_sys_fd(dirfd) {
-            return Ok(None);
-        }
-        let (atime, mtime) = match parse_utimens_pair(user_times, now) {
-            Ok(v) => v,
-            Err(e) => return Ok(Some(SyscallReturn::error(e))),
-        };
-        let Ok((idx, alias_gen)) = resolve_proc_sys_slot_idx(owner, dirfd) else {
-            return Ok(Some(SyscallReturn::error(Errno::EBADF)));
-        };
-        let res = with_mount_state(|state| {
-            let Some(entry) = resolve_proc_sys_entry(state, owner, idx, alias_gen) else {
-                return Err(Errno::EBADF);
-            };
-            if entry.mem_ino != 0 {
-                state
-                    .memfs
-                    .utimens(entry.mount_id, entry.mem_ino, atime, mtime, now)?;
-            }
-            Ok(0)
-        })?;
-        return Ok(Some(encode_result(res)));
+        return handle_utimens_on_fd(owner, dirfd, user_times, now);
     }
     let Ok(raw) = read_user_path_vec(user_path) else {
         return Ok(None);
     };
+    if raw.is_empty() && (flags & AT_EMPTY_PATH) != 0 {
+        return handle_utimens_on_fd(owner, dirfd, user_times, now);
+    }
     let follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
     let caller = CallerSnapshotData::capture();
     let cwd = cwd_if_at_fdcwd(owner, dirfd);
@@ -5673,6 +6618,7 @@ fn handle_name_to_handle_at(
             ResolvedVirtualTarget::Virtual {
                 mount_id,
                 fstype,
+                abs_path,
                 rel_path,
                 mem_stat,
                 ..
@@ -5681,7 +6627,13 @@ fn handle_name_to_handle_at(
                     Some(ms) => ms.ino,
                     None => virtual_inode(fstype, &rel_path),
                 };
-                HandleRes::Virtual(ino, mount_id)
+                let table_mnt_id = state
+                    .ns_view(caller.mnt_ns_id)
+                    .0
+                    .resolve(&abs_path)
+                    .map(|(e, _)| e.mount_id())
+                    .unwrap_or(mount_id);
+                HandleRes::Virtual(ino, table_mnt_id)
             }
         }
     })?;
@@ -6470,9 +7422,12 @@ fn encode_statfs(fstype: FilesystemType, flags: u64) -> [u8; ARM64_STATFS_BYTES]
     let mut buf = [0u8; ARM64_STATFS_BYTES];
     buf[0..8].copy_from_slice(&fstype.f_type_magic().to_le_bytes()); // f_type
     buf[8..16].copy_from_slice(&4096u64.to_le_bytes()); // f_bsize
-    buf[16..24].copy_from_slice(&65536u64.to_le_bytes()); // f_blocks
-    buf[24..32].copy_from_slice(&48000u64.to_le_bytes()); // f_bfree
-    buf[32..40].copy_from_slice(&48000u64.to_le_bytes()); // f_bavail
+    // Virtual filesystems are backed by the bounded kernel heap (MemFs), so advertise a
+    // 16 MiB capacity. Userspace sizing heuristics (e.g. journald's 10% runtime limit) then
+    // stay inside what MemFs can actually store instead of failing later with ENOSPC.
+    buf[16..24].copy_from_slice(&4096u64.to_le_bytes()); // f_blocks
+    buf[24..32].copy_from_slice(&3072u64.to_le_bytes()); // f_bfree
+    buf[32..40].copy_from_slice(&3072u64.to_le_bytes()); // f_bavail
     buf[40..48].copy_from_slice(&16384u64.to_le_bytes()); // f_files
     buf[48..56].copy_from_slice(&14000u64.to_le_bytes()); // f_ffree
     buf[64..72].copy_from_slice(&255u64.to_le_bytes()); // f_namelen

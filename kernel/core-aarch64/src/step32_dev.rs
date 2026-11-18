@@ -33,6 +33,7 @@ const O_NONBLOCK: u64 = 0x0000_0800;
 const O_DIRECTORY: u64 = 0x0000_4000;
 const O_CLOEXEC: u64 = 0x0008_0000;
 const O_PATH: u64 = 0x0020_0000;
+const TIOCNOTTY: u32 = 0x5422;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeviceAccess {
@@ -202,19 +203,19 @@ fn is_aliased_dev_fd(raw_fd: u64) -> bool {
     lookup_aliased_subsystem_current(raw_fd).is_some_and(|h| h.kind == SUBSYS_DEV)
 }
 
-pub(super) fn retain_alias_handle(
-    process: ObjectId,
-    raw_fd: u64,
+fn retain_dev_slot(
+    slot_idx: usize,
+    owner: Option<ObjectId>,
+    expected_gen: Option<u64>,
 ) -> Result<(SubsystemHandle, u64), Errno> {
-    if !is_dev_fd(raw_fd) {
-        return Err(Errno::EBADF);
-    }
-    let slot_idx = (linux_signed_int(raw_fd) - DEV_FD_BASE) as usize;
     with_dev_state(|state| {
         let Some(entry) = state.fds.get_mut(slot_idx) else {
             return Err(Errno::EBADF);
         };
-        if !entry.live || !entry.owners.has_owner(process) {
+        let valid = entry.live
+            && owner.map_or(true, |p| entry.owners.has_owner(p))
+            && expected_gen.map_or(true, |g| entry.generation == g);
+        if !valid {
             return Err(Errno::EBADF);
         }
         entry.alias_refs += 1;
@@ -228,6 +229,26 @@ pub(super) fn retain_alias_handle(
         ))
     })
     .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn retain_alias_handle(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if !is_dev_fd(raw_fd) {
+        return Err(Errno::EBADF);
+    }
+    let slot_idx = (linux_signed_int(raw_fd) - DEV_FD_BASE) as usize;
+    retain_dev_slot(slot_idx, Some(process), None)
+}
+
+pub(super) fn retain_existing_handle(
+    handle: SubsystemHandle,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if handle.kind != SUBSYS_DEV {
+        return Err(Errno::EBADF);
+    }
+    retain_dev_slot(handle.slot as usize, None, Some(handle.generation))
 }
 
 pub(super) fn append_open_dev_fds(process: ObjectId, out: &mut alloc::vec::Vec<i32>) {
@@ -277,6 +298,7 @@ fn format_dev_node_path(kind: DeviceNodeKind, out: &mut [u8]) -> usize {
         DeviceNodeKind::Urandom => Some(b"/dev/urandom"),
         DeviceNodeKind::Tty => Some(b"/dev/tty"),
         DeviceNodeKind::Console => Some(b"/dev/console"),
+        DeviceNodeKind::TtyAma0 => Some(b"/dev/ttyAMA0"),
         DeviceNodeKind::Ptmx => Some(b"/dev/ptmx"),
         DeviceNodeKind::Pts(_) => None,
     };
@@ -534,7 +556,9 @@ pub(super) fn probe_dev_fd_readiness(process: ObjectId, raw_fd: u64) -> Option<R
             None => return Outcome::Err(Errno::EBADF),
         };
         match entry.backing {
-            DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console) => {
+            DevBacking::Node(
+                DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
+            ) => {
                 let (pending_sig, mask) = probe_console_in_state(state);
                 Outcome::Console(pending_sig, mask)
             }
@@ -567,6 +591,14 @@ pub(super) fn probe_dev_fd_readiness(process: ObjectId, raw_fd: u64) -> Option<R
 
 pub(super) fn poll_console_rx_and_deliver_signals() {
     let _ = probe_console_readiness();
+}
+
+/// Clears Step 31's pre-attached PID 1 console session when PID 1 execs `/sbin/init` (`systemd`)
+/// so `console-getty`/`agetty` can acquire `/dev/console` via `TIOCSCTTY`.
+pub(super) fn detach_pid1_console_session_on_init_exec() {
+    let _ = with_dev_state(|state| {
+        state.console_session.clear_pid1_controlling_session();
+    });
 }
 
 /// Reads committed console line-discipline bytes via PL011 RX into `user_buffer`.
@@ -854,18 +886,18 @@ pub(super) fn handle_dev_ioctl(
                 };
                 Ok((res, None))
             }
-            DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console) => {
-                handle_console_backing_ioctl(
-                    &mut state.console_ldisc,
-                    &mut state.console_session,
-                    caller_pid,
-                    caller_pgid,
-                    caller_sid,
-                    cmd,
-                    arg,
-                    sigttou_ignored_or_blocked,
-                )
-            }
+            DevBacking::Node(
+                DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
+            ) => handle_console_backing_ioctl(
+                &mut state.console_ldisc,
+                &mut state.console_session,
+                caller_pid,
+                caller_pgid,
+                caller_sid,
+                cmd,
+                arg,
+                sigttou_ignored_or_blocked,
+            ),
             DevBacking::PtySlave(slave) => {
                 if matches!(
                     cmd,
@@ -921,7 +953,7 @@ fn handle_console_backing_ioctl(
         TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSWINSZ => {
             Ok((handle_ldisc_ioctl(ldisc, cmd, arg)?, None))
         }
-        TIOCSCTTY | TIOCGPGRP | TIOCSPGRP => handle_session_ioctl(
+        TIOCSCTTY | TIOCNOTTY | TIOCGPGRP | TIOCSPGRP => handle_session_ioctl(
             session,
             caller_pid,
             caller_pgid,
@@ -997,9 +1029,18 @@ fn handle_session_ioctl(
 ) -> Result<(SyscallReturn, Option<kernal_linux_dev::TtySignal>), ()> {
     match cmd {
         TIOCSCTTY => {
-            if let Err(err) =
-                session.attach_controlling_session(caller_pid, caller_sid, caller_pgid)
-            {
+            if let Err(err) = session.attach_controlling_session_with_force(
+                caller_pid,
+                caller_sid,
+                caller_pgid,
+                arg == 1,
+            ) {
+                return Ok((SyscallReturn::error(err.to_errno()), None));
+            }
+            Ok((SyscallReturn::success(0).ok_or(())?, None))
+        }
+        TIOCNOTTY => {
+            if let Err(err) = session.detach_controlling_session(caller_sid) {
                 return Ok((SyscallReturn::error(err.to_errno()), None));
             }
             Ok((SyscallReturn::success(0).ok_or(())?, None))
@@ -1169,6 +1210,7 @@ fn lseek_dev_fd(raw_fd: u64) -> Result<SyscallReturn, ()> {
             | DeviceNodeKind::Urandom => Ok(SyscallReturn::success(0).ok_or(())?),
             DeviceNodeKind::Tty
             | DeviceNodeKind::Console
+            | DeviceNodeKind::TtyAma0
             | DeviceNodeKind::Ptmx
             | DeviceNodeKind::Pts(_) => Ok(SyscallReturn::error(Errno::ESPIPE)),
         }
@@ -1278,7 +1320,9 @@ fn read_dev_entry(
             }
             Ok(SyscallReturn::success(total as i64).ok_or(())?)
         }
-        DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console) => {
+        DevBacking::Node(
+            DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
+        ) => {
             #[cfg(feature = "step31-debian-shell")]
             {
                 return read_console_into_user(user_buffer, requested, entry.nonblocking, frame);
@@ -1613,7 +1657,9 @@ fn write_dev_entry(
                     };
                 }
             },
-            DevBacking::Node(DeviceNodeKind::Tty | DeviceNodeKind::Console) => {
+            DevBacking::Node(
+                DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
+            ) => {
                 let sigttou_ignored_or_blocked =
                     super::step30_runtime::current_signal_is_ignored_or_blocked(
                         kernal_linux_signal::SIGTTOU,

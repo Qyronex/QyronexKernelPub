@@ -14,10 +14,10 @@ use kernal_linux_dpkg::{
 };
 
 const CAP_FOWNER: u32 = 3;
-const MAX_LOCKS: usize = 64;
-const MAX_XATTRS: usize = 32;
+const MAX_LOCKS: usize = 128;
+const MAX_XATTRS: usize = 256;
 const MAX_XATTR_VAL: usize = 128;
-const MAX_META: usize = 32;
+const MAX_META: usize = 128;
 const MAX_PATH_BYTES: usize = 512;
 const MAX_XATTR_NAME: usize = 64;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;

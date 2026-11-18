@@ -14,30 +14,35 @@ use kernal_linux_fd::SubsystemHandle;
 use kernal_linux_net::stack::{NetStack, TcpConnState};
 use kernal_linux_net::{
     AF_INET, AF_INET6, AF_NETLINK, AF_UNSPEC, IPPROTO_IPV6, IPPROTO_TCP, IPV6_V6ONLY,
-    MAX_SCM_RIGHTS_FDS, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, NETLINK_ROUTE, NetInterfaceConfig,
-    SCM_CREDENTIALS, SCM_RIGHTS, SHUT_RD, SHUT_RDWR, SHUT_WR, SO_ACCEPTCONN, SO_DOMAIN, SO_ERROR,
-    SO_PROTOCOL, SO_RCVBUF, SO_RCVTIMEO_NEW, SO_RCVTIMEO_OLD, SO_SNDBUF, SO_SNDTIMEO_NEW,
-    SO_SNDTIMEO_OLD, SO_TYPE, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SockAddr, SocketTable, Ucred,
-    handle_netlink_route_request_with_cfg,
+    MAX_DGRAM_PKTS, MAX_SCM_RIGHTS_FDS, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_PEEK, NETLINK_ROUTE,
+    NetInterfaceConfig, SCM_CREDENTIALS, SCM_RIGHTS, SHUT_RD, SHUT_RDWR, SHUT_WR, SO_ACCEPTCONN,
+    SO_DOMAIN, SO_ERROR, SO_PROTOCOL, SO_RCVBUF, SO_RCVTIMEO_NEW, SO_RCVTIMEO_OLD, SO_SNDBUF,
+    SO_SNDTIMEO_NEW, SO_SNDTIMEO_OLD, SO_TYPE, SOCK_DGRAM, SOCK_STREAM, SOL_SOCKET, SockAddr,
+    SocketTable, Ucred, handle_netlink_route_request_with_cfg,
 };
 
 use super::step_fd_util::{
-    DirectProcessRefs, SUBSYS_NET, current_process_object, lookup_aliased_subsystem,
-    lookup_aliased_subsystem_current, read_user_iovec,
+    DirectProcessRefs, SUBSYS_NET, current_process_object, install_subsystem_fd_in_process,
+    lookup_aliased_subsystem, lookup_aliased_subsystem_current, read_user_iovec,
+    release_subsystem_handle, retain_any_subsystem_fd, retain_existing_subsystem_handle,
+    rollback_subsystem_fd_in_process,
 };
 
-/// Dedicated file-descriptor base for Step-34 sockets (`128..160`), partitioned cleanly above
-/// `STEP29_RUNTIME_FDS` (`0..64`), `DEV_FD_BASE` (`64..96`), and `PROC_SYS_FD_BASE` (`96..128`).
-pub(super) const SOCK_FD_BASE: i32 = 128;
-const MAX_SOCKETS: usize = 32;
+/// Dedicated file-descriptor base for Step-34 sockets (`736..800`), partitioned cleanly above
+/// `EVENT_FD_BASE` (`672..736`) and `PROC_SYS_FD_BASE` (`416..672`).
+pub(super) const SOCK_FD_BASE: i32 = 736;
+const MAX_SOCKETS: usize = 64;
 const SOCK_BUF_CAP: usize = 4096;
+const MAX_INFLIGHT_SCM_RIGHTS: usize = 64;
 const MAX_IOV_BYTES: usize = 65_536;
 const MAX_SOCKADDR_BYTES: usize = 128;
 const ARM64_STAT_BYTES: usize = 128;
 const S_IFSOCK_MODE: u32 = 0o140_777;
 const SOCK_CLOEXEC_FLAG: u32 = 0x0008_0000;
 const SOCK_NONBLOCK_FLAG: u32 = 0x0000_0800;
+const MSG_CTRUNC: u32 = 0x0008;
 const MSG_TRUNC: u32 = 0x0020;
+const MSG_CMSG_CLOEXEC: u32 = 0x4000_0000;
 const SOL_NETLINK: u32 = 270;
 const O_RDWR_U64: u64 = 2;
 
@@ -116,10 +121,34 @@ impl SocketMeta {
     };
 }
 
+#[derive(Clone, Copy)]
+struct InflightScmRight {
+    live: bool,
+    generation: u32,
+    handle: SubsystemHandle,
+    status_flags: u64,
+}
+
+impl InflightScmRight {
+    const EMPTY: Self = Self {
+        live: false,
+        generation: 0,
+        handle: SubsystemHandle {
+            kind: 0,
+            slot: 0,
+            generation: 0,
+        },
+        status_flags: 0,
+    };
+}
+
 struct Step34NetState {
     next_generation: u64,
+    next_scm_gen: u32,
     table: SocketTable<MAX_SOCKETS, SOCK_BUF_CAP>,
     meta: [SocketMeta; MAX_SOCKETS],
+    scm_rights: [InflightScmRight; MAX_INFLIGHT_SCM_RIGHTS],
+    pending_scm_release: Vec<SubsystemHandle>,
     hw_net: Option<NetStack>,
     netlink_rx: Vec<VecDeque<Vec<u8>>>,
 }
@@ -128,11 +157,61 @@ impl Step34NetState {
     const fn new() -> Self {
         Self {
             next_generation: 1,
+            next_scm_gen: 1,
             table: SocketTable::new(),
             meta: [SocketMeta::EMPTY; MAX_SOCKETS],
+            scm_rights: [InflightScmRight::EMPTY; MAX_INFLIGHT_SCM_RIGHTS],
+            pending_scm_release: Vec::new(),
             hw_net: None,
             netlink_rx: Vec::new(),
         }
+    }
+
+    fn alloc_scm_right(
+        &mut self,
+        handle: SubsystemHandle,
+        status_flags: u64,
+    ) -> Result<i32, Errno> {
+        let Some((idx, entry)) = self
+            .scm_rights
+            .iter_mut()
+            .enumerate()
+            .find(|(_, e)| !e.live)
+        else {
+            return Err(Errno::EMFILE);
+        };
+        let generation = self.next_scm_gen;
+        self.next_scm_gen = (self.next_scm_gen % 0x007f_ffff) + 1;
+        *entry = InflightScmRight {
+            live: true,
+            generation,
+            handle,
+            status_flags,
+        };
+        Ok(((generation as i32) << 8) | (idx as i32))
+    }
+
+    fn lookup_scm_idx(&self, token: i32) -> Option<usize> {
+        if token <= 0 {
+            return None;
+        }
+        let idx = (token as usize) & 0xff;
+        let expected_gen = (token as u32) >> 8;
+        let entry = self.scm_rights.get(idx)?;
+        (entry.live && entry.generation == expected_gen).then_some(idx)
+    }
+
+    fn take_scm_right(&mut self, token: i32) -> Option<(SubsystemHandle, u64)> {
+        let idx = self.lookup_scm_idx(token)?;
+        let entry = self.scm_rights[idx];
+        self.scm_rights[idx] = InflightScmRight::EMPTY;
+        Some((entry.handle, entry.status_flags))
+    }
+
+    fn peek_scm_right(&self, token: i32) -> Option<(SubsystemHandle, u64)> {
+        let idx = self.lookup_scm_idx(token)?;
+        let entry = self.scm_rights[idx];
+        Some((entry.handle, entry.status_flags))
     }
 
     fn ensure_netlink_vec(&mut self) {
@@ -196,14 +275,24 @@ impl Step34NetState {
     }
 
     fn retire_if_unused(&mut self, idx: usize, now_ns: u64) {
-        let Some(m) = self.meta.get_mut(idx) else {
-            return;
+        let hw = {
+            let Some(m) = self.meta.get_mut(idx) else {
+                return;
+            };
+            if !m.live || !m.owners.is_empty() || m.alias_refs > 0 {
+                return;
+            }
+            let hw = m.hw;
+            *m = SocketMeta::EMPTY;
+            hw
         };
-        if !m.live || !m.owners.is_empty() || m.alias_refs > 0 {
-            return;
+        let mut drained = [-1i32; MAX_SCM_RIGHTS_FDS + MAX_DGRAM_PKTS * MAX_SCM_RIGHTS_FDS];
+        let drained_n = self.table.drain_queued_rights(idx, &mut drained);
+        for &tok in &drained[..drained_n] {
+            if let Some((handle, _)) = self.take_scm_right(tok) {
+                self.pending_scm_release.push(handle);
+            }
         }
-        let hw = m.hw;
-        *m = SocketMeta::EMPTY;
         if let Some(q) = self.netlink_rx.get_mut(idx) {
             q.clear();
         }
@@ -263,7 +352,35 @@ fn with_net_full<R>(f: impl FnOnce(&mut Step34NetState) -> R) -> Result<R, ()> {
     Ok(result)
 }
 
+fn drain_pending_scm_releases() {
+    loop {
+        let batch = with_net_full(|state| {
+            if state.pending_scm_release.is_empty() {
+                Vec::new()
+            } else {
+                core::mem::take(&mut state.pending_scm_release)
+            }
+        })
+        .unwrap_or_default();
+        if batch.is_empty() {
+            break;
+        }
+        for handle in batch {
+            release_subsystem_handle(handle);
+        }
+    }
+}
+
+fn release_retained_handles(handles: &mut [Option<(SubsystemHandle, u64)>]) {
+    for slot in handles {
+        if let Some((handle, _)) = slot.take() {
+            release_subsystem_handle(handle);
+        }
+    }
+}
+
 fn drain_tx_frames() {
+    drain_pending_scm_releases();
     if !super::step42_hardware::has_hardware_net() {
         return;
     }
@@ -463,19 +580,19 @@ pub(super) fn close_range_for_process(
     }
 }
 
-pub(super) fn retain_alias_handle(
-    process: ObjectId,
-    raw_fd: u64,
+fn retain_net_slot(
+    idx: usize,
+    owner: Option<ObjectId>,
+    expected_gen: Option<u64>,
 ) -> Result<(SubsystemHandle, u64), Errno> {
-    if !is_socket_fd(raw_fd) {
-        return Err(Errno::EBADF);
-    }
-    let idx = (linux_signed_int(raw_fd) - SOCK_FD_BASE) as usize;
     with_net_full(|state| {
         let Some(m) = state.meta.get_mut(idx) else {
             return Err(Errno::EBADF);
         };
-        if !m.live || !m.owners.has_owner(process) {
+        let valid = m.live
+            && owner.map_or(true, |p| m.owners.has_owner(p))
+            && expected_gen.map_or(true, |g| m.generation == g);
+        if !valid {
             return Err(Errno::EBADF);
         }
         m.alias_refs += 1;
@@ -489,6 +606,26 @@ pub(super) fn retain_alias_handle(
         ))
     })
     .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn retain_alias_handle(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if !is_socket_fd(raw_fd) {
+        return Err(Errno::EBADF);
+    }
+    let idx = (linux_signed_int(raw_fd) - SOCK_FD_BASE) as usize;
+    retain_net_slot(idx, Some(process), None)
+}
+
+pub(super) fn retain_existing_handle(
+    handle: SubsystemHandle,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if handle.kind != SUBSYS_NET {
+        return Err(Errno::EBADF);
+    }
+    retain_net_slot(handle.slot as usize, None, Some(handle.generation))
 }
 
 pub(super) fn release_alias_handle(handle: SubsystemHandle) {
@@ -926,6 +1063,7 @@ fn handle_socketpair(
             state.retire_if_unused(a, now);
             state.retire_if_unused(b, now);
         })?;
+        drain_pending_scm_releases();
         return Ok(Err(errno));
     }
     Ok(Ok(0))
@@ -1434,6 +1572,9 @@ fn send_payload_blocking(
             snd_timeout_ns = m.snd_timeout_ns;
 
             if m.domain == AF_NETLINK && m.proto == NETLINK_ROUTE {
+                if !rights.is_empty() {
+                    return Err(Errno::EOPNOTSUPP);
+                }
                 let bound_pid = match state.meta[idx].bound_local {
                     Some(SockAddr::Netlink { pid, .. }) => pid,
                     _ => {
@@ -1464,6 +1605,9 @@ fn send_payload_blocking(
                 && !is_loopback_ipv4(ip)
                 && m.sock_type == SOCK_DGRAM
             {
+                if !rights.is_empty() {
+                    return Err(Errno::EOPNOTSUPP);
+                }
                 let bound = m
                     .bound_local
                     .and_then(|b| extract_ipv4(&b, m.domain, m.ipv6_v6only));
@@ -1488,6 +1632,9 @@ fn send_payload_blocking(
 
             match m.hw {
                 HardwareSockKind::Udp { handle, .. } => {
+                    if !rights.is_empty() {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
                     used_hw_net = true;
                     let dst = dest.and_then(|d| extract_ipv4(&d, m.domain, m.ipv6_v6only));
                     let Some(ref mut stack) = state.hw_net else {
@@ -1497,6 +1644,9 @@ fn send_payload_blocking(
                     Ok(Some(n))
                 }
                 HardwareSockKind::Tcp { handle, .. } => {
+                    if !rights.is_empty() {
+                        return Err(Errno::EOPNOTSUPP);
+                    }
                     used_hw_net = true;
                     let Some(ref mut stack) = state.hw_net else {
                         return Err(Errno::ENETUNREACH);
@@ -1578,8 +1728,9 @@ struct RecvPayload {
     data: Vec<u8>,
     full_len: usize,
     peer: Option<SockAddr>,
-    rights: [i32; MAX_SCM_RIGHTS_FDS],
+    handles: [Option<(SubsystemHandle, u64)>; MAX_SCM_RIGHTS_FDS],
     rights_count: usize,
+    peek: bool,
     cred: Option<Ucred>,
 }
 
@@ -1630,8 +1781,9 @@ fn recv_payload_blocking(
                     data: out,
                     full_len,
                     peer: Some(SockAddr::Netlink { pid: 0, groups: 0 }),
-                    rights: [-1; MAX_SCM_RIGHTS_FDS],
+                    handles: [None; MAX_SCM_RIGHTS_FDS],
                     rights_count: 0,
+                    peek,
                     cred: None,
                 });
             }
@@ -1650,8 +1802,9 @@ fn recv_payload_blocking(
                         full_len: n,
                         data: buf,
                         peer: Some(peer),
-                        rights: [-1; MAX_SCM_RIGHTS_FDS],
+                        handles: [None; MAX_SCM_RIGHTS_FDS],
                         rights_count: 0,
+                        peek,
                         cred: None,
                     })
                 }
@@ -1669,8 +1822,9 @@ fn recv_payload_blocking(
                         full_len: n,
                         data: buf,
                         peer,
-                        rights: [-1; MAX_SCM_RIGHTS_FDS],
+                        handles: [None; MAX_SCM_RIGHTS_FDS],
                         rights_count: 0,
+                        peek,
                         cred: None,
                     })
                 }
@@ -1678,12 +1832,26 @@ fn recv_payload_blocking(
                     let (n, full_len, peer, rights, rcount, cred) =
                         state.table.recv_with_cred_peek(idx, &mut buf, peek)?;
                     buf.truncate(n);
+                    let mut handles = [None; MAX_SCM_RIGHTS_FDS];
+                    let mut resolved_count = 0usize;
+                    for &tok in rights.iter().take(rcount) {
+                        let resolved = if peek {
+                            state.peek_scm_right(tok)
+                        } else {
+                            state.take_scm_right(tok)
+                        };
+                        if let Some(pair) = resolved {
+                            handles[resolved_count] = Some(pair);
+                            resolved_count += 1;
+                        }
+                    }
                     Ok(RecvPayload {
                         full_len,
                         data: buf,
                         peer,
-                        rights,
-                        rights_count: rcount,
+                        handles,
+                        rights_count: resolved_count,
+                        peek,
                         cred,
                     })
                 }
@@ -2236,15 +2404,71 @@ fn handle_sendmsg_blocking(
         }
     }
 
-    send_payload_blocking(
+    let process = current_process_object().unwrap_or(ObjectId(1));
+    let mut retained: [Option<(SubsystemHandle, u64)>; MAX_SCM_RIGHTS_FDS] =
+        [None; MAX_SCM_RIGHTS_FDS];
+    for (idx, &raw_right_fd) in rights.iter().take(rights_count).enumerate() {
+        match retain_any_subsystem_fd(process, raw_right_fd as u64) {
+            Ok(Some(pair)) => retained[idx] = Some(pair),
+            Ok(None) => {
+                release_retained_handles(&mut retained);
+                return Ok(SyscallReturn::error(Errno::EBADF));
+            }
+            Err(e) => {
+                release_retained_handles(&mut retained);
+                return Ok(SyscallReturn::error(e));
+            }
+        }
+    }
+
+    let mut tokens = [0i32; MAX_SCM_RIGHTS_FDS];
+    if rights_count > 0 {
+        let alloc_res = with_net_full(|state| {
+            for idx in 0..rights_count {
+                let (h, st) = retained[idx].ok_or(Errno::EBADF)?;
+                match state.alloc_scm_right(h, st) {
+                    Ok(tok) => tokens[idx] = tok,
+                    Err(e) => {
+                        for &prev in &tokens[..idx] {
+                            let _ = state.take_scm_right(prev);
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(())
+        });
+        match alloc_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                release_retained_handles(&mut retained);
+                return Ok(SyscallReturn::error(e));
+            }
+            Err(()) => {
+                release_retained_handles(&mut retained);
+                return Ok(SyscallReturn::error(Errno::EIO));
+            }
+        }
+    }
+
+    let ret = send_payload_blocking(
         frame,
         raw_fd,
         &payload,
         linux_unsigned_int(raw_flags),
         dest,
-        &rights[..rights_count],
+        &tokens[..rights_count],
         explicit_cred,
-    )
+    )?;
+    if rights_count > 0 && ret.raw() < 0 {
+        let _ = with_net_full(|state| {
+            for &tok in &tokens[..rights_count] {
+                let _ = state.take_scm_right(tok);
+            }
+        });
+        release_retained_handles(&mut retained);
+    }
+    Ok(ret)
 }
 
 fn handle_recvmsg_blocking(
@@ -2288,6 +2512,7 @@ fn handle_recvmsg_blocking(
         }
     }
 
+    let process = current_process_object().unwrap_or(ObjectId(1));
     let flags = linux_unsigned_int(raw_flags);
     let recv = match recv_payload_blocking(frame, raw_fd, total_iov, flags)? {
         Ok(r) => r,
@@ -2295,10 +2520,17 @@ fn handle_recvmsg_blocking(
     };
     let data = recv.data;
     let peer = recv.peer;
-    let rights = recv.rights;
+    let mut handles = recv.handles;
     let rights_count = recv.rights_count;
+    let peek = recv.peek;
     let recv_cred = recv.cred;
     let full_len = recv.full_len;
+
+    let release_popped = |h: &mut [Option<(SubsystemHandle, u64)>]| {
+        if !peek {
+            release_retained_handles(h);
+        }
+    };
 
     let mut off = 0usize;
     for (base, take) in iovs {
@@ -2308,6 +2540,7 @@ fn handle_recvmsg_blocking(
         let chunk = take.min(data.len() - off);
         if chunk > 0 {
             if let Err(e) = copy_to_user(base, &data[off..off + chunk]) {
+                release_popped(&mut handles);
                 return Ok(SyscallReturn::error(e));
             }
             off += chunk;
@@ -2324,15 +2557,19 @@ fn handle_recvmsg_blocking(
         if cp > 0
             && let Err(e) = copy_to_user(msg_name, &encoded[..cp])
         {
+            release_popped(&mut handles);
             return Ok(SyscallReturn::error(e));
         }
         hdr[8..12].copy_from_slice(&(actual as u32).to_le_bytes());
     }
 
     let mut out_cmsg_len = 0usize;
+    let mut cmsg_trunc = 0u32;
+    let mut installed_fds = [-1i32; MAX_SCM_RIGHTS_FDS];
+    let mut installed_count = 0usize;
+    let mut cmsg = [0u8; 32 + 16 + MAX_SCM_RIGHTS_FDS * 4];
+    let mut pos = 0usize;
     if msg_control != 0 && msg_controllen >= 16 {
-        let mut cmsg = [0u8; 32 + 16 + MAX_SCM_RIGHTS_FDS * 4];
-        let mut pos = 0usize;
         if let Some(cred) = recv_cred
             && pos + 28 <= msg_controllen
             && pos + 32 <= cmsg.len()
@@ -2344,30 +2581,84 @@ fn handle_recvmsg_blocking(
             pos += 32;
             out_cmsg_len = pos.min(msg_controllen);
         }
-        if rights_count > 0 {
-            let cmsg_len = 16 + rights_count * 4;
-            if pos + cmsg_len <= msg_controllen && pos + cmsg_len <= cmsg.len() {
-                cmsg[pos..pos + 8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
-                cmsg[pos + 8..pos + 12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
-                cmsg[pos + 12..pos + 16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
-                for (i, &fd) in rights.iter().enumerate().take(rights_count) {
-                    let fd_off = pos + 16 + i * 4;
-                    cmsg[fd_off..fd_off + 4].copy_from_slice(&fd.to_le_bytes());
+    }
+
+    if rights_count > 0 {
+        let fit_cap = if msg_control != 0 && msg_controllen >= pos + 20 {
+            ((msg_controllen - pos - 16) / 4).min(rights_count)
+        } else {
+            0
+        };
+        if fit_cap < rights_count {
+            cmsg_trunc |= MSG_CTRUNC;
+        }
+        let cmsg_cloexec = (flags & MSG_CMSG_CLOEXEC) != 0;
+        for slot in handles.iter_mut().take(fit_cap) {
+            let Some((orig_h, orig_status)) = (if peek { *slot } else { slot.take() }) else {
+                continue;
+            };
+            let install_pair = if peek {
+                match retain_existing_subsystem_handle(orig_h) {
+                    Ok(pair) => pair,
+                    Err(_) => {
+                        cmsg_trunc |= MSG_CTRUNC;
+                        break;
+                    }
                 }
-                let aligned = (cmsg_len + 7) & !7;
-                out_cmsg_len = (pos + aligned).min(msg_controllen);
+            } else {
+                (orig_h, orig_status)
+            };
+            match install_subsystem_fd_in_process(
+                process,
+                install_pair.0,
+                cmsg_cloexec,
+                install_pair.1,
+            ) {
+                Ok(new_fd) => {
+                    installed_fds[installed_count] = new_fd;
+                    installed_count += 1;
+                }
+                Err(_) => {
+                    release_subsystem_handle(install_pair.0);
+                    cmsg_trunc |= MSG_CTRUNC;
+                    break;
+                }
             }
         }
-        if out_cmsg_len > 0
-            && let Err(e) = copy_to_user(msg_control, &cmsg[..out_cmsg_len])
-        {
-            return Ok(SyscallReturn::error(e));
+        release_popped(&mut handles);
+    }
+
+    if installed_count > 0 {
+        let cmsg_len = 16 + installed_count * 4;
+        if pos + cmsg_len <= msg_controllen && pos + cmsg_len <= cmsg.len() {
+            cmsg[pos..pos + 8].copy_from_slice(&(cmsg_len as u64).to_le_bytes());
+            cmsg[pos + 8..pos + 12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+            cmsg[pos + 12..pos + 16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
+            for (i, &fd) in installed_fds.iter().enumerate().take(installed_count) {
+                let fd_off = pos + 16 + i * 4;
+                cmsg[fd_off..fd_off + 4].copy_from_slice(&fd.to_le_bytes());
+            }
+            let aligned = (cmsg_len + 7) & !7;
+            out_cmsg_len = (pos + aligned).min(msg_controllen);
         }
     }
-    let msg_flags = if full_len > off { MSG_TRUNC } else { 0 };
+
+    if out_cmsg_len > 0
+        && let Err(e) = copy_to_user(msg_control, &cmsg[..out_cmsg_len])
+    {
+        for &fd in &installed_fds[..installed_count] {
+            rollback_subsystem_fd_in_process(process, fd);
+        }
+        return Ok(SyscallReturn::error(e));
+    }
+
+    let msg_flags = (if full_len > off { MSG_TRUNC } else { 0 }) | cmsg_trunc;
     hdr[40..48].copy_from_slice(&(out_cmsg_len as u64).to_le_bytes());
     hdr[48..52].copy_from_slice(&(msg_flags as i32).to_le_bytes()); // msg_flags
     if let Err(e) = copy_to_user(user_msghdr, &hdr) {
+        for &fd in &installed_fds[..installed_count] {
+            rollback_subsystem_fd_in_process(process, fd);
+        }
         return Ok(SyscallReturn::error(e));
     }
     let ret_len = if (flags & MSG_TRUNC) != 0 {

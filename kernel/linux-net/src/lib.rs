@@ -847,12 +847,13 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
                     },
                 };
                 let src_addr = match self.slots[id].local_addr {
-                    Some(SockAddr::Netlink { pid, groups }) => {
-                        Some(SockAddr::Netlink { pid, groups })
-                    }
+                    Some(SockAddr::Netlink { pid, groups: _ }) => Some(SockAddr::Netlink {
+                        pid,
+                        groups: dst_groups,
+                    }),
                     _ => Some(SockAddr::Netlink {
                         pid: sender_cred.map_or(1, |c| c.pid),
-                        groups: 0,
+                        groups: dst_groups,
                     }),
                 };
                 self.broadcast_netlink_uevent_targeted(
@@ -924,7 +925,9 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
         }
 
         let avail = BUF_CAP.saturating_sub(peer.rx_len);
-        if avail == 0 && !payload.is_empty() {
+        if (avail == 0 && !payload.is_empty())
+            || (!rights.is_empty() && peer.rx_ancillary.count > 0)
+        {
             return Err(Errno::EAGAIN);
         }
         let take = payload.len().min(avail);
@@ -1116,6 +1119,33 @@ impl<const MAX_SOCKETS: usize, const BUF_CAP: usize> SocketTable<MAX_SOCKETS, BU
                 gid: 0,
             }),
         )
+    }
+
+    /// Drains any queued `SCM_RIGHTS` descriptor tokens stored on socket `id`.
+    pub fn drain_queued_rights(&mut self, id: usize, out: &mut [i32]) -> usize {
+        let Ok(slot) = self.slot_mut(id) else {
+            return 0;
+        };
+        let mut written = 0usize;
+        let stream_count = slot.rx_ancillary.count.min(MAX_SCM_RIGHTS_FDS);
+        for &tok in &slot.rx_ancillary.fds[..stream_count] {
+            if tok >= 0 && written < out.len() {
+                out[written] = tok;
+                written += 1;
+            }
+        }
+        slot.rx_ancillary = AncillaryRights::EMPTY;
+        for pkt in &mut slot.pkt_queue[..slot.pkt_count.min(MAX_DGRAM_PKTS)] {
+            let pkt_count = pkt.rights.count.min(MAX_SCM_RIGHTS_FDS);
+            for &tok in &pkt.rights.fds[..pkt_count] {
+                if tok >= 0 && written < out.len() {
+                    out[written] = tok;
+                    written += 1;
+                }
+            }
+            pkt.rights = AncillaryRights::EMPTY;
+        }
+        written
     }
 
     /// Closes socket `id`.
@@ -2150,5 +2180,46 @@ mod tests {
             .unwrap();
         assert_eq!(&rx[..n2], b"MAINPID=20\n");
         assert_eq!(c2.unwrap().pid, 20);
+    }
+
+    #[test]
+    fn netlink_uevent_multicast_preserves_dst_groups_in_received_peer_addr() {
+        let mut table = SocketTable::<8, 512>::new();
+        let pid1_mon = table
+            .socket(AF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)
+            .unwrap();
+        table
+            .bind(pid1_mon, SockAddr::Netlink { pid: 1, groups: 2 })
+            .unwrap();
+        table
+            .setsockopt(pid1_mon, SOL_SOCKET, SO_PASSCRED, 1)
+            .unwrap();
+
+        let udevd_worker = table
+            .socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT)
+            .unwrap();
+        table
+            .bind(udevd_worker, SockAddr::Netlink { pid: 36, groups: 0 })
+            .unwrap();
+
+        table
+            .send_with_cred(
+                udevd_worker,
+                b"libudev\0ACTION=add\0",
+                Some(SockAddr::Netlink { pid: 0, groups: 2 }),
+                &[],
+                Some(Ucred {
+                    pid: 36,
+                    uid: 0,
+                    gid: 0,
+                }),
+            )
+            .unwrap();
+
+        let mut rx = [0u8; 64];
+        let (n, _, peer, _, _, cred) = table.recv_with_cred_peek(pid1_mon, &mut rx, false).unwrap();
+        assert_eq!(&rx[..n], b"libudev\0ACTION=add\0");
+        assert_eq!(peer, Some(SockAddr::Netlink { pid: 36, groups: 2 }));
+        assert_eq!(cred.unwrap().pid, 36);
     }
 }

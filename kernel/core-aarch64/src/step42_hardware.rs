@@ -669,19 +669,19 @@ fn node_path_bytes(kind: HwNodeKind, buf: &mut [u8; 40]) -> &[u8] {
     }
 }
 
-pub(super) fn retain_alias_handle(
-    process: ObjectId,
-    raw_fd: u64,
+fn retain_hw_slot(
+    slot_idx: usize,
+    owner: Option<ObjectId>,
+    expected_gen: Option<u64>,
 ) -> Result<(SubsystemHandle, u64), Errno> {
-    if !is_hw_fd(raw_fd) {
-        return Err(Errno::EBADF);
-    }
-    let slot_idx = (linux_signed_int(raw_fd) - HW_FD_BASE) as usize;
     with_step42_state(|state| {
         let Some(entry) = state.fds.get_mut(slot_idx) else {
             return Err(Errno::EBADF);
         };
-        if !entry.live || !entry.owners.has_owner(process) {
+        let valid = entry.live
+            && owner.map_or(true, |p| entry.owners.has_owner(p))
+            && expected_gen.map_or(true, |g| entry.generation == g);
+        if !valid {
             return Err(Errno::EBADF);
         }
         entry.alias_refs += 1;
@@ -695,6 +695,26 @@ pub(super) fn retain_alias_handle(
         ))
     })
     .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn retain_alias_handle(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if !is_hw_fd(raw_fd) {
+        return Err(Errno::EBADF);
+    }
+    let slot_idx = (linux_signed_int(raw_fd) - HW_FD_BASE) as usize;
+    retain_hw_slot(slot_idx, Some(process), None)
+}
+
+pub(super) fn retain_existing_handle(
+    handle: SubsystemHandle,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if handle.kind != SUBSYS_HW {
+        return Err(Errno::EBADF);
+    }
+    retain_hw_slot(handle.slot as usize, None, Some(handle.generation))
 }
 
 pub(super) fn release_alias_handle(handle: SubsystemHandle) {
@@ -1143,9 +1163,17 @@ fn materialize_sysfs(state: &Step42State, kind: HwNodeKind, out: &mut [u8; 64]) 
             s.len()
         }
         HwNodeKind::SysCpuOnline | HwNodeKind::SysCpuPossible => {
-            let s = b"0\n";
-            out[..s.len()].copy_from_slice(s);
-            s.len()
+            let count = super::super::online_cpu_count();
+            if count <= 1 {
+                let s = b"0\n";
+                out[..s.len()].copy_from_slice(s);
+                s.len()
+            } else {
+                let last = b'0' + count.saturating_sub(1);
+                let s = [b'0', b'-', last, b'\n'];
+                out[..s.len()].copy_from_slice(&s);
+                s.len()
+            }
         }
         HwNodeKind::SysVirtioMmioCount => format_u64_line(state.discovered_virtio_mmio as u64, out),
         _ => 0,

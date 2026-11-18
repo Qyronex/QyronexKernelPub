@@ -54,6 +54,7 @@ pub enum FilesystemType {
     Initramfs,
     Ext4,
     Tmpfs,
+    Ramfs,
     Procfs,
     Sysfs,
     Devtmpfs,
@@ -68,6 +69,7 @@ impl FilesystemType {
             b"rootfs" | b"initramfs" => Ok(Self::Initramfs),
             b"ext4" => Ok(Self::Ext4),
             b"tmpfs" => Ok(Self::Tmpfs),
+            b"ramfs" => Ok(Self::Ramfs),
             b"proc" | b"procfs" => Ok(Self::Procfs),
             b"sysfs" => Ok(Self::Sysfs),
             b"devtmpfs" => Ok(Self::Devtmpfs),
@@ -83,6 +85,7 @@ impl FilesystemType {
             Self::Initramfs => b"rootfs",
             Self::Ext4 => b"ext4",
             Self::Tmpfs => b"tmpfs",
+            Self::Ramfs => b"ramfs",
             Self::Procfs => b"proc",
             Self::Sysfs => b"sysfs",
             Self::Devtmpfs => b"devtmpfs",
@@ -97,6 +100,7 @@ impl FilesystemType {
             Self::Initramfs => 0x8584_58f6, // RAMFS_MAGIC
             Self::Ext4 => 0xef53,           // EXT4_SUPER_MAGIC
             Self::Tmpfs => 0x0102_1994,     // TMPFS_MAGIC
+            Self::Ramfs => 0x8584_58f6,     // RAMFS_MAGIC
             Self::Procfs => 0x9fa0,         // PROC_SUPER_MAGIC
             Self::Sysfs => 0x6265_6572,     // SYSFS_MAGIC
             Self::Devtmpfs => 0x0102_1994,  // TMPFS_MAGIC
@@ -117,6 +121,7 @@ impl FilesystemType {
             Self::Ext4 => (254, mount_id),
             Self::Tmpfs => (0, 20 + mount_id),
             Self::Overlay => (0, 40 + mount_id),
+            Self::Ramfs => (0, 60 + mount_id),
         }
     }
 
@@ -132,7 +137,7 @@ impl FilesystemType {
 }
 
 pub const MAX_MOUNT_PATH: usize = 256;
-pub const MAX_MOUNT_SOURCE: usize = 32;
+pub const MAX_MOUNT_SOURCE: usize = MAX_MOUNT_PATH;
 
 /// One active mount point in the kernel [`MountTable`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +227,54 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
         child
     }
 
+    pub const fn next_mount_id(&self) -> u32 {
+        self.next_id
+    }
+
+    pub fn set_next_mount_id(&mut self, next_id: u32) {
+        if next_id > self.next_id {
+            self.next_id = next_id;
+        }
+    }
+
+    /// Inserts a pre-resolved mount entry (such as a validated `MS_BIND` or cloned recursive
+    /// subtree entry) directly into this mount table, enforcing `MAX_MOUNT_SOURCE`/`MAX_MOUNT_PATH`
+    /// bounds and unbindable source protection when applicable.
+    pub fn insert_exact_mount(
+        &mut self,
+        source: &[u8],
+        target: &[u8],
+        fstype: FilesystemType,
+        flags: u64,
+    ) -> Result<u32, Errno> {
+        let normalized_target = normalize_mount_path(target)?;
+        if source.len() > MAX_MOUNT_SOURCE {
+            return Err(Errno::ENAMETOOLONG);
+        }
+        let slot = self
+            .entries
+            .iter_mut()
+            .find(|e| !e.live)
+            .ok_or(Errno::ENOMEM)?;
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1).max(1);
+        let mut src_buf = [0u8; MAX_MOUNT_SOURCE];
+        src_buf[..source.len()].copy_from_slice(source);
+        let mut tgt_buf = [0u8; MAX_MOUNT_PATH];
+        tgt_buf[..normalized_target.len()].copy_from_slice(normalized_target);
+        *slot = MountEntry {
+            live: true,
+            mount_id: id,
+            fstype,
+            flags,
+            source: src_buf,
+            source_len: source.len(),
+            target: tgt_buf,
+            target_len: normalized_target.len(),
+        };
+        Ok(id)
+    }
+
     /// Seeds the baseline early-boot mount table (`/` on `initramfs`, `/dev`, `/dev/pts`, `/proc`,
     /// `/sys`, `/run`).
     pub fn seed_default_hierarchy(&mut self) -> Result<(), Errno> {
@@ -262,7 +315,8 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
             let slot = self
                 .entries
                 .iter_mut()
-                .find(|e| e.live && e.target() == normalized_target)
+                .filter(|e| e.live && e.target() == normalized_target)
+                .max_by_key(|e| e.mount_id)
                 .ok_or(Errno::EINVAL)?;
             let preserved = slot.flags & !(MS_RDONLY | MS_SYNCHRONOUS | MS_NOATIME | MS_RELATIME);
             let updated = flags & (MS_RDONLY | MS_SYNCHRONOUS | MS_NOATIME | MS_RELATIME);
@@ -275,15 +329,65 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
             if normalized_source == b"/" {
                 return Err(Errno::EINVAL);
             }
-            let slot = self
+            let moved_id = self
                 .entries
-                .iter_mut()
-                .find(|e| e.live && e.target() == normalized_source)
+                .iter()
+                .filter(|e| e.live && e.target() == normalized_source)
+                .max_by_key(|e| e.mount_id)
+                .map(|e| e.mount_id)
                 .ok_or(Errno::EINVAL)?;
-            slot.target = [0u8; MAX_MOUNT_PATH];
-            slot.target[..normalized_target.len()].copy_from_slice(normalized_target);
-            slot.target_len = normalized_target.len();
-            return Ok(slot.mount_id);
+            if normalized_target != b"/" {
+                for e in &self.entries {
+                    if !e.live {
+                        continue;
+                    }
+                    let tgt = e.target();
+                    if tgt.len() > normalized_source.len()
+                        && tgt.starts_with(normalized_source)
+                        && tgt[normalized_source.len()] == b'/'
+                    {
+                        let rest_len = tgt.len() - normalized_source.len();
+                        if normalized_target.len() + rest_len > MAX_MOUNT_PATH {
+                            return Err(Errno::ENAMETOOLONG);
+                        }
+                    }
+                }
+            }
+            for slot in &mut self.entries {
+                if !slot.live {
+                    continue;
+                }
+                let is_exact = slot.target() == normalized_source;
+                let is_child = slot.target_len > normalized_source.len()
+                    && slot.target().starts_with(normalized_source)
+                    && slot.target()[normalized_source.len()] == b'/';
+                if is_exact {
+                    slot.target = [0u8; MAX_MOUNT_PATH];
+                    slot.target[..normalized_target.len()].copy_from_slice(normalized_target);
+                    slot.target_len = normalized_target.len();
+                } else if is_child {
+                    let rest_len = slot.target_len - normalized_source.len();
+                    let mut next = [0u8; MAX_MOUNT_PATH];
+                    if normalized_target == b"/" {
+                        next[..rest_len].copy_from_slice(
+                            &slot.target[normalized_source.len()..slot.target_len],
+                        );
+                        slot.target = next;
+                        slot.target_len = rest_len;
+                    } else {
+                        next[..normalized_target.len()].copy_from_slice(normalized_target);
+                        next[normalized_target.len()..normalized_target.len() + rest_len]
+                            .copy_from_slice(
+                                &slot.target[normalized_source.len()..slot.target_len],
+                            );
+                        slot.target = next;
+                        slot.target_len = normalized_target.len() + rest_len;
+                    }
+                } else if normalized_target == b"/" {
+                    *slot = MountEntry::EMPTY;
+                }
+            }
+            return Ok(moved_id);
         }
 
         if (flags & MS_PROPAGATION_MASK) != 0
@@ -402,6 +506,11 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
 
     /// Executes `umount2(2)`.
     pub fn umount2(&mut self, target: &[u8], flags: u32) -> Result<(), Errno> {
+        self.umount2_returning_id(target, flags).map(|_| ())
+    }
+
+    /// Executes `umount2(2)` (LIFO for stacked mounts) and returns the unmounted `mount_id`.
+    pub fn umount2_returning_id(&mut self, target: &[u8], flags: u32) -> Result<u32, Errno> {
         if flags & !UMOUNT_VALID_MASK != 0 {
             return Err(Errno::EINVAL);
         }
@@ -424,13 +533,17 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
                 return Err(Errno::EBUSY);
             }
         }
-        let slot = self
+        let idx = self
             .entries
-            .iter_mut()
-            .find(|e| e.live && e.target() == normalized)
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.live && e.target() == normalized)
+            .max_by_key(|(_, e)| e.mount_id)
+            .map(|(i, _)| i)
             .ok_or(Errno::EINVAL)?;
-        *slot = MountEntry::EMPTY;
-        Ok(())
+        let id = self.entries[idx].mount_id;
+        self.entries[idx] = MountEntry::EMPTY;
+        Ok(id)
     }
 
     /// Atomically transitions `/` from the early initramfs root to the newly mounted persistent
@@ -489,7 +602,10 @@ impl<const MAX_MOUNTS: usize> MountTable<MAX_MOUNTS> {
             if matches {
                 let replace = match best {
                     None => true,
-                    Some(prev) => tgt.len() > prev.target().len(),
+                    Some(prev) => {
+                        tgt.len() > prev.target().len()
+                            || (tgt.len() == prev.target().len() && entry.mount_id > prev.mount_id)
+                    }
                 };
                 if replace {
                     best = Some(*entry);
@@ -879,6 +995,7 @@ pub fn read_procfs_node<const MAX_MOUNTS: usize>(
             cursor += copy_slice(&mut out[cursor..], b"\n");
             Some(cursor)
         }
+        b"sys/kernel/domainname" => Some(copy_slice(out, b"(none)\n")),
         b"sys/kernel/random/boot_id" => Some(format_boot_id(&snap.boot_id_seed, out)),
         b"uptime" => {
             let mut cursor = write_u64_ascii(snap.uptime_seconds, out);
@@ -1543,5 +1660,40 @@ mod tests {
             FilesystemType::Procfs.st_dev(4),
             FilesystemType::Sysfs.st_dev(5)
         );
+    }
+
+    #[test]
+    fn ms_move_and_umount2_returning_id_support_switch_root_and_lifo_unmounts() {
+        let mut tbl = MountTable::<8>::new();
+        tbl.mount(b"none", b"/", Some(b"ramfs"), 0).unwrap();
+        let tmp1 = tbl.mount(b"tmpfs", b"/run", Some(b"tmpfs"), 0).unwrap();
+        let tmp2 = tbl.mount(b"/", b"/run", None, MS_BIND).unwrap();
+        assert_ne!(tmp1, tmp2);
+
+        // LIFO umount2_returning_id pops the top stacked mount first.
+        assert_eq!(tbl.umount2_returning_id(b"/run", 0), Ok(tmp2));
+        assert_eq!(tbl.umount2_returning_id(b"/run", MNT_DETACH), Ok(tmp1));
+
+        // MS_MOVE to "/" replaces root mount and slides nested child mounts underneath "/".
+        let rootfs_id = tbl
+            .mount(b"/", b"/run/systemd/mount-rootfs", None, MS_BIND)
+            .unwrap();
+        tbl.mount(
+            b"proc",
+            b"/run/systemd/mount-rootfs/proc",
+            Some(b"proc"),
+            MS_RDONLY,
+        )
+        .unwrap();
+        assert_eq!(
+            tbl.mount(b"/run/systemd/mount-rootfs", b"/", None, MS_MOVE),
+            Ok(rootfs_id)
+        );
+
+        let (proc_slot, rel) = tbl.resolve(b"/proc/version").unwrap();
+        assert_eq!(proc_slot.target(), b"/proc");
+        assert_eq!(rel, b"version");
+        assert_eq!(tbl.resolve(b"/").unwrap().0.mount_id(), rootfs_id);
+        assert_eq!(tbl.umount2_returning_id(b"/", 0), Err(Errno::EBUSY));
     }
 }

@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use kernal_linux_abi::Errno;
 use kernal_linux_mounts::FilesystemType;
 
-const MAX_MEMFS_NODES: usize = 1024;
+const MAX_MEMFS_NODES: usize = 4096;
 const MAX_MEMFS_FILE_BYTES: usize = 1024 * 1024;
 const MAX_NAME_LEN: usize = 255;
 
@@ -32,6 +32,24 @@ const fn makedev(major: u32, minor: u32) -> u64 {
     let maj = major as u64;
     let min = minor as u64;
     ((maj & 0x0fff) << 8) | ((maj & !0x0fff) << 32) | (min & 0xff) | ((min & !0xff) << 12)
+}
+
+pub(super) const fn dev_path_for_rdev(rdev: u64) -> Option<&'static [u8]> {
+    match rdev {
+        x if x == makedev(1, 3) => Some(b"/dev/null"),
+        x if x == makedev(1, 5) => Some(b"/dev/zero"),
+        x if x == makedev(1, 7) => Some(b"/dev/full"),
+        x if x == makedev(1, 8) => Some(b"/dev/random"),
+        x if x == makedev(1, 9) => Some(b"/dev/urandom"),
+        x if x == makedev(5, 0) => Some(b"/dev/tty"),
+        x if x == makedev(5, 1) => Some(b"/dev/console"),
+        x if x == makedev(5, 2) => Some(b"/dev/ptmx"),
+        x if x == makedev(204, 64) => Some(b"/dev/ttyAMA0"),
+        x if x == makedev(1, 11) => Some(b"/dev/kmsg"),
+        x if x == makedev(254, 0) => Some(b"/dev/vda"),
+        x if x == makedev(254, 1) => Some(b"/dev/vda1"),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,7 +244,10 @@ impl MemFs {
     ) {
         if !matches!(
             fstype,
-            FilesystemType::Tmpfs | FilesystemType::Devtmpfs | FilesystemType::Devpts
+            FilesystemType::Tmpfs
+                | FilesystemType::Ramfs
+                | FilesystemType::Devtmpfs
+                | FilesystemType::Devpts
         ) {
             return;
         }

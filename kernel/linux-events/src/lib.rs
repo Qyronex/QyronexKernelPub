@@ -161,13 +161,15 @@ impl InotifyWatch {
     };
 }
 
+pub const MAX_EPOLL_WATCHES: usize = 64;
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy)]
 pub enum EventObject<const MEMFD_CAP: usize> {
     Empty,
     Epoll {
         cloexec: bool,
-        watches: [EpollWatch; 32],
+        watches: [EpollWatch; MAX_EPOLL_WATCHES],
     },
     EventFd {
         counter: u64,
@@ -261,12 +263,12 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         }
         self.alloc_slot(EventObject::Epoll {
             cloexec: (flags & EPOLL_CLOEXEC) != 0,
-            watches: [EpollWatch::EMPTY; 32],
+            watches: [EpollWatch::EMPTY; MAX_EPOLL_WATCHES],
         })
     }
 
-    pub fn epoll_watch_targets(&self, epfd_idx: usize) -> [Option<(i32, u32)>; 32] {
-        let mut out = [None; 32];
+    pub fn epoll_watch_targets(&self, epfd_idx: usize) -> [Option<(i32, u32)>; MAX_EPOLL_WATCHES] {
+        let mut out = [None; MAX_EPOLL_WATCHES];
         if let Some(EventObject::Epoll { watches, .. }) = self.slots.get(epfd_idx) {
             for (i, w) in watches.iter().enumerate() {
                 if w.live && w.armed {
@@ -517,6 +519,9 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         {
             *stored = watches;
         }
+        if count == 0 {
+            self.clear_parent_epoll_edge_bits(epfd_idx, fd_base, EPOLLIN);
+        }
         Ok(count)
     }
 
@@ -527,6 +532,21 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             for w in watches {
                 if w.live && w.target_fd == target_fd {
                     w.last_edge_mask &= !bits;
+                }
+            }
+        }
+    }
+
+    /// Clears `bits` from every outer `epoll` watch referencing `fd_base + child_epfd_idx` once
+    /// the inner `epoll` instance has drained to unready so subsequent wakeups re-trigger `EPOLLET`.
+    pub fn clear_parent_epoll_edge_bits(&mut self, child_epfd_idx: usize, fd_base: i32, bits: u32) {
+        let target_fd = fd_base + (child_epfd_idx as i32);
+        for slot in &mut self.slots {
+            if let EventObject::Epoll { watches, .. } = slot {
+                for w in watches {
+                    if w.live && w.target_fd == target_fd {
+                        w.last_edge_mask &= !bits;
+                    }
                 }
             }
         }

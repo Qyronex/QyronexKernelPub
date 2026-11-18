@@ -271,6 +271,31 @@ impl<const MAX_DEVS: usize> UdevDeviceRegistry<MAX_DEVS> {
         action: UeventAction,
         out: &mut [u8],
     ) -> Result<usize, Errno> {
+        self.format_uevent_with_uuid(name, action, None, self.seqnum, out)
+    }
+
+    /// Formats a `NETLINK_KOBJECT_UEVENT` datagram for `name` (with optional `SYNTH_UUID`) and
+    /// advances `self.seqnum`.
+    pub fn emit_uevent_with_uuid(
+        &mut self,
+        name: &[u8],
+        action: UeventAction,
+        synth_uuid: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Result<usize, Errno> {
+        let len = self.format_uevent_with_uuid(name, action, synth_uuid, self.seqnum, out)?;
+        self.seqnum = self.seqnum.saturating_add(1);
+        Ok(len)
+    }
+
+    fn format_uevent_with_uuid(
+        &self,
+        name: &[u8],
+        action: UeventAction,
+        synth_uuid: Option<&[u8]>,
+        seqnum: u64,
+        out: &mut [u8],
+    ) -> Result<usize, Errno> {
         let dev = self
             .devices
             .iter()
@@ -299,8 +324,14 @@ impl<const MAX_DEVS: usize> UdevDeviceRegistry<MAX_DEVS> {
             cursor += push_bytes(out, cursor, b"\0IFINDEX=");
             cursor += push_u64(out, cursor, u64::from(dev.ifindex));
         }
+        if let Some(uuid) = synth_uuid
+            && !uuid.is_empty()
+        {
+            cursor += push_bytes(out, cursor, b"\0SYNTH_UUID=");
+            cursor += push_bytes(out, cursor, uuid);
+        }
         cursor += push_bytes(out, cursor, b"\0SEQNUM=");
-        cursor += push_u64(out, cursor, self.seqnum);
+        cursor += push_u64(out, cursor, seqnum);
         cursor += push_bytes(out, cursor, b"\0");
         Ok(cursor)
     }
@@ -446,5 +477,29 @@ mod tests {
             reg.authorize_handle(handle, CapRights::READ),
             Err(Errno::ENODEV)
         );
+
+        let s1 = reg.seqnum;
+        let mut uevent_buf = [0u8; 512];
+        let n1 = reg
+            .emit_uevent_with_uuid(b"vda", UeventAction::Add, None, &mut uevent_buf)
+            .unwrap();
+        let msg1 = core::str::from_utf8(&uevent_buf[..n1]).unwrap();
+        assert!(msg1.contains("ACTION=add\0") && msg1.contains(&format!("SEQNUM={s1}\0")));
+        assert!(!msg1.contains("SYNTH_UUID="));
+        assert_eq!(reg.seqnum, s1 + 1);
+
+        let n2 = reg
+            .emit_uevent_with_uuid(
+                b"ttyAMA0",
+                UeventAction::Add,
+                Some(b"11223344-5566-7788-99aa-bbccddeeff00"),
+                &mut uevent_buf,
+            )
+            .unwrap();
+        let msg2 = core::str::from_utf8(&uevent_buf[..n2]).unwrap();
+        let s2 = s1 + 1;
+        assert!(msg2.contains(&format!("SEQNUM={s2}\0")));
+        assert!(msg2.contains("SYNTH_UUID=11223344-5566-7788-99aa-bbccddeeff00\0"));
+        assert_eq!(reg.seqnum, s2 + 1);
     }
 }

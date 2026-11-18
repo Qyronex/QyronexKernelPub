@@ -1593,8 +1593,10 @@ fn commit_exec_identity_marker(
     exe_path: &[u8],
     cmdline: &[u8],
 ) -> Result<(), ()> {
+    let mut is_pid1 = false;
     let result = super::runtime::with_linux_runtime(|state| {
         match state.with_current_process_identity(current, |process, identities| {
+            is_pid1 = identities.bound_pid(process).is_ok_and(|p| p.get() == 1);
             identities.mark_execed(process)
         }) {
             Ok(Ok(())) => {}
@@ -1605,7 +1607,12 @@ fn commit_exec_identity_marker(
             .map_err(|_| ())
     });
     match result {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            if is_pid1 && (exe_path == b"/sbin/init" || exe_path.ends_with(b"/systemd")) {
+                super::step32_dev::detach_pid1_console_session_on_init_exec();
+            }
+            Ok(())
+        }
         _ => Err(()),
     }
 }

@@ -26,10 +26,10 @@ use super::step_fd_util::{
     lookup_aliased_subsystem, lookup_aliased_subsystem_current,
 };
 
-/// Dedicated file-descriptor base for Step-35 event/memfd/pidfd descriptors (`160..192`),
-/// partitioned cleanly above `SOCK_FD_BASE` (`128..160`).
-pub(super) const EVENT_FD_BASE: i32 = 160;
-const MAX_EVENT_FDS: usize = 32;
+/// Dedicated file-descriptor base for Step-35 event/memfd/pidfd descriptors (`672..736`),
+/// partitioned cleanly above `PROC_SYS_FD_BASE` (`416..672`).
+pub(super) const EVENT_FD_BASE: i32 = 672;
+const MAX_EVENT_FDS: usize = 64;
 const MEMFD_CAP: usize = 32768;
 const MAX_CGROUPS: usize = 64;
 const ARM64_STAT_BYTES: usize = 128;
@@ -59,11 +59,35 @@ impl EventMeta {
     };
 }
 
+const MAX_SECURITY_PROCS: usize = 64;
+const PRIO_PROCESS: i32 = 0;
+const PRIO_PGRP: i32 = 1;
+const PRIO_USER: i32 = 2;
+const PRIORITY_OFFSET: i64 = 20;
+
+#[derive(Clone, Copy)]
+struct SecurityProcSlot {
+    live: bool,
+    process: ObjectId,
+    sec: ProcessSecurityState,
+    nice: i8,
+}
+
+impl SecurityProcSlot {
+    const EMPTY: Self = Self {
+        live: false,
+        process: ObjectId(0),
+        sec: ProcessSecurityState::new_root_init(),
+        nice: 0,
+    };
+}
+
 struct Step35State {
     next_generation: u64,
     events: EventTable<MAX_EVENT_FDS, MEMFD_CAP>,
     meta: [EventMeta; MAX_EVENT_FDS],
-    security: ProcessSecurityState,
+    default_security: ProcessSecurityState,
+    security_slots: [SecurityProcSlot; MAX_SECURITY_PROCS],
     cgroups: CgroupTree<MAX_CGROUPS>,
 }
 
@@ -73,8 +97,62 @@ impl Step35State {
             next_generation: 1,
             events: EventTable::new(),
             meta: [EventMeta::EMPTY; MAX_EVENT_FDS],
-            security: ProcessSecurityState::new_root_init(),
+            default_security: ProcessSecurityState::new_root_init(),
+            security_slots: [SecurityProcSlot::EMPTY; MAX_SECURITY_PROCS],
             cgroups: CgroupTree::new(),
+        }
+    }
+
+    fn security_for(&self, process: ObjectId) -> &ProcessSecurityState {
+        self.security_slots
+            .iter()
+            .find(|s| s.live && s.process == process)
+            .map_or(&self.default_security, |s| &s.sec)
+    }
+
+    fn security_for_mut(&mut self, process: ObjectId) -> &mut ProcessSecurityState {
+        if let Some(pos) = self
+            .security_slots
+            .iter()
+            .position(|s| s.live && s.process == process)
+        {
+            return &mut self.security_slots[pos].sec;
+        }
+        if let Some(pos) = self.security_slots.iter().position(|s| !s.live) {
+            self.security_slots[pos] = SecurityProcSlot {
+                live: true,
+                process,
+                sec: self.default_security,
+                nice: 0,
+            };
+            return &mut self.security_slots[pos].sec;
+        }
+        &mut self.default_security
+    }
+
+    fn nice_for(&self, process: ObjectId) -> i8 {
+        self.security_slots
+            .iter()
+            .find(|s| s.live && s.process == process)
+            .map_or(0, |s| s.nice)
+    }
+
+    fn set_nice_for(&mut self, process: ObjectId, nice: i8) {
+        if let Some(slot) = self
+            .security_slots
+            .iter_mut()
+            .find(|s| s.live && s.process == process)
+        {
+            slot.nice = nice;
+            return;
+        }
+        if let Some(pos) = self.security_slots.iter().position(|s| !s.live) {
+            self.security_slots[pos] = SecurityProcSlot {
+                live: true,
+                process,
+                sec: self.default_security,
+                nice,
+            };
         }
     }
 
@@ -170,19 +248,19 @@ fn resolve_event_target(raw_fd: u64) -> Result<(usize, Option<u64>), Errno> {
     resolve_event_target_for_process(slot_process_id(), raw_fd)
 }
 
-pub(super) fn retain_alias_handle(
-    process: ObjectId,
-    raw_fd: u64,
+fn retain_event_slot(
+    idx: usize,
+    owner: Option<ObjectId>,
+    expected_gen: Option<u64>,
 ) -> Result<(SubsystemHandle, u64), Errno> {
-    if !is_event_fd(raw_fd) {
-        return Err(Errno::EBADF);
-    }
-    let idx = (linux_signed_int(raw_fd) - EVENT_FD_BASE) as usize;
     with_step35_state(|state| {
         let Some(m) = state.meta.get_mut(idx) else {
             return Err(Errno::EBADF);
         };
-        if !m.live || !m.owners.has_owner(process) {
+        let valid = m.live
+            && owner.map_or(true, |p| m.owners.has_owner(p))
+            && expected_gen.map_or(true, |g| m.generation == g);
+        if !valid {
             return Err(Errno::EBADF);
         }
         m.alias_refs += 1;
@@ -196,6 +274,26 @@ pub(super) fn retain_alias_handle(
         ))
     })
     .map_err(|()| Errno::EIO)?
+}
+
+pub(super) fn retain_alias_handle(
+    process: ObjectId,
+    raw_fd: u64,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if !is_event_fd(raw_fd) {
+        return Err(Errno::EBADF);
+    }
+    let idx = (linux_signed_int(raw_fd) - EVENT_FD_BASE) as usize;
+    retain_event_slot(idx, Some(process), None)
+}
+
+pub(super) fn retain_existing_handle(
+    handle: SubsystemHandle,
+) -> Result<(SubsystemHandle, u64), Errno> {
+    if handle.kind != SUBSYS_EVENT {
+        return Err(Errno::EBADF);
+    }
+    retain_event_slot(handle.slot as usize, None, Some(handle.generation))
 }
 
 pub(super) fn release_alias_handle(handle: SubsystemHandle) {
@@ -325,6 +423,10 @@ pub(super) fn on_process_fork(parent: ObjectId, child: ObjectId) {
                 m.owners.on_fork(parent, child);
             }
         }
+        let parent_sec = *state.security_for(parent);
+        if parent_sec != state.default_security {
+            *state.security_for_mut(child) = parent_sec;
+        }
     });
 }
 
@@ -336,6 +438,13 @@ pub(super) fn on_process_exec(process: ObjectId) {
                 state.retire_if_unused(idx);
             }
         }
+        if let Some(slot) = state
+            .security_slots
+            .iter_mut()
+            .find(|s| s.live && s.process == process)
+        {
+            slot.sec.pdeathsig = 0;
+        }
     });
 }
 
@@ -345,6 +454,11 @@ pub(super) fn on_process_exit(process: ObjectId) {
             if state.meta[idx].live {
                 let _ = state.meta[idx].owners.close_owner(process);
                 state.retire_if_unused(idx);
+            }
+        }
+        for slot in &mut state.security_slots {
+            if slot.live && slot.process == process {
+                *slot = SecurityProcSlot::EMPTY;
             }
         }
     });
@@ -461,7 +575,8 @@ pub(super) fn pid_cgroup_path(pid: u32, out: &mut [u8]) -> usize {
 pub(super) fn with_security_state<R>(
     f: impl FnOnce(&mut ProcessSecurityState) -> R,
 ) -> Result<R, ()> {
-    with_step35_state(|state| f(&mut state.security))
+    let process = slot_process_id();
+    with_step35_state(|state| f(state.security_for_mut(process)))
 }
 
 /// Evaluates active seccomp filter before dispatching sensitive AArch64 syscalls.
@@ -469,8 +584,9 @@ pub(super) fn with_security_state<R>(
 pub(super) fn evaluate_seccomp_request(
     request: SyscallRequest,
 ) -> Result<kernal_linux_cgroup::SeccompVerdict, ()> {
+    let process = slot_process_id();
     with_step35_state(|state| {
-        state.security.evaluate_seccomp(
+        state.security_for(process).evaluate_seccomp(
             request.number as u32,
             kernal_linux_cgroup::AUDIT_ARCH_AARCH64,
             0,
@@ -481,7 +597,8 @@ pub(super) fn evaluate_seccomp_request(
 
 /// Reports whether the current Step-36 security state retains effective capability `cap`.
 pub(super) fn has_effective_capability(cap: u32) -> Result<bool, ()> {
-    with_step35_state(|state| state.security.has_cap(cap))
+    let process = slot_process_id();
+    with_step35_state(|state| state.security_for(process).has_cap(cap))
 }
 
 /// Dispatches Step-35 event/notification/memfd/pidfd/close_range syscalls, synchronous I/O
@@ -546,6 +663,15 @@ pub(super) fn try_handle_syscall(
         46 if is_event_fd(request.args[0]) || is_aliased_event_fd(request.args[0]) => Ok(Some(
             encode_result(handle_memfd_truncate(request.args[0], request.args[1])?),
         )),
+        // fallocate(fd, mode, offset, len) on memfd
+        47 if is_event_fd(request.args[0]) || is_aliased_event_fd(request.args[0]) => {
+            Ok(Some(encode_result(handle_memfd_fallocate(
+                request.args[0],
+                request.args[1],
+                request.args[2] as i64,
+                request.args[3] as i64,
+            )?)))
+        }
         // close(fd)
         57 if is_event_fd(request.args[0]) => {
             Ok(Some(encode_result(handle_close(request.args[0])?)))
@@ -560,11 +686,12 @@ pub(super) fn try_handle_syscall(
         }
         // read(fd, buf, count)
         63 if is_event_fd(request.args[0]) || is_aliased_event_fd(request.args[0]) => {
-            Ok(Some(encode_result(handle_read(
+            Ok(Some(encode_blocking(handle_read(
                 request.args[0],
                 request.args[1],
                 request.args[2],
-            )?)))
+                frame,
+            )?)?))
         }
         // write(fd, buf, count)
         64 if is_event_fd(request.args[0]) || is_aliased_event_fd(request.args[0]) => {
@@ -656,6 +783,29 @@ pub(super) fn try_handle_syscall(
             request.args[2],
             request.args[3],
             frame,
+        )?))),
+        // sched_setaffinity(pid, cpusetsize, user_mask_ptr)
+        122 => Ok(Some(encode_result(handle_sched_setaffinity(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
+        // sched_getaffinity(pid, cpusetsize, user_mask_ptr)
+        123 => Ok(Some(encode_result(handle_sched_getaffinity(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
+        // setpriority(which, who, prio)
+        140 => Ok(Some(encode_result(handle_setpriority(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+        )?))),
+        // getpriority(which, who)
+        141 => Ok(Some(encode_result(handle_getpriority(
+            request.args[0],
+            request.args[1],
         )?))),
         // gettimeofday(tv, tz)
         169 => Ok(Some(encode_result(handle_gettimeofday(
@@ -991,8 +1141,8 @@ fn probe_epoll_external_fds_snapshot(
     process: ObjectId,
     ep_idx: usize,
     alias_gen: Option<u64>,
-) -> Result<([i32; 64], [u32; 64], usize), Errno> {
-    let mut ext_fds = [-1i32; 64];
+) -> Result<([i32; 128], [u32; 128], usize), Errno> {
+    let mut ext_fds = [-1i32; 128];
     let ext_n = with_step35_state(|state| {
         state.check_slot(process, ep_idx, alias_gen)?;
         Ok::<usize, Errno>(state.events.collect_epoll_external_fds(
@@ -1002,7 +1152,7 @@ fn probe_epoll_external_fds_snapshot(
         ))
     })
     .map_err(|()| Errno::EIO)??;
-    let mut ext_masks = [0u32; 64];
+    let mut ext_masks = [0u32; 128];
     for i in 0..ext_n {
         let fd = ext_fds[i];
         if fd >= 0 {
@@ -1085,9 +1235,9 @@ fn handle_epoll_pwait(
     };
     let deadline = deadline_from_relative_ns(rel_ns)?;
     let process = current_process_object().ok_or(())?;
-    let cap = (maxevents as usize).min(32);
-    let mut ready = [EpollEvent { events: 0, data: 0 }; 32];
-    let mut ready_fds = [-1i32; 32];
+    let cap = (maxevents as usize).min(64);
+    let mut ready = [EpollEvent { events: 0, data: 0 }; 64];
+    let mut ready_fds = [-1i32; 64];
     let old_sigmask = apply_optional_sigmask(temp_mask)?;
 
     let count = loop {
@@ -1118,14 +1268,17 @@ fn handle_epoll_pwait(
                 return Ok(BlockingCallResult::Err(e));
             }
             Ok(c) if c > 0 => {
-                let mut pri_fds = [-1i32; 32];
+                let mut pri_fds = [-1i32; 64];
                 let mut pri_n = 0usize;
                 for i in 0..c {
-                    if (ready[i].events & u32::from(POLLPRI)) != 0 && ready_fds[i] >= 0 {
-                        super::step33_mounts::ack_mountinfo_poll_change(
+                    if (ready[i].events & (u32::from(POLLPRI) | u32::from(POLLERR))) != 0
+                        && ready_fds[i] >= 0
+                        && super::step33_mounts::ack_mountinfo_poll_change(
                             process,
                             ready_fds[i] as u64,
-                        );
+                        )
+                        && pri_n < pri_fds.len()
+                    {
                         pri_fds[pri_n] = ready_fds[i];
                         pri_n += 1;
                     }
@@ -1137,6 +1290,29 @@ fn handle_epoll_pwait(
                                 ep_idx,
                                 pfd,
                                 u32::from(POLLPRI) | u32::from(POLLERR),
+                            );
+                        }
+                        if state
+                            .events
+                            .poll_readiness_with(ep_idx, EVENT_FD_BASE, |fd| {
+                                let m = lookup_snapshot_mask(
+                                    &ext_fds[..ext_n],
+                                    &ext_masks[..ext_n],
+                                    fd,
+                                );
+                                if pri_fds[..pri_n].contains(&fd) {
+                                    m & !(u32::from(POLLPRI) | u32::from(POLLERR))
+                                } else {
+                                    m
+                                }
+                            })
+                            .unwrap_or(0)
+                            == 0
+                        {
+                            state.events.clear_parent_epoll_edge_bits(
+                                ep_idx,
+                                EVENT_FD_BASE,
+                                u32::from(POLLIN),
                             );
                         }
                     });
@@ -1249,8 +1425,8 @@ fn handle_ppoll(
         if ready > 0 || deadline == Some(0) {
             if ready > 0 {
                 for (i, &(fd, _)) in entries.iter().enumerate() {
-                    if fd >= 0 && (revents_out[i] & POLLPRI) != 0 {
-                        super::step33_mounts::ack_mountinfo_poll_change(process, fd as u64);
+                    if fd >= 0 && (revents_out[i] & (POLLPRI | POLLERR)) != 0 {
+                        let _ = super::step33_mounts::ack_mountinfo_poll_change(process, fd as u64);
                     }
                 }
             }
@@ -1686,6 +1862,40 @@ fn handle_memfd_truncate(raw_fd: u64, raw_len: u64) -> Result<Result<i64, Errno>
     })
 }
 
+fn handle_memfd_fallocate(
+    raw_fd: u64,
+    raw_mode: u64,
+    offset: i64,
+    len: i64,
+) -> Result<Result<i64, Errno>, ()> {
+    let end = match super::step33_mounts::validate_fallocate_args(raw_mode, offset, len) {
+        Ok(end) => end,
+        Err(e) => return Ok(Err(e)),
+    };
+    let keep_size =
+        (u64::from(linux_unsigned_int(raw_mode)) & super::step33_mounts::FALLOC_FL_KEEP_SIZE) != 0;
+    let (idx, alias_gen) = match resolve_event_target(raw_fd) {
+        Ok(pair) => pair,
+        Err(e) => return Ok(Err(e)),
+    };
+    let Ok(end) = usize::try_from(end) else {
+        return Ok(Err(Errno::EFBIG));
+    };
+    let process = slot_process_id();
+    with_step35_state(|state| {
+        state.check_slot(process, idx, alias_gen)?;
+        // Only memfds are regular files; eventfd/timerfd/epoll report ENODEV like Linux.
+        state
+            .events
+            .memfd_snapshot(idx)
+            .map_err(|_| Errno::ENODEV)?;
+        if !keep_size && end > state.events.memfd_len(idx) {
+            state.events.memfd_truncate(idx, end)?;
+        }
+        Ok(0)
+    })
+}
+
 fn handle_signalfd4(
     raw_ufd: u64,
     user_mask: u64,
@@ -1866,36 +2076,54 @@ fn handle_lseek(raw_fd: u64, offset: i64, whence: i32) -> Result<Result<i64, Err
     })
 }
 
-fn handle_read(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Errno>, ()> {
+fn handle_read(
+    raw_fd: u64,
+    user_buf: u64,
+    count: u64,
+    mut frame: Option<&mut ExceptionFrame>,
+) -> Result<BlockingCallResult, ()> {
     let (idx, alias_gen) = match resolve_event_target(raw_fd) {
         Ok(pair) => pair,
-        Err(e) => return Ok(Err(e)),
+        Err(e) => return Ok(BlockingCallResult::Err(e)),
     };
     let take = usize::try_from(count).unwrap_or(MEMFD_CAP).min(MEMFD_CAP);
     if take == 0 {
-        return Ok(Ok(0));
+        return Ok(BlockingCallResult::Value(0));
     }
     if user_buf == 0 {
-        return Ok(Err(Errno::EFAULT));
+        return Ok(BlockingCallResult::Err(Errno::EFAULT));
     }
     let mut buf = vec![0u8; take];
-    let (mono_ns, real_ns) = timerfd_clocks_now_ns();
     let process = slot_process_id();
-    let res = with_step35_state(|state| {
-        state.events.refresh_timers(mono_ns, real_ns);
-        state.check_slot(process, idx, alias_gen)?;
-        state.events.read(idx, &mut buf[..take])
-    })?;
-    let n = match res {
-        Ok(n) => n,
-        Err(e) => return Ok(Err(e)),
+    let n = loop {
+        let (mono_ns, real_ns) = timerfd_clocks_now_ns();
+        let (nonblocking, res) = with_step35_state(|state| {
+            state.events.refresh_timers(mono_ns, real_ns);
+            state.check_slot(process, idx, alias_gen)?;
+            let nb = state.meta[idx].nonblocking;
+            Ok::<(bool, Result<usize, Errno>), Errno>((
+                nb,
+                state.events.read(idx, &mut buf[..take]),
+            ))
+        })?
+        .unwrap_or_else(|e| (true, Err(e)));
+        match res {
+            Ok(n) => break n,
+            Err(Errno::EAGAIN) if !nonblocking => match blocking_wait_step(frame.as_deref_mut())? {
+                Some(ret) => {
+                    return Ok(BlockingCallResult::HandledInFrame(ret.as_u64_bits()));
+                }
+                None => {}
+            },
+            Err(e) => return Ok(BlockingCallResult::Err(e)),
+        }
     };
     if n > 0 {
         if let Err(e) = copy_to_user(user_buf, &buf[..n]) {
-            return Ok(Err(e));
+            return Ok(BlockingCallResult::Err(e));
         }
     }
-    Ok(Ok(n as i64))
+    Ok(BlockingCallResult::Value(n as i64))
 }
 
 fn handle_write(raw_fd: u64, user_buf: u64, count: u64) -> Result<Result<i64, Errno>, ()> {
@@ -2105,7 +2333,8 @@ fn handle_capget(user_hdr: u64, user_data: u64) -> Result<Result<i64, Errno>, ()
         return Ok(Err(Errno::EINVAL));
     }
     if user_data != 0 {
-        let data = with_step35_state(|state| state.security.encode_cap_data_v3())?;
+        let process = slot_process_id();
+        let data = with_step35_state(|state| state.security_for(process).encode_cap_data_v3())?;
         if let Err(e) = copy_to_user(user_data, &data) {
             return Ok(Err(e));
         }
@@ -2130,11 +2359,23 @@ fn handle_capset(user_hdr: u64, user_data: u64) -> Result<Result<i64, Errno>, ()
     if let Err(e) = copy_from_user(&mut data, user_data) {
         return Ok(Err(e));
     }
-    with_step35_state(|state| state.security.apply_cap_data_v3(&data).map(|()| 0))
+    let process = slot_process_id();
+    with_step35_state(|state| {
+        state
+            .security_for_mut(process)
+            .apply_cap_data_v3(&data)
+            .map(|()| 0)
+    })
 }
 
 fn handle_unshare(raw_flags: u64) -> Result<Result<i64, Errno>, ()> {
-    with_step35_state(|state| state.security.unshare(raw_flags).map(|()| 0))
+    let process = slot_process_id();
+    with_step35_state(|state| {
+        state
+            .security_for_mut(process)
+            .unshare(raw_flags)
+            .map(|()| 0)
+    })
 }
 
 fn handle_prctl_if_step36(
@@ -2145,8 +2386,17 @@ fn handle_prctl_if_step36(
     arg5: u64,
 ) -> Result<Option<SyscallReturn>, ()> {
     let option = linux_unsigned_int(raw_option);
+    let process = slot_process_id();
     // Keep PR_SET_NO_NEW_PRIVS / PR_GET_NO_NEW_PRIVS in step30_runtime for Step-30 proof fidelity.
-    if option == PR_SET_NO_NEW_PRIVS || option == PR_GET_NO_NEW_PRIVS {
+    if option == PR_SET_NO_NEW_PRIVS {
+        if arg2 == 1 && arg3 == 0 && arg4 == 0 && arg5 == 0 {
+            let _ = with_step35_state(|state| {
+                state.security_for_mut(process).no_new_privs = true;
+            });
+        }
+        return Ok(None);
+    }
+    if option == PR_GET_NO_NEW_PRIVS {
         return Ok(None);
     }
     if option == PR_SET_NAME {
@@ -2154,7 +2404,7 @@ fn handle_prctl_if_step36(
         if let Err(e) = copy_from_user(&mut name, arg2) {
             return Ok(Some(SyscallReturn::error(e)));
         }
-        with_step35_state(|state| state.security.set_comm(&name))?;
+        with_step35_state(|state| state.security_for_mut(process).set_comm(&name))?;
         if let Some(current) = super::step_fd_util::current_scheduler_thread() {
             let _ = super::runtime::with_linux_runtime(|state| {
                 let _ = state.set_current_process_comm(current, &name);
@@ -2163,7 +2413,7 @@ fn handle_prctl_if_step36(
         return Ok(Some(SyscallReturn::success(0).ok_or(())?));
     }
     if option == PR_GET_NAME {
-        let mut comm = with_step35_state(|state| state.security.comm)?;
+        let mut comm = with_step35_state(|state| state.security_for(process).comm)?;
         if let Some(current) = super::step_fd_util::current_scheduler_thread() {
             let _ = super::runtime::with_linux_runtime(|state| {
                 if let Ok(proc_comm) = state.current_process_comm(current) {
@@ -2177,14 +2427,209 @@ fn handle_prctl_if_step36(
         return Ok(Some(SyscallReturn::success(0).ok_or(())?));
     }
     if option == PR_GET_PDEATHSIG {
-        let sig = with_step35_state(|state| state.security.pdeathsig)?;
+        let sig = with_step35_state(|state| state.security_for(process).pdeathsig)?;
         if let Err(e) = copy_to_user(arg2, &sig.to_le_bytes()) {
             return Ok(Some(SyscallReturn::error(e)));
         }
         return Ok(Some(SyscallReturn::success(0).ok_or(())?));
     }
-    let res = with_step35_state(|state| state.security.prctl(option, arg2, arg3, arg4, arg5))?;
+    let res = with_step35_state(|state| {
+        state
+            .security_for_mut(process)
+            .prctl(option, arg2, arg3, arg4, arg5)
+    })?;
     Ok(Some(encode_result(res)))
+}
+
+fn resolve_priority_targets(
+    which: i32,
+    who: i32,
+) -> Result<
+    (
+        [Option<(ObjectId, u32)>; super::runtime::STEP15_RUNTIME_PROCESSES],
+        usize,
+    ),
+    Errno,
+> {
+    if !matches!(which, PRIO_PROCESS | PRIO_PGRP | PRIO_USER) {
+        return Err(Errno::EINVAL);
+    }
+    if who < 0 && which != PRIO_USER {
+        return Err(Errno::ESRCH);
+    }
+    let fallback_proc = slot_process_id();
+    let (fallback_uid, _) = super::step_fd_util::current_uid_gid();
+    let mut targets = [None; super::runtime::STEP15_RUNTIME_PROCESSES];
+    let Some(tid) = super::step_fd_util::current_scheduler_thread() else {
+        if who == 0 {
+            targets[0] = Some((fallback_proc, fallback_uid));
+            return Ok((targets, 1));
+        }
+        return Err(Errno::ESRCH);
+    };
+
+    let Ok(count) = super::runtime::with_linux_runtime(|rt| {
+        let Some(cur) = rt.proc_snapshot_for_scheduler_thread(tid) else {
+            return Err(Errno::ESRCH);
+        };
+        if which == PRIO_PROCESS {
+            let target_pid = if who == 0 { cur.pid } else { who as u32 };
+            if target_pid == cur.pid {
+                targets[0] = Some((cur.process, cur.uid));
+                return Ok(1usize);
+            }
+            let Some(nz) = core::num::NonZeroU32::new(target_pid) else {
+                return Err(Errno::ESRCH);
+            };
+            let Some(snap) = rt.proc_snapshot_by_pid(nz) else {
+                return Err(Errno::ESRCH);
+            };
+            targets[0] = Some((snap.process, snap.uid));
+            return Ok(1usize);
+        }
+
+        let mut snaps = [None; super::runtime::STEP15_RUNTIME_PROCESSES];
+        let snap_count = rt.collect_proc_snapshots(&mut snaps);
+        let mut matched = 0usize;
+        for snap in snaps.into_iter().take(snap_count).flatten() {
+            let matches_group = match which {
+                PRIO_PGRP => {
+                    let target_pgid = if who == 0 { cur.pgid } else { who as u32 };
+                    snap.pgid == target_pgid
+                }
+                PRIO_USER => {
+                    let target_uid = if who == 0 { cur.uid } else { who as u32 };
+                    snap.uid == target_uid
+                }
+                _ => false,
+            };
+            if matches_group && matched < targets.len() {
+                targets[matched] = Some((snap.process, snap.uid));
+                matched += 1;
+            }
+        }
+        if matched == 0 {
+            return Err(Errno::ESRCH);
+        }
+        Ok(matched)
+    }) else {
+        if who == 0 {
+            targets[0] = Some((fallback_proc, fallback_uid));
+            return Ok((targets, 1));
+        }
+        return Err(Errno::ESRCH);
+    };
+
+    let count = count?;
+    Ok((targets, count))
+}
+
+fn handle_getpriority(raw_which: u64, raw_who: u64) -> Result<Result<i64, Errno>, ()> {
+    let which = linux_signed_int(raw_which);
+    let who = linux_signed_int(raw_who);
+    let (targets, count) = match resolve_priority_targets(which, who) {
+        Ok(found) => found,
+        Err(err) => return Ok(Err(err)),
+    };
+    with_step35_state(|state| {
+        let mut best_nice = i8::MAX;
+        for (proc_id, _) in targets.into_iter().take(count).flatten() {
+            best_nice = best_nice.min(state.nice_for(proc_id));
+        }
+        Ok(PRIORITY_OFFSET - i64::from(best_nice))
+    })
+}
+
+fn handle_setpriority(
+    raw_which: u64,
+    raw_who: u64,
+    raw_prio: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    let which = linux_signed_int(raw_which);
+    let who = linux_signed_int(raw_who);
+    let niceval = linux_signed_int(raw_prio).clamp(-20, 19) as i8;
+    let (targets, count) = match resolve_priority_targets(which, who) {
+        Ok(found) => found,
+        Err(err) => return Ok(Err(err)),
+    };
+    let (caller_uid, _) = super::step_fd_util::current_uid_gid();
+    let is_root = caller_uid == 0;
+    with_step35_state(|state| {
+        for (proc_id, target_uid) in targets.into_iter().take(count).flatten() {
+            if !is_root && caller_uid != target_uid {
+                return Err(Errno::EPERM);
+            }
+            if !is_root && niceval < state.nice_for(proc_id) {
+                return Err(Errno::EACCES);
+            }
+        }
+        for (proc_id, _) in targets.into_iter().take(count).flatten() {
+            state.set_nice_for(proc_id, niceval);
+        }
+        Ok(0)
+    })
+}
+
+fn validate_affinity_args(
+    raw_pid: u64,
+    cpusetsize: u64,
+    user_mask: u64,
+) -> Result<(u64, u64), Errno> {
+    let pid = linux_signed_int(raw_pid);
+    if pid < 0 {
+        return Err(Errno::ESRCH);
+    }
+    if pid > 0
+        && let Some(_tid) = super::step_fd_util::current_scheduler_thread()
+        && let Some(nz) = core::num::NonZeroU32::new(pid as u32)
+        && super::runtime::with_linux_runtime(|rt| rt.proc_snapshot_by_pid(nz).is_none())
+            .unwrap_or(false)
+    {
+        return Err(Errno::ESRCH);
+    }
+    if cpusetsize < 8 || cpusetsize % 8 != 0 {
+        return Err(Errno::EINVAL);
+    }
+    if user_mask == 0 {
+        return Err(Errno::EFAULT);
+    }
+    let count = super::super::online_cpu_count();
+    let online_mask = (1u64 << count) - 1;
+    Ok((online_mask, user_mask))
+}
+
+fn handle_sched_getaffinity(
+    raw_pid: u64,
+    cpusetsize: u64,
+    user_mask: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    let (online_mask, dst) = match validate_affinity_args(raw_pid, cpusetsize, user_mask) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Err(e) = copy_to_user(dst, &online_mask.to_le_bytes()) {
+        return Ok(Err(e));
+    }
+    Ok(Ok(8))
+}
+
+fn handle_sched_setaffinity(
+    raw_pid: u64,
+    cpusetsize: u64,
+    user_mask: u64,
+) -> Result<Result<i64, Errno>, ()> {
+    let (online_mask, src) = match validate_affinity_args(raw_pid, cpusetsize, user_mask) {
+        Ok(v) => v,
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut raw = [0u8; 8];
+    if let Err(e) = copy_from_user(&mut raw, src) {
+        return Ok(Err(e));
+    }
+    if (u64::from_le_bytes(raw) & online_mask) == 0 {
+        return Ok(Err(Errno::EINVAL));
+    }
+    Ok(Ok(0))
 }
 
 fn read_user_cstr(user_ptr: u64, out: &mut [u8]) -> Result<usize, Errno> {
@@ -2237,5 +2682,50 @@ mod tests {
             let ret = try_handle_syscall(req, None).unwrap().unwrap();
             assert_eq!(ret, SyscallReturn::error(Errno::ENOSYS));
         }
+    }
+
+    #[test]
+    fn getpriority_and_setpriority_validate_and_track_nice() {
+        let get_req = SyscallRequest::new(141, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            try_handle_syscall(get_req, None).unwrap().unwrap(),
+            SyscallReturn::success(20).unwrap()
+        );
+
+        let set_req = SyscallRequest::new(140, [0, 0, (-5i64) as u64, 0, 0, 0]);
+        assert_eq!(
+            try_handle_syscall(set_req, None).unwrap().unwrap(),
+            SyscallReturn::success(0).unwrap()
+        );
+        assert_eq!(
+            try_handle_syscall(get_req, None).unwrap().unwrap(),
+            SyscallReturn::success(25).unwrap()
+        );
+
+        let bad_which = SyscallRequest::new(141, [9, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            try_handle_syscall(bad_which, None).unwrap().unwrap(),
+            SyscallReturn::error(Errno::EINVAL)
+        );
+
+        let reset_req = SyscallRequest::new(140, [0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            try_handle_syscall(reset_req, None).unwrap().unwrap(),
+            SyscallReturn::success(0).unwrap()
+        );
+    }
+
+    #[test]
+    fn sched_affinity_validates_cpuset_size_and_null_mask() {
+        let bad_size = SyscallRequest::new(123, [0, 4, 0x1000, 0, 0, 0]);
+        assert_eq!(
+            try_handle_syscall(bad_size, None).unwrap().unwrap(),
+            SyscallReturn::error(Errno::EINVAL)
+        );
+        let null_mask = SyscallRequest::new(123, [0, 128, 0, 0, 0, 0]);
+        assert_eq!(
+            try_handle_syscall(null_mask, None).unwrap().unwrap(),
+            SyscallReturn::error(Errno::EFAULT)
+        );
     }
 }

@@ -251,6 +251,7 @@ impl Errno {
     pub const ENFILE: Self = Self(23);
     pub const EMFILE: Self = Self(24);
     pub const ENOTTY: Self = Self(25);
+    pub const EFBIG: Self = Self(27);
     pub const ENOSPC: Self = Self(28);
     pub const ESPIPE: Self = Self(29);
     pub const EROFS: Self = Self(30);

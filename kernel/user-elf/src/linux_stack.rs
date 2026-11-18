@@ -201,20 +201,25 @@ fn build_stack(
     let envc = spec.envp.len();
     let mut argv_addresses = [0u64; MAX_ARGC];
     let mut env_addresses = [0u64; MAX_ENVC];
-    let mut string_cursor = stack.stack_end();
+    // Reserve strings in Linux upward address order (argv[0..] < envp[0..]) with a 16-byte
+    // zeroed tail margin below stack_end so SIMD/setproctitle scans never touch stack_end.
+    let mut string_cursor = stack
+        .stack_end()
+        .checked_sub(STACK_ALIGNMENT)
+        .ok_or(Error::StackTooSmall)?;
 
-    for (index, address) in argv_addresses.iter_mut().enumerate().take(argc) {
+    for index in (0..envc).rev() {
+        string_cursor = reserve_c_string(string_cursor, spec.envp[index])?;
+        env_addresses[index] = string_cursor;
+    }
+    for index in (0..argc).rev() {
         let value = if index == 0 {
             spec.argv0
         } else {
             spec.argv_tail[index - 1]
         };
         string_cursor = reserve_c_string(string_cursor, value)?;
-        *address = string_cursor;
-    }
-    for (index, value) in spec.envp.iter().copied().enumerate() {
-        string_cursor = reserve_c_string(string_cursor, value)?;
-        env_addresses[index] = string_cursor;
+        argv_addresses[index] = string_cursor;
     }
 
     let random = string_cursor
@@ -567,6 +572,8 @@ mod tests {
         cursor += 8;
         assert_eq!(read_u64(&page, page_start, cursor), 0);
         assert_eq!(argv0, layout.argv0());
+        assert!(argv0 < argv1 && argv1 < argv2 && argv2 < env0 && env0 < env1);
+        assert!(env1 + (ENVP[1].len() as u64) < STACK_END - STACK_ALIGNMENT);
         for (address, value) in [
             (argv0, rich.argv0),
             (argv1, ARGV_TAIL[0]),

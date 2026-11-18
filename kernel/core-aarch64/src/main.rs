@@ -99,6 +99,16 @@ static RUNTIME_SCHEDULER_TICK_ACTIVE: [AtomicBool; MAX_PROOF_CPUS] =
     [const { AtomicBool::new(false) }; MAX_PROOF_CPUS];
 static BSP_REMOTE_SGI_SENT: AtomicBool = AtomicBool::new(false);
 static EXPECTED_CPUS: AtomicU32 = AtomicU32::new(0);
+
+/// Returns the number of online application/bootstrap PEs clamped to `[1, MAX_PROOF_CPUS]`.
+pub(crate) fn online_cpu_count() -> u8 {
+    let online = CPU_STATES
+        .iter()
+        .filter(|slot| slot.load(Ordering::Acquire) == CPU_ONLINE)
+        .count();
+    let expected = EXPECTED_CPUS.load(Ordering::Acquire) as usize;
+    online.max(expected).clamp(1, MAX_PROOF_CPUS) as u8
+}
 static SCHEDULER_SMOKE_STATE: AtomicU32 = AtomicU32::new(SCHEDULER_SMOKE_IDLE);
 
 static TIMER_INTID: AtomicU32 = AtomicU32::new(NO_INTERRUPT);
