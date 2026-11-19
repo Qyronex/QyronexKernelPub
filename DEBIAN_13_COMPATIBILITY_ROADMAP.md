@@ -1,5 +1,7 @@
 # Kernal — Debian 13 compatibility roadmap (Steps 27–44)
 
+> **Status note (2026-11-19):** Steps 27–39 and 43 are marked DONE for AArch64/QEMU as declared by the maintainer, based on the commit history (`2d4f2d7` … `b0cc59c`) and an observed boot of Debian 13 arm64 with systemd 257 plus a labwc + XFCE desktop. They were not individually re-verified against the acceptance criteria by an automated run. Step 40 is PARTIAL, steps 41, 42 and 44 remain open. See [STATUS.md](STATUS.md).
+
 This file is the canonical **post-v0.1 extension** of `AGENT_PLAN_26.md`.
 
 It does not replace, reorder, or weaken Steps 1–26. Steps 27–44 are blocked until Step 26 is accepted. The project must finish the multi-architecture kernel foundation, userspace, storage/network, Linux ABI baseline, security/reproducibility work and documented v0.1 hardware subset before claiming Debian compatibility work as active.
@@ -49,7 +51,7 @@ Finish lines for this extension:
 ---
 
 ## 27 — Pin Debian 13 target and build a compatibility oracle
-**Status: TODO / BLOCKED BY STEP 26**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Pin one Debian 13 rootfs/repository snapshot per primary architecture and record exact release, architecture, snapshot identity and cryptographic hashes for local test artifacts. Do not use an unversioned `latest` rootfs as acceptance evidence.
 
@@ -62,7 +64,7 @@ Acceptance:
 - unknown/unsupported operations have an explicit expected failure policy.
 
 ## 28 — Initramfs and unchanged static BusyBox shell
-**Status: TODO / BLOCKED BY STEP 27**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Add a deterministic initramfs/CPIO ingestion path or equivalent immutable boot filesystem that feeds the normal VFS. Preserve ownership and bounds validation while parsing the archive. The kernel must not special-case BusyBox binaries.
 
@@ -75,7 +77,7 @@ Acceptance on x86_64 and AArch64:
 - malformed CPIO entries cannot escape bounds or create illegal VFS state.
 
 ## 29 — Linux path, file-descriptor and directory semantics
-**Status: TODO / BLOCKED BY STEP 28**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Complete the ordinary filesystem semantics expected by shells and core utilities: cwd/root path resolution, symlinks, `openat`/`openat2`, read/write/pread/pwrite, seek, close/dup/fcntl, pipes, `getdents64`, stat families, directory and link operations, modes/umask/basic ownership/timestamps and descriptor inheritance across exec.
 
@@ -86,7 +88,7 @@ Acceptance:
 - bad user pointers and invalid FDs return Linux-compatible errors without kernel panic.
 
 ## 30 — Linux process lifecycle, exec, wait, signals and credentials
-**Status: TODO / BLOCKED BY STEP 29**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Implement `execve`/`execveat`, the clone/fork/vfork subset required by the target, wait/zombie/reaping behavior, process groups/sessions, signal delivery and architecture-correct signal frames, uid/gid credentials, robust lists, thread-exit semantics and required `prctl` behavior.
 
@@ -97,7 +99,7 @@ Acceptance:
 - malformed signal frames fail closed.
 
 ## 31 — Debian 13 dynamic glibc ELF, TLS, auxv and runtime bootstrap
-**Status: TODO / BLOCKED BY STEP 30**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Support the dynamic-loader behavior required by Debian 13: `PT_INTERP`, PIE/ET_DYN mappings, argc/argv/envp/auxv, x86_64 FS/TLS and AArch64 `TPIDR_EL0`, `AT_RANDOM`, IDs, program-header metadata, getrandom, robust futex/thread startup and safe fallback for optional features such as rseq/vDSO when not yet implemented.
 
@@ -108,7 +110,7 @@ Acceptance:
 - loader mappings never become W+X.
 
 ## 32 — `/dev`, console, TTY/PTY and pseudo-device baseline
-**Status: TODO / BLOCKED BY STEP 31**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Provide `/dev/null`, `/dev/zero`, `/dev/full`, random devices, `/dev/console`, serial TTY, the required TTY ioctl/line-discipline subset, PTYs, `/dev/ptmx`, devpts-facing behavior and session/foreground-process-group semantics. Device nodes remain capability mediated.
 
@@ -118,7 +120,7 @@ Acceptance:
 - entropy devices do not claim readiness before the explicit entropy policy permits it.
 
 ## 33 — Mount model, tmpfs, procfs, sysfs, devpts and persistent root filesystem
-**Status: TODO / BLOCKED BY STEP 32**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Add mount/umount semantics, initramfs-to-real-root transition, tmpfs, devpts, procfs and sysfs subsets required by Debian 13, plus one persistent read/write root filesystem. Ext4 is the preferred compatibility target unless another format is explicitly selected. Provide sync/fsync/rename semantics sufficient for package-manager safety.
 
@@ -129,7 +131,7 @@ Acceptance:
 - package-manager smoke tests do not corrupt the image under normal clean shutdown.
 
 ## 34 — Debian networking: Unix sockets, IP semantics, netlink and resolver path
-**Status: TODO / BLOCKED BY STEP 33**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Extend networking with AF_UNIX, required IPv4/IPv6 TCP/UDP semantics/options, nonblocking/event interaction, basic interface ioctls, NETLINK_ROUTE minimum, loopback, hostname APIs and the resolver prerequisites required by Debian 13 glibc.
 
@@ -141,7 +143,7 @@ Acceptance:
 - malformed netlink messages are bounded.
 
 ## 35 — Linux event, notification and modern descriptor APIs
-**Status: TODO / BLOCKED BY STEP 34**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Implement the required epoll semantics plus eventfd, timerfd, signalfd, inotify, memfd/sealing, required pidfd operations and modern housekeeping syscalls observed in the Debian 13 corpus.
 
@@ -151,7 +153,7 @@ Acceptance:
 - systemd/dbus prerequisite probe no longer fails on missing fundamental event descriptors.
 
 ## 36 — Namespaces, cgroups v2 and security-facing syscall contract
-**Status: TODO / BLOCKED BY STEP 35**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Implement the minimum namespaces, cgroups-v2 hierarchy/controllers, rlimits, Linux capabilities/securebits view and security-facing syscall behavior required by Debian 13/systemd while preserving Kernal's capability authority model. Unsupported seccomp/keyring/audit/BPF functionality must fail explicitly until genuinely implemented.
 
@@ -161,7 +163,7 @@ Acceptance:
 - unsupported security/isolation calls do not broaden authority.
 
 ## 37 — Unchanged Debian 13 systemd as PID 1
-**Status: TODO / BLOCKED BY STEP 36**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Boot the pinned Debian 13 userspace with its own systemd binary as PID 1. Implement missing kernel contracts from observed failures one at a time; never add systemd process-name special cases.
 
@@ -173,7 +175,7 @@ Acceptance on x86_64 and AArch64 QEMU:
 - clean poweroff/reboot completes through the normal userspace request path.
 
 ## 38 — udev, hotplug and Linux-visible device model
-**Status: TODO / BLOCKED BY STEP 37**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Provide the sysfs hierarchy, Linux-visible device identities and uevent delivery required by Debian 13 systemd-udevd for the supported block/network/tty subset, with race-safe device lifecycle and no authority amplification through device nodes.
 
@@ -183,7 +185,7 @@ Acceptance:
 - device add/remove does not leak stale authority.
 
 ## 39 — `dpkg`/`apt` and package-manager durability semantics
-**Status: TODO / BLOCKED BY STEP 38**
+**Status: DONE (AArch64/QEMU, maintainer-declared 2026-11-19)**
 
 Close Debian 13 package-management gaps: file/advisory locks, atomic metadata operations, fsync/fdatasync/syncfs, mmap/truncation behavior, required xattrs/ACLs, network/time/entropy support, shebang/interpreter behavior and ownership/mode preservation.
 
@@ -194,7 +196,7 @@ Acceptance:
 - process-failure tests stay within documented filesystem durability guarantees.
 
 ## 40 — Unmodified Debian 13 Server rootfs proof in QEMU
-**Status: TODO / BLOCKED BY STEP 39**
+**Status: PARTIAL (AArch64/QEMU boots to multi-user.target; shutdown, x86_64 and full acceptance not shown)**
 
 This is the first point at which the project may claim a bounded form of "Debian 13 runs on Kernal."
 
@@ -236,7 +238,7 @@ Acceptance:
 - unsupported hardware remains isolated and fails cleanly.
 
 ## 43 — Optional Debian desktop enablement
-**Status: TODO / OPTIONAL AFTER STEP 40**
+**Status: DONE (AArch64/QEMU: labwc + XFCE 4.20, maintainer-declared 2026-11-19)**
 
 Desktop support is not required for the Step-40 Debian Server claim. If pursued, add a documented framebuffer/DRM/KMS target, input stack, evdev semantics, selected audio contract, logind/seat/session behavior and the shared-memory/ioctl contracts required by the selected Wayland/X stack.
 

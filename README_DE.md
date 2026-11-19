@@ -38,6 +38,8 @@ Der aktuelle Quellbaum umfasst unter anderem:
 
 Die Linux-Kompatibilität zielt auf die **Userspace-ABI**. Linux-Kernelmodule sind kein Kompatibilitätsziel.
 
+**Aktueller Meilenstein:** Ein unverändertes Debian-13-Userspace (trixie/arm64) mit systemd 257 bootet auf Kernal in QEMU, und ein labwc- (Wayland) + XFCE-Desktop startet über `qyronex-desktop.service`. Wayland und XFCE sind Debian-Programme und nicht Teil des Kernels. Siehe [docs/de/STATUS.md](docs/de/STATUS.md) für den geprüften Stand, bekannte Lücken und das Starten.
+
 ## Voraussetzungen
 
 Das Workspace verwendet derzeit Rust **1.98.0**.

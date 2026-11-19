@@ -27,6 +27,8 @@ The repository includes protected EL0 execution, AArch64 exception/syscall/conte
 
 Linux compatibility targets the **userspace ABI**. Linux kernel modules are not a compatibility target.
 
+**Current milestone:** an unchanged Debian 13 (trixie/arm64) userspace with systemd 257 boots on Kernal in QEMU, and a labwc (Wayland) + XFCE desktop starts via `qyronex-desktop.service`. Wayland and XFCE are Debian userspace programs, not part of the kernel. See [STATUS.md](STATUS.md) for the verified state, known gaps and how to run it.
+
 ## Build
 
 The workspace currently pins Rust **1.98.0**.
@@ -70,6 +72,7 @@ The public verification path covers formatting, workspace tests, strict Clippy c
 
 - [German documentation overview](docs/de/README.md)
 - [German dissertation-style technical monograph](docs/de/DISSERTATION_QYRONEX_KERNAL.md)
+- [Project status](STATUS.md)
 - [Debian 13 compatibility roadmap](DEBIAN_13_COMPATIBILITY_ROADMAP.md)
 - [Secure storage architecture](SECURE_STORAGE_ARCHITECTURE.md)
 - [Boot protocol](docs/BOOT_PROTOCOL.md)

@@ -1,0 +1,71 @@
+# Qyronex Kernal — Status
+
+Last updated: 2026-11-19 (source head `b0cc59c`). German version: [docs/de/STATUS.md](docs/de/STATUS.md).
+
+> Research kernel. Not production-ready, not a security boundary. Claims below are limited to what the commit history and the observed QEMU boot log show; they are not a completed conformance or audit result.
+
+## What Qyronex is
+
+- A **standalone Rust kernel** (about 157k lines under `kernel/`), **not Linux and not a Linux fork**.
+- Own architecture: capabilities, W^X, null-page and guard-stack invariants, IOMMU/IRQ fail-closed design, own scheduler and memory management.
+- Provides the **Linux userspace ABI** (syscalls, VFS, `/proc`, `/sys`, devices, netlink) so unmodified Linux binaries can run. Linux kernel modules (`.ko`) are not supported.
+- Primary target: **AArch64 / ARM64 in QEMU** (`virt`, GICv3). x86_64 components exist but are not the active runtime target.
+
+## Current state (observed)
+
+| Area | State | Notes |
+|---|---|---|
+| Protected boot, EL0/EL1, PAN, W^X, TTBR0/TTBR1 | Working in QEMU | Boot log proves each step (S7–S15) |
+| Linux syscall personality (arm64) | Working | Unchanged static and dynamic ELF programs run |
+| VFS: initramfs, memfs (tmpfs), ext4 on virtio-blk (GPT) | Working | |
+| Networking: virtio-net, DHCP, AF_UNIX, TCP/UDP, netlink | Working | DHCP lease `10.0.2.15` in QEMU user networking |
+| Events/cgroups: epoll, eventfd, timerfd, signalfd, inotify, memfd, cgroups v2 | Implemented | |
+| **Debian 13 (trixie/arm64) with systemd 257 as PID 1** | **Boots to `multi-user.target`** | Unchanged Debian userspace; udevd, journald, dbus, serial getty run |
+| Graphics/input: virtio-gpu (KMS/mmap), virtio-input evdev (keyboard, tablet) | Implemented | `drivers/virtio`, `kernel/linux-desktop` |
+| **Desktop: labwc (Wayland compositor) + XFCE 4.20** | **Starts via `qyronex-desktop.service`** | Verified visually: XFCE panel, terminal, file manager over noVNC |
+| SMP | `smp=1` default; 1/2/4/8 selectable | Higher counts less tested |
+
+## Wayland and XFCE: how it works
+
+Wayland and XFCE are **not built into the kernel**. They are ordinary **Debian 13 userspace programs** (labwc as Wayland compositor, XFCE on top) that run on Qyronex through the Linux ABI layer and the DRM/KMS, evdev, seat and udev interfaces in `kernel/linux-desktop` and `drivers/virtio`.
+
+## Known gaps (from the boot log)
+
+- Missing kernel features reported by systemd: `autofs4`, BPF LSM / cgroup BPF firewalling, `fs.file-max`, `fs.nr_open`, kbrequest ioctl.
+- systemd detects virtualization as `container-other`.
+- `modprobe@*` services are terminated with `SIGKILL` (modules are not supported; units are effectively no-ops).
+- Desktop is software-rendered in QEMU; expect it to be slow on 1 vCPU / 2 GB.
+- No real-hardware profile is documented. QEMU is the only proof platform.
+- Roadmap steps 27–39 and 43 are marked DONE by the maintainer (AArch64/QEMU only), step 40 is PARTIAL, steps 41, 42 and 44 are open. The DONE marks were not re-verified by an automated acceptance run.
+
+## How to run (macOS)
+
+The launcher is `tools/debian13/start-desktop.sh` (a user-level wrapper named `qyronex` may point to it). QEMU runs inside a Docker image (`kernal-dev:bookworm-arm64`), so **Docker Desktop must be running**.
+
+```bash
+tools/debian13/start-desktop.sh            # XFCE + labwc desktop via web VNC (default)
+tools/debian13/start-desktop.sh 4          # 4 vCPUs
+tools/debian13/start-desktop.sh --headless # serial console only
+tools/debian13/start-desktop.sh --cocoa    # native QEMU window (needs local qemu)
+tools/debian13/start-desktop.sh --build    # rebuild the AArch64 kernel first
+tools/debian13/start-desktop.sh --etappe5  # older Weston desktop image
+tools/debian13/start-desktop.sh --etappe4  # systemd CLI image
+```
+
+- Browser desktop: `http://127.0.0.1:6080/web_vnc.html?ws=6081`
+- VNC: `vnc://:qyronex@127.0.0.1:5900` (override with `VNC_PORT`, `WEB_PORT`, `WS_PORT`, `VNC_PASS`)
+- Login: `root`, no password. Quit: `Ctrl+A`, then `x`.
+- The default VNC password and empty root password are for local development only. Do not expose these ports.
+
+The disk images live in Docker volumes (`kernal-docker-cache`, `kernal-docker-target`), not in Git.
+
+## Milestone history
+
+| Milestone | Commit | Date |
+|---|---|---|
+| Etappes 1–3: pty, virtio-blk ext4, virtio-net/apt | `2d4f2d7` | — |
+| Etappe 4: systemd PID 1, udevd, cgroups v2, login, SMP | `b6aa145` | 2026-11-18 |
+| Etappe 5: virtio-gpu KMS, virtio-input, Weston | `8c67bfe` | 2026-11-18 |
+| Full XFCE + labwc desktop, VM/TTY/PTY hardening | `d81aab8` | 2026-11-19 |
+| `qyronex` desktop launcher, web VNC viewer | `a130154` | 2026-11-19 |
+| epoll aliasing fix, virtio-tablet udev tags | `b0cc59c` | 2026-11-19 |
