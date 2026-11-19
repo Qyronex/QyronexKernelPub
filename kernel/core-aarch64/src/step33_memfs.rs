@@ -123,6 +123,7 @@ struct MemNode {
     atime: u32,
     mtime: u32,
     ctime: u32,
+    write_rev: u64,
     unlinked: bool,
     open_refs: u32,
 }
@@ -244,6 +245,7 @@ impl MemFs {
             atime: now,
             mtime: now,
             ctime: now,
+            write_rev: 1,
             unlinked: false,
             open_refs: 0,
         })
@@ -290,6 +292,7 @@ impl MemFs {
                 atime: now,
                 mtime: now,
                 ctime: now,
+                write_rev: 1,
                 unlinked: false,
                 open_refs: 0,
             })
@@ -503,6 +506,25 @@ impl MemFs {
         Some(node.as_stat(self.count_nlink(mount_id, node)))
     }
 
+    pub(super) fn file_rev(&self, mount_id: u32, ino: u64) -> Option<u64> {
+        let idx = self.find_ino_idx(mount_id, ino)?;
+        Some(self.nodes[idx].write_rev)
+    }
+
+    pub(super) fn read_file_if_changed(
+        &self,
+        mount_id: u32,
+        ino: u64,
+        last_rev: u64,
+    ) -> Option<(Vec<u8>, u64)> {
+        let idx = self.find_ino_idx(mount_id, ino)?;
+        let node = &self.nodes[idx];
+        if node.write_rev == last_rev {
+            return None;
+        }
+        Some((node.data.clone(), node.write_rev))
+    }
+
     pub(super) fn parent_ino(&self, mount_id: u32, ino: u64) -> Option<u64> {
         let idx = self.find_ino_idx(mount_id, ino)?;
         let parent = self.nodes[idx].parent_ino;
@@ -605,6 +627,9 @@ impl MemFs {
                 return Err(Errno::EISDIR);
             }
             if trunc && self.nodes[idx].kind == MemNodeKind::File {
+                if !self.nodes[idx].data.is_empty() {
+                    self.nodes[idx].write_rev = self.nodes[idx].write_rev.wrapping_add(1).max(1);
+                }
                 self.nodes[idx].data.clear();
                 self.nodes[idx].mtime = now;
                 self.nodes[idx].ctime = now;
@@ -627,6 +652,7 @@ impl MemFs {
             atime: now,
             mtime: now,
             ctime: now,
+            write_rev: 1,
             unlinked: false,
             open_refs: 0,
         };
@@ -666,6 +692,7 @@ impl MemFs {
             atime: now,
             mtime: now,
             ctime: now,
+            write_rev: 1,
             unlinked: true,
             open_refs: 0,
         };
@@ -734,6 +761,7 @@ impl MemFs {
             atime: now,
             mtime: now,
             ctime: now,
+            write_rev: 1,
             unlinked: false,
             open_refs: 0,
         };
@@ -774,6 +802,7 @@ impl MemFs {
             atime: now,
             mtime: now,
             ctime: now,
+            write_rev: 1,
             unlinked: false,
             open_refs: 0,
         };
@@ -826,6 +855,7 @@ impl MemFs {
             atime: now,
             mtime: now,
             ctime: now,
+            write_rev: 1,
             unlinked: false,
             open_refs: 0,
         };
@@ -997,11 +1027,17 @@ impl MemFs {
         if end_pos > MAX_MEMFS_FILE_BYTES {
             return Err(Errno::ENOSPC);
         }
+        let mut changed = false;
         if end_pos > node.data.len() {
             node.data.resize(end_pos, 0);
+            changed = true;
         }
-        if !src.is_empty() {
+        if !src.is_empty() && node.data[write_pos..end_pos] != *src {
             node.data[write_pos..end_pos].copy_from_slice(src);
+            changed = true;
+        }
+        if changed {
+            node.write_rev = node.write_rev.wrapping_add(1).max(1);
         }
         node.mtime = now;
         node.ctime = now;
@@ -1025,6 +1061,9 @@ impl MemFs {
         }
         if len > MAX_MEMFS_FILE_BYTES {
             return Err(Errno::ENOSPC);
+        }
+        if node.data.len() != len {
+            node.write_rev = node.write_rev.wrapping_add(1).max(1);
         }
         node.data.resize(len, 0);
         node.mtime = now;

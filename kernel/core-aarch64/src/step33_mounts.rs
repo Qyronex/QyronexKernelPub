@@ -664,6 +664,27 @@ pub(super) fn read_memfs_for_mremap(mount_id: u32, mem_ino: u64) -> Option<Vec<u
     .flatten()
 }
 
+pub(super) fn current_memfs_rev(mount_id: u32, mem_ino: u64) -> u64 {
+    with_mount_state(|state| state.memfs.file_rev(mount_id, mem_ino))
+        .ok()
+        .flatten()
+        .unwrap_or(1)
+}
+
+pub(super) fn read_memfs_if_changed(
+    mount_id: u32,
+    mem_ino: u64,
+    last_rev: u64,
+) -> Option<(Vec<u8>, u64)> {
+    with_mount_state(|state| {
+        state
+            .memfs
+            .read_file_if_changed(mount_id, mem_ino, last_rev)
+    })
+    .ok()
+    .flatten()
+}
+
 pub(super) fn append_open_proc_sys_fds(process: ObjectId, out: &mut Vec<i32>) {
     let _ = with_mount_state(|state| {
         for (idx, entry) in state.fds.iter().enumerate() {
@@ -1216,7 +1237,7 @@ impl CallerSnapshotData {
         let _ = super::memory::with_live_frame_pool(|pool| {
             free_pages = pool.allocator_mut().free_pages();
         });
-        let total_pages = (kernal_qemu_initrd_aarch64::QEMU_VIRT_RAM_BYTES / 4096).max(free_pages);
+        let total_pages = (super::memory::effective_ram_bytes() / 4096).max(free_pages);
         let uptime_seconds =
             kernal_timer_aarch64::monotonic_now_ns().map_or(1, |ns| (ns / 1_000_000_000).max(1));
 

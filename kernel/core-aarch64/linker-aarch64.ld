@@ -24,13 +24,15 @@ STACK_GUARD_SIZE = 0x1000;
 BOOT_STACK_SIZE = 0x80000;
 /*
  * The final Step-29 Overlay path resolver keeps several PATH_MAX-sized bounded work buffers live in
- * one syscall frame, and Step-31/33 live Debian execve nests 256-VMA address-space builders. Clone/user-thread stacks share this guarded linker arena with firmware
- * secondary stacks, so use one 512 KiB payload stride for the complete protected arena. The separate
- * scheduler smoke-worker stack remains 64 KiB below.
+ * one syscall frame, and Step-31/33 live Debian execve nests 1024-VMA address-space builders.
+ * Clone/user-thread stacks share this guarded linker arena with firmware secondary stacks, so keep
+ * the 512 KiB payload stride for the complete protected arena (`56` clone slots cover `32`
+ * concurrent processes plus multi-threaded GTK/GLib desktop workers while leaving headroom on
+ * 512 MiB targets). The separate scheduler smoke-worker stack remains 64 KiB below.
  */
 SECONDARY_STACK_SIZE = 0x80000;
 SECONDARY_STACK_COUNT = 4;
-CLONE_STACK_COUNT = 32;
+CLONE_STACK_COUNT = 56;
 SECONDARY_STACK_STRIDE = STACK_GUARD_SIZE + SECONDARY_STACK_SIZE;
 SCHEDULER_WORKER_STACK_SIZE = 0x10000;
 /*
@@ -41,7 +43,7 @@ SCHEDULER_WORKER_STACK_SIZE = 0x10000;
  */
 BOOT_PAGE_TABLE_COUNT = 2048;
 BOOT_PAGE_TABLE_BYTES = BOOT_PAGE_TABLE_COUNT * 0x1000;
-KERNEL_HEAP_SIZE = 0x3000000;
+KERNEL_HEAP_SIZE = 0x2400000;
 
 PHDRS
 {

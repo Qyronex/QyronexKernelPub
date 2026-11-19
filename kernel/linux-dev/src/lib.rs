@@ -511,6 +511,12 @@ impl TtySessionState {
         }
     }
 
+    /// Clears the controlling session when the owning session-leader process exits.
+    pub fn clear_controlling_session(&mut self) {
+        self.controlling_session = None;
+        self.foreground_pgid = None;
+    }
+
     /// Implements `TIOCGPGRP` (`0x540f`).
     pub fn get_foreground_pgid(&self, caller_sid: NonZeroU32) -> Result<NonZeroU32, Error> {
         if self.controlling_session != Some(caller_sid) {
@@ -871,6 +877,7 @@ struct PtySlot<const BUF_CAP: usize> {
     slave_open_count: usize,
     slave_ever_opened: bool,
     slave_locked: bool,
+    packet_mode: bool,
     ldisc: LineDiscipline<BUF_CAP>,
     session: TtySessionState,
     master_rx_buf: [u8; BUF_CAP],
@@ -886,6 +893,7 @@ impl<const BUF_CAP: usize> PtySlot<BUF_CAP> {
             slave_open_count: 0,
             slave_ever_opened: false,
             slave_locked: true,
+            packet_mode: false,
             ldisc: LineDiscipline::new(),
             session: TtySessionState::new(),
             master_rx_buf: [0u8; BUF_CAP],
@@ -937,6 +945,7 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
         slot.slave_open_count = 0;
         slot.slave_ever_opened = false;
         slot.slave_locked = true;
+        slot.packet_mode = false;
         slot.ldisc = LineDiscipline::new();
         slot.session = TtySessionState::new();
         slot.master_rx_len = 0;
@@ -958,6 +967,17 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
     pub fn set_slave_lock(&mut self, master: PtyMasterEndpoint, locked: bool) -> Result<(), Error> {
         let slot = self.master_slot_mut(master)?;
         slot.slave_locked = locked;
+        Ok(())
+    }
+
+    /// Enables or disables PTY packet mode (`TIOCPKT`) on a master descriptor.
+    pub fn set_packet_mode(
+        &mut self,
+        master: PtyMasterEndpoint,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        let slot = self.master_slot_mut(master)?;
+        slot.packet_mode = enabled;
         Ok(())
     }
 
@@ -1053,6 +1073,16 @@ impl<const MAX_PTYS: usize, const BUF_CAP: usize> PtyTable<MAX_PTYS, BUF_CAP> {
                 return Err(Error::InputOutput);
             }
             return Err(Error::WouldBlock);
+        }
+        if slot.packet_mode {
+            out[0] = 0;
+            let take = slot.master_rx_len.min(out.len().saturating_sub(1));
+            if take > 0 {
+                out[1..1 + take].copy_from_slice(&slot.master_rx_buf[..take]);
+                slot.master_rx_buf.copy_within(take..slot.master_rx_len, 0);
+                slot.master_rx_len -= take;
+            }
+            return Ok(1 + take);
         }
         let take = slot.master_rx_len.min(out.len());
         out[..take].copy_from_slice(&slot.master_rx_buf[..take]);
@@ -1556,6 +1586,12 @@ mod tests {
             Err(Error::NotControllingTty)
         );
         sess.detach_controlling_session(sid99).unwrap();
+        assert_eq!(sess.controlling_session(), None);
+        assert_eq!(sess.foreground_pgid(), None);
+
+        sess.attach_controlling_session_with_force(sid42, sid42, sid42, false)
+            .unwrap();
+        sess.clear_controlling_session();
         assert_eq!(sess.controlling_session(), None);
         assert_eq!(sess.foreground_pgid(), None);
     }

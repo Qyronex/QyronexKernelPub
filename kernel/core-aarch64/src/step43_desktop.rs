@@ -11,21 +11,22 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kernal_capability::{CapRights, Capability, ObjectId};
 use kernal_linux_abi::{Errno, SyscallRequest, SyscallReturn, linux_signed_int};
 use kernal_linux_desktop::{
-    AddFbRequest, DRM_CAP_ADDFB2_MODIFIERS, DRM_CAP_ASYNC_PAGE_FLIP, DRM_CAP_CRTC_IN_VBLANK_EVENT,
-    DRM_CAP_CURSOR_HEIGHT, DRM_CAP_CURSOR_WIDTH, DRM_CAP_DUMB_BUFFER, DRM_CAP_DUMB_PREFER_SHADOW,
-    DRM_CAP_DUMB_PREFERRED_DEPTH, DRM_CAP_PRIME, DRM_CAP_TIMESTAMP_MONOTONIC,
-    DRM_CAP_VBLANK_HIGH_CRTC, DRM_CLIENT_CAP_ATOMIC, DRM_CLIENT_CAP_STEREO_3D,
-    DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_CONNECTOR_ID, DRM_CRTC_ID, DRM_ENCODER_ID,
-    DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
-    DRM_IOCTL_GET_CAP, DRM_IOCTL_GET_MAGIC, DRM_IOCTL_GET_UNIQUE, DRM_IOCTL_MODE_ADDFB,
-    DRM_IOCTL_MODE_ADDFB2, DRM_IOCTL_MODE_ATOMIC, DRM_IOCTL_MODE_CREATE_DUMB,
-    DRM_IOCTL_MODE_CURSOR, DRM_IOCTL_MODE_CURSOR2, DRM_IOCTL_MODE_DESTROY_DUMB,
-    DRM_IOCTL_MODE_DIRTYFB, DRM_IOCTL_MODE_GETCONNECTOR, DRM_IOCTL_MODE_GETCRTC,
-    DRM_IOCTL_MODE_GETENCODER, DRM_IOCTL_MODE_GETFB, DRM_IOCTL_MODE_GETPLANE,
-    DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPBLOB, DRM_IOCTL_MODE_GETPROPERTY,
-    DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_MAP_DUMB, DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
-    DRM_IOCTL_MODE_PAGE_FLIP, DRM_IOCTL_MODE_RMFB, DRM_IOCTL_MODE_SETCRTC,
-    DRM_IOCTL_MODE_SETPROPERTY, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
+    AddFbRequest, DMA_BUF_IOCTL_SYNC, DRM_CAP_ADDFB2_MODIFIERS, DRM_CAP_ASYNC_PAGE_FLIP,
+    DRM_CAP_CRTC_IN_VBLANK_EVENT, DRM_CAP_CURSOR_HEIGHT, DRM_CAP_CURSOR_WIDTH, DRM_CAP_DUMB_BUFFER,
+    DRM_CAP_DUMB_PREFER_SHADOW, DRM_CAP_DUMB_PREFERRED_DEPTH, DRM_CAP_PRIME,
+    DRM_CAP_TIMESTAMP_MONOTONIC, DRM_CAP_VBLANK_HIGH_CRTC, DRM_CLIENT_CAP_ATOMIC,
+    DRM_CLIENT_CAP_STEREO_3D, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_CONNECTOR_ID, DRM_CRTC_ID,
+    DRM_ENCODER_ID, DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_IOCTL_AUTH_MAGIC,
+    DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_GET_CAP, DRM_IOCTL_GET_MAGIC,
+    DRM_IOCTL_GET_UNIQUE, DRM_IOCTL_MODE_ADDFB, DRM_IOCTL_MODE_ADDFB2, DRM_IOCTL_MODE_ATOMIC,
+    DRM_IOCTL_MODE_CREATE_DUMB, DRM_IOCTL_MODE_CREATE_LEASE, DRM_IOCTL_MODE_CURSOR,
+    DRM_IOCTL_MODE_CURSOR2, DRM_IOCTL_MODE_DESTROY_DUMB, DRM_IOCTL_MODE_DIRTYFB,
+    DRM_IOCTL_MODE_GETCONNECTOR, DRM_IOCTL_MODE_GETCRTC, DRM_IOCTL_MODE_GETENCODER,
+    DRM_IOCTL_MODE_GETFB, DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES,
+    DRM_IOCTL_MODE_GETPROPBLOB, DRM_IOCTL_MODE_GETPROPERTY, DRM_IOCTL_MODE_GETRESOURCES,
+    DRM_IOCTL_MODE_MAP_DUMB, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_MODE_PAGE_FLIP,
+    DRM_IOCTL_MODE_RMFB, DRM_IOCTL_MODE_SETCRTC, DRM_IOCTL_MODE_SETPROPERTY,
+    DRM_IOCTL_PRIME_FD_TO_HANDLE, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
     DRM_IOCTL_SET_MASTER, DRM_IOCTL_VERSION, DRM_IOCTL_WAIT_VBLANK, DRM_MODE_CONNECTED,
     DRM_MODE_CONNECTOR_VIRTUAL, DRM_MODE_ENCODER_VIRTUAL, DRM_PRIMARY_PLANE_ID, DisplayMode,
     DrmModeInfo, EvdevIoctl, FBIOGET_FSCREENINFO, FBIOGET_VSCREENINFO, FBIOPAN_DISPLAY,
@@ -61,12 +62,13 @@ enum DesktopNodeKind {
     InputEvent(u8),
     SndPcm0,
     Seat0Status,
+    PrimeDmabuf(u32),
 }
 
 impl DesktopNodeKind {
     const fn stat_mode(self) -> u32 {
         match self {
-            Self::Seat0Status => S_IFREG_MODE,
+            Self::Seat0Status | Self::PrimeDmabuf(_) => S_IFREG_MODE,
             _ => S_IFCHR_MODE,
         }
     }
@@ -82,6 +84,7 @@ impl DesktopNodeKind {
             }
             Self::SndPcm0 => ((116u64 << 8) | 16, 43_020),
             Self::Seat0Status => (0, 43_030),
+            Self::PrimeDmabuf(handle) => (0, 43_100 + (handle as u64)),
         }
     }
 
@@ -92,6 +95,7 @@ impl DesktopNodeKind {
             Self::Fb0 => b"/dev/fb0",
             Self::SndPcm0 => b"/dev/snd/pcmC0D0p",
             Self::Seat0Status => b"/run/systemd/seats/seat0",
+            Self::PrimeDmabuf(_) => b"/dev/dri/dmabuf",
             Self::InputEvent(idx) => {
                 let prefix = b"/dev/input/event";
                 let mut n = prefix.len().min(out.len());
@@ -119,6 +123,8 @@ struct DesktopFdSlot {
     status_flags: u64,
     session_id: u32,
     session_gen: u32,
+    drm_master: bool,
+    drm_lease: bool,
     offset: usize,
 }
 
@@ -132,6 +138,8 @@ impl DesktopFdSlot {
         status_flags: 0,
         session_id: 0,
         session_gen: 0,
+        drm_master: false,
+        drm_lease: false,
         offset: 0,
     };
 }
@@ -145,6 +153,7 @@ struct DumbBacking {
     width: u32,
     height: u32,
     gpu_attached: bool,
+    gem_refs: u32,
 }
 
 impl DumbBacking {
@@ -156,6 +165,7 @@ impl DumbBacking {
         width: 0,
         height: 0,
         gpu_attached: false,
+        gem_refs: 0,
     };
 }
 
@@ -369,6 +379,9 @@ fn retire_slot_if_unused(state: &mut Step43State, slot_idx: usize) {
     if !entry.live || !entry.owners.is_empty() || entry.alias_refs > 0 {
         return;
     }
+    if entry.drm_master {
+        let _ = state.seat.drm.drop_master(entry.session_id);
+    }
     state.fds[slot_idx] = DesktopFdSlot::EMPTY;
 }
 
@@ -398,11 +411,16 @@ fn match_desktop_path(state: &Step43State, path: &[u8]) -> Option<DesktopNodeKin
 
 fn desktop_stat_meta(state: &Step43State, kind: DesktopNodeKind) -> StatMeta {
     let (rdev, ino) = kind.rdev_and_ino();
-    let size = if kind == DesktopNodeKind::Seat0Status {
-        let mut data = [0u8; 128];
-        state.seat.format_seat0_status(&mut data).unwrap_or(0) as u64
-    } else {
-        0
+    let size = match kind {
+        DesktopNodeKind::Seat0Status => {
+            let mut data = [0u8; 128];
+            state.seat.format_seat0_status(&mut data).unwrap_or(0) as u64
+        }
+        DesktopNodeKind::PrimeDmabuf(handle) => state
+            .find_backing(handle)
+            .map(|b| b.pages.saturating_mul(4096))
+            .unwrap_or(0),
+        _ => 0,
     };
     let ts = super::step42_hardware::rtc_epoch_base_seconds() as i64;
     StatMeta {
@@ -688,6 +706,7 @@ pub(super) fn probe_desktop_fd_readiness(
             }
             DesktopNodeKind::Fb0 | DesktopNodeKind::SndPcm0 => POLLOUT,
             DesktopNodeKind::Seat0Status => POLLIN,
+            DesktopNodeKind::PrimeDmabuf(_) => POLLIN | POLLOUT,
         };
         Ok(mask)
     })
@@ -861,6 +880,8 @@ fn open_desktop_slot(
         status_flags: flags & O_NONBLOCK_U64,
         session_id: state.default_session_id,
         session_gen: state.default_session_gen,
+        drm_master: false,
+        drm_lease: false,
         offset: 0,
     };
     Ok(i64::from(DESKTOP_FD_BASE + (idx as i32)))
@@ -903,6 +924,15 @@ pub(super) fn try_prepare_desktop_mmap(
                 let h = state.seat.drm.mode.height;
                 let existing = state.fb0_dumb_handle.or(state.seat.drm.active_fb_handle);
                 Ok(Err((session_id, w, h, existing)))
+            }
+            DesktopNodeKind::PrimeDmabuf(handle) => {
+                let Some(dumb) = state.find_backing(handle) else {
+                    return Err(Errno::ENOENT);
+                };
+                if offset != 0 || length == 0 || length > dumb.pages.saturating_mul(4096) {
+                    return Err(Errno::EINVAL);
+                }
+                Ok(Ok(dumb.handle))
             }
             _ => Err(Errno::ENODEV),
         }
@@ -1014,6 +1044,7 @@ fn allocate_and_register_dumb(
             width,
             height,
             gpu_attached,
+            gem_refs: 1,
         };
         Ok(())
     })
@@ -1327,7 +1358,7 @@ fn handle_ioctl(raw_fd: u64, req: u64, arg: u64) -> Result<Result<i64, Errno>, (
     };
 
     match slot.kind {
-        DesktopNodeKind::DrmCard0 => handle_drm_ioctl(slot, req, arg),
+        DesktopNodeKind::DrmCard0 => handle_drm_ioctl(process, slot, req, arg),
         DesktopNodeKind::Fb0 => handle_fb_ioctl(slot, req, arg),
         DesktopNodeKind::InputEvent(idx) => {
             with_step43_state(|state| handle_evdev_ioctl(state, idx, slot, req, arg))
@@ -1347,12 +1378,21 @@ fn handle_ioctl(raw_fd: u64, req: u64, arg: u64) -> Result<Result<i64, Errno>, (
             }
             _ => Err(Errno::ENOTTY),
         }),
+        DesktopNodeKind::PrimeDmabuf(_) => match req {
+            DMA_BUF_IOCTL_SYNC => Ok(Ok(0)),
+            _ => Ok(Err(Errno::ENOTTY)),
+        },
         DesktopNodeKind::None => Ok(Err(Errno::EBADF)),
         _ => Ok(Err(Errno::ENOTTY)),
     }
 }
 
-fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {
+fn handle_drm_ioctl(
+    process: ObjectId,
+    slot: DesktopFdSlot,
+    req: u64,
+    arg: u64,
+) -> Result<Result<i64, Errno>, ()> {
     if req == DRM_IOCTL_MODE_CREATE_DUMB {
         let mut raw = [0u8; 32];
         if let Err(e) = copy_from_user(&mut raw, arg) {
@@ -1379,7 +1419,56 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
             return Ok(Err(e));
         }
         let handle = u32::from_le_bytes(raw[0..4].try_into().unwrap_or([0; 4]));
+        let still_referenced = with_step43_state(|state| {
+            if let Some(b) = state.find_backing_mut(handle)
+                && b.gem_refs > 1
+            {
+                b.gem_refs -= 1;
+                return true;
+            }
+            false
+        })?;
+        if still_referenced {
+            return Ok(Ok(0));
+        }
         return Ok(destroy_dumb_with_backing(slot.session_id, handle).map(|()| 0));
+    }
+
+    if req == DRM_IOCTL_PRIME_FD_TO_HANDLE {
+        let mut raw = [0u8; 12];
+        if let Err(e) = copy_from_user(&mut raw, arg) {
+            return Ok(Err(e));
+        }
+        let prime_fd = i32::from_le_bytes(raw[8..12].try_into().unwrap_or([u8::MAX; 4]));
+        if prime_fd < 0 {
+            return Ok(Err(Errno::EBADF));
+        }
+        let Ok((p_idx, p_alias)) = resolve_slot_idx(process, prime_fd as u64) else {
+            return Ok(Err(Errno::EINVAL));
+        };
+        let imported = with_step43_state(|state| {
+            let Some(p_slot) = resolve_slot_mut(state, process, p_idx, p_alias) else {
+                return Err(Errno::EBADF);
+            };
+            let DesktopNodeKind::PrimeDmabuf(handle) = p_slot.kind else {
+                return Err(Errno::EINVAL);
+            };
+            if state.seat.drm.lookup_dumb(handle).is_none() {
+                return Err(Errno::ENOENT);
+            }
+            let Some(b) = state.find_backing_mut(handle) else {
+                return Err(Errno::ENOENT);
+            };
+            b.gem_refs = b.gem_refs.saturating_add(1);
+            Ok(handle)
+        })?;
+        return Ok(match imported {
+            Ok(handle) => {
+                raw[0..4].copy_from_slice(&handle.to_le_bytes());
+                copy_to_user(arg, &raw).map(|()| 0)
+            }
+            Err(e) => Err(e),
+        });
     }
 
     let mut pending_gpu_present: Option<(u32, u32, u32, bool)> = None;
@@ -1408,17 +1497,48 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
             }
         }
         DRM_IOCTL_SET_MASTER => {
+            if slot.drm_lease {
+                return Err(Errno::EACCES);
+            }
+            if state
+                .fds
+                .iter()
+                .any(|s| s.live && s.generation != slot.generation && s.drm_master)
+            {
+                return Err(Errno::EACCES);
+            }
             let active_gen = state.seat.seat_generation();
-            state.seat.drm.set_master(
+            let r = state.seat.drm.set_master(
                 DESKTOP_CTRL_CAP,
                 slot.session_id,
                 slot.session_gen,
                 active_gen,
-            )?;
+            );
+            if r.is_ok()
+                && let Some(s) = state
+                    .fds
+                    .iter_mut()
+                    .find(|s| s.live && s.generation == slot.generation)
+            {
+                s.drm_master = true;
+            }
+            r?;
             Ok(0)
         }
         DRM_IOCTL_DROP_MASTER => {
-            state.seat.drm.drop_master(slot.session_id)?;
+            if slot.drm_lease || !slot.drm_master {
+                return Err(Errno::EINVAL);
+            }
+            let r = state.seat.drm.drop_master(slot.session_id);
+            if r.is_ok()
+                && let Some(s) = state
+                    .fds
+                    .iter_mut()
+                    .find(|s| s.live && s.generation == slot.generation)
+            {
+                s.drm_master = false;
+            }
+            r?;
             Ok(0)
         }
         DRM_IOCTL_MODE_GETRESOURCES => handle_drm_get_resources(state, arg),
@@ -1444,7 +1564,7 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
             } else {
                 None
             };
-            if let Some(fb) = state.seat.drm.set_crtc_by_fb_id(SetCrtcRequest {
+            match state.seat.drm.set_crtc_by_fb_id(SetCrtcRequest {
                 session_id: slot.session_id,
                 seat_generation: slot.session_gen,
                 crtc_id,
@@ -1452,15 +1572,19 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
                 x,
                 y,
                 mode_override,
-            })? {
-                pending_gpu_present = Some((
-                    fb.handle,
-                    state.seat.drm.mode.width,
-                    state.seat.drm.mode.height,
-                    true,
-                ));
+            }) {
+                Ok(Some(fb)) => {
+                    pending_gpu_present = Some((
+                        fb.handle,
+                        state.seat.drm.mode.width,
+                        state.seat.drm.mode.height,
+                        true,
+                    ));
+                    Ok(0)
+                }
+                Ok(None) => Ok(0),
+                Err(e) => Err(e),
             }
-            Ok(0)
         }
         DRM_IOCTL_MODE_ADDFB => {
             let mut raw = [0u8; 28];
@@ -1601,7 +1725,7 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
                 return Err(Errno::ENOENT);
             }
             let fmt_ptr = u64::from_le_bytes(raw[24..32].try_into().unwrap_or([0; 8]));
-            let fmt_cnt = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
+            let fmt_cnt = u32::from_le_bytes(raw[20..24].try_into().unwrap_or([0; 4]));
             if fmt_ptr != 0 && fmt_cnt >= 2 {
                 copy_to_user(fmt_ptr, &DRM_FORMAT_XRGB8888.to_le_bytes())?;
                 copy_to_user(
@@ -1612,7 +1736,8 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
             raw[4..8].copy_from_slice(&DRM_CRTC_ID.to_le_bytes());
             raw[8..12].copy_from_slice(&state.seat.drm.active_fb_id.unwrap_or(0).to_le_bytes());
             raw[12..16].copy_from_slice(&1u32.to_le_bytes()); // possible_crtcs
-            raw[16..20].copy_from_slice(&2u32.to_le_bytes());
+            raw[16..20].copy_from_slice(&0u32.to_le_bytes()); // gamma_size
+            raw[20..24].copy_from_slice(&2u32.to_le_bytes()); // count_format_types
             copy_to_user(arg, &raw)?;
             Ok(0)
         }
@@ -1633,6 +1758,16 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
                     }
                 }
                 raw[16..20].copy_from_slice(&1u32.to_le_bytes());
+            } else if obj_id == DRM_CONNECTOR_ID {
+                if count_in >= 1 {
+                    if props_ptr != 0 {
+                        copy_to_user(props_ptr, &2u32.to_le_bytes())?;
+                    }
+                    if vals_ptr != 0 {
+                        copy_to_user(vals_ptr, &0u64.to_le_bytes())?;
+                    }
+                }
+                raw[16..20].copy_from_slice(&1u32.to_le_bytes());
             } else {
                 raw[16..20].copy_from_slice(&0u32.to_le_bytes());
             }
@@ -1645,17 +1780,27 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
             let values_ptr = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
             let enum_blob_ptr = u64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
             let prop_id = u32::from_le_bytes(raw[16..20].try_into().unwrap_or([0; 4]));
-            if prop_id != 1 {
-                return Err(Errno::ENOENT);
-            }
             let count_values = u32::from_le_bytes(raw[56..60].try_into().unwrap_or([0; 4]));
             let count_enums = u32::from_le_bytes(raw[60..64].try_into().unwrap_or([0; 4]));
-            // flags = DRM_MODE_PROP_ENUM (1 << 3) | DRM_MODE_PROP_IMMUTABLE (1 << 2) = 0x0c
-            raw[20..24].copy_from_slice(&0x0cu32.to_le_bytes());
+            let (flags, prop_name, enums): (u32, &[u8], &[(u64, &[u8])]) = match prop_id {
+                // DRM_MODE_PROP_ENUM (1 << 3) | DRM_MODE_PROP_IMMUTABLE (1 << 2) = 0x0c
+                1 => (
+                    0x0c,
+                    b"type",
+                    &[(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")],
+                ),
+                // DRM_MODE_PROP_ENUM (1 << 3) = 0x08
+                2 => (
+                    0x08,
+                    b"DPMS",
+                    &[(0, b"On"), (1, b"Standby"), (2, b"Suspend"), (3, b"Off")],
+                ),
+                _ => return Err(Errno::ENOENT),
+            };
+            raw[20..24].copy_from_slice(&flags.to_le_bytes());
             raw[24..56].fill(0);
-            raw[24..28].copy_from_slice(b"type");
-            let enums: [(u64, &[u8]); 3] = [(0, b"Overlay"), (1, b"Primary"), (2, b"Cursor")];
-            if values_ptr != 0 && count_values >= 3 {
+            raw[24..24 + prop_name.len()].copy_from_slice(prop_name);
+            if values_ptr != 0 && count_values >= (enums.len() as u32) {
                 for (i, (val, _)) in enums.iter().enumerate() {
                     copy_to_user(
                         values_ptr.saturating_add((i * 8) as u64),
@@ -1663,7 +1808,7 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
                     )?;
                 }
             }
-            if enum_blob_ptr != 0 && count_enums >= 3 {
+            if enum_blob_ptr != 0 && count_enums >= (enums.len() as u32) {
                 for (i, (val, name)) in enums.iter().enumerate() {
                     let mut entry = [0u8; 40];
                     entry[0..8].copy_from_slice(&val.to_le_bytes());
@@ -1671,12 +1816,23 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
                     copy_to_user(enum_blob_ptr.saturating_add((i * 40) as u64), &entry)?;
                 }
             }
-            raw[56..60].copy_from_slice(&3u32.to_le_bytes());
-            raw[60..64].copy_from_slice(&3u32.to_le_bytes());
+            let n = enums.len() as u32;
+            raw[56..60].copy_from_slice(&n.to_le_bytes());
+            raw[60..64].copy_from_slice(&n.to_le_bytes());
             copy_to_user(arg, &raw)?;
             Ok(0)
         }
-        DRM_IOCTL_MODE_SETPROPERTY | DRM_IOCTL_MODE_GETPROPBLOB => Err(Errno::ENOENT),
+        DRM_IOCTL_MODE_SETPROPERTY => {
+            let mut raw = [0u8; 16];
+            copy_from_user(&mut raw, arg)?;
+            let prop_id = u32::from_le_bytes(raw[8..12].try_into().unwrap_or([0; 4]));
+            let conn_id = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
+            if conn_id != DRM_CONNECTOR_ID || prop_id != 2 {
+                return Err(Errno::ENOENT);
+            }
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_GETPROPBLOB => Err(Errno::ENOENT),
         DRM_IOCTL_MODE_CURSOR | DRM_IOCTL_MODE_CURSOR2 => Ok(0),
         DRM_IOCTL_WAIT_VBLANK => {
             let mut raw = [0u8; 24];
@@ -1692,7 +1848,66 @@ fn handle_drm_ioctl(slot: DesktopFdSlot, req: u64, arg: u64) -> Result<Result<i6
             copy_to_user(arg, &raw)?;
             Ok(0)
         }
-        DRM_IOCTL_PRIME_HANDLE_TO_FD | DRM_IOCTL_MODE_ATOMIC => Err(Errno::EOPNOTSUPP),
+        DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+            let mut raw = [0u8; 12];
+            copy_from_user(&mut raw, arg)?;
+            let handle = u32::from_le_bytes(raw[0..4].try_into().unwrap_or([0; 4]));
+            let flags = u32::from_le_bytes(raw[4..8].try_into().unwrap_or([0; 4]));
+            let Some(_) = state.seat.drm.lookup_dumb(handle) else {
+                return Err(Errno::ENOENT);
+            };
+            if state.find_backing(handle).is_none() {
+                return Err(Errno::ENOENT);
+            }
+            let fd = open_desktop_slot(
+                state,
+                process,
+                DesktopNodeKind::PrimeDmabuf(handle),
+                u64::from(flags) & O_CLOEXEC_U64,
+            )?;
+            raw[8..12].copy_from_slice(&(fd as i32).to_le_bytes());
+            copy_to_user(arg, &raw)?;
+            Ok(0)
+        }
+        DRM_IOCTL_AUTH_MAGIC => {
+            let mut raw = [0u8; 4];
+            copy_from_user(&mut raw, arg)?;
+            let magic = u32::from_le_bytes(raw);
+            if slot.drm_lease
+                || !slot.drm_master
+                || state.seat.drm.active_master_session != Some(slot.session_id)
+            {
+                return Err(Errno::EACCES);
+            }
+            if magic == 0 {
+                return Err(Errno::EINVAL);
+            }
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_CREATE_LEASE => {
+            if slot.drm_lease
+                || !slot.drm_master
+                || state.seat.drm.active_master_session != Some(slot.session_id)
+            {
+                return Err(Errno::EACCES);
+            }
+            let mut raw = [0u8; 24];
+            copy_from_user(&mut raw, arg)?;
+            let flags = u32::from_le_bytes(raw[12..16].try_into().unwrap_or([0; 4]));
+            let fd = open_desktop_slot(
+                state,
+                process,
+                DesktopNodeKind::DrmCard0,
+                u64::from(flags) & O_CLOEXEC_U64,
+            )?;
+            let lease_slot_idx = (fd - i64::from(DESKTOP_FD_BASE)) as usize;
+            state.fds[lease_slot_idx].drm_lease = true;
+            raw[16..20].copy_from_slice(&1u32.to_le_bytes());
+            raw[20..24].copy_from_slice(&(fd as u32).to_le_bytes());
+            copy_to_user(arg, &raw)?;
+            Ok(0)
+        }
+        DRM_IOCTL_MODE_ATOMIC => Err(Errno::EOPNOTSUPP),
         _ => Err(Errno::ENOTTY),
     })?;
 
@@ -1745,7 +1960,7 @@ fn handle_drm_get_cap(arg: u64) -> Result<i64, Errno> {
         DRM_CAP_VBLANK_HIGH_CRTC => 1,
         DRM_CAP_DUMB_PREFERRED_DEPTH => 24,
         DRM_CAP_DUMB_PREFER_SHADOW => 0,
-        DRM_CAP_PRIME => 0,
+        DRM_CAP_PRIME => 3,
         DRM_CAP_TIMESTAMP_MONOTONIC => 1,
         DRM_CAP_ASYNC_PAGE_FLIP => 1,
         DRM_CAP_CURSOR_WIDTH | DRM_CAP_CURSOR_HEIGHT => 64,
@@ -1819,10 +2034,21 @@ fn handle_drm_get_connector(state: &Step43State, arg: u64) -> Result<i64, Errno>
     }
     let encoders_ptr = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
     let modes_ptr = u64::from_le_bytes(raw[8..16].try_into().unwrap_or([0; 8]));
+    let props_ptr = u64::from_le_bytes(raw[16..24].try_into().unwrap_or([0; 8]));
+    let prop_vals_ptr = u64::from_le_bytes(raw[24..32].try_into().unwrap_or([0; 8]));
     let count_modes = u32::from_le_bytes(raw[32..36].try_into().unwrap_or([0; 4]));
+    let count_props = u32::from_le_bytes(raw[36..40].try_into().unwrap_or([0; 4]));
     let count_encoders = u32::from_le_bytes(raw[40..44].try_into().unwrap_or([0; 4]));
 
     let _ = write_u32_array_if_room(encoders_ptr, count_encoders, &[DRM_ENCODER_ID])?;
+    if count_props >= 1 {
+        if props_ptr != 0 {
+            copy_to_user(props_ptr, &2u32.to_le_bytes())?;
+        }
+        if prop_vals_ptr != 0 {
+            copy_to_user(prop_vals_ptr, &0u64.to_le_bytes())?;
+        }
+    }
     if modes_ptr != 0 && count_modes >= 1 {
         let mode = DrmModeInfo::from_display_mode(state.seat.drm.mode);
         copy_to_user(modes_ptr, &mode.to_bytes())?;
@@ -1831,7 +2057,7 @@ fn handle_drm_get_connector(state: &Step43State, arg: u64) -> Result<i64, Errno>
     let mm_h = state.seat.drm.mode.height.saturating_mul(254) / 960;
 
     raw[32..36].copy_from_slice(&1u32.to_le_bytes()); // count_modes
-    raw[36..40].copy_from_slice(&0u32.to_le_bytes()); // count_props
+    raw[36..40].copy_from_slice(&1u32.to_le_bytes()); // count_props (DPMS)
     raw[40..44].copy_from_slice(&1u32.to_le_bytes()); // count_encoders
     raw[44..48].copy_from_slice(&DRM_ENCODER_ID.to_le_bytes());
     raw[52..56].copy_from_slice(&DRM_MODE_CONNECTOR_VIRTUAL.to_le_bytes());
@@ -2062,6 +2288,17 @@ fn handle_lseek(raw_fd: u64, offset: i64, whence: i32) -> Result<Result<i64, Err
                 let total = (u64::from(state.seat.drm.mode.width)
                     * u64::from(state.seat.drm.mode.height)
                     * 4) as usize;
+                let next = seek_bounded(slot_copy.offset, total, offset, whence)?;
+                if let Some(s) = resolve_slot_mut(state, process, slot_idx, alias_gen) {
+                    s.offset = next;
+                }
+                Ok(next as i64)
+            }
+            DesktopNodeKind::PrimeDmabuf(handle) => {
+                let total = state
+                    .find_backing(handle)
+                    .map(|b| (b.pages.saturating_mul(4096)) as usize)
+                    .ok_or(Errno::EBADF)?;
                 let next = seek_bounded(slot_copy.offset, total, offset, whence)?;
                 if let Some(s) = resolve_slot_mut(state, process, slot_idx, alias_gen) {
                     s.offset = next;

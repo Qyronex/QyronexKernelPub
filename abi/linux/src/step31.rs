@@ -36,8 +36,10 @@ pub const TIOCGPGRP: u32 = 0x540f;
 pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
 pub const TIOCSWINSZ: u32 = 0x5414;
+pub const TIOCPKT: u32 = 0x5420;
 pub const TIOCGPTN: u32 = 0x8004_5430;
 pub const TIOCSPTLCK: u32 = 0x4004_5431;
+pub const TIOCGPTPEER: u32 = 0x5441;
 
 /// Linux `struct winsize` byte size (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`).
 pub const WINSIZE_BYTES: usize = 8;
@@ -325,8 +327,8 @@ pub const fn default_rlimit64(resource: RlimitResource) -> Rlimit64 {
     match resource {
         RlimitResource::Stack => Rlimit64::new(8 * 1024 * 1024, RLIM64_INFINITY),
         RlimitResource::Core => Rlimit64::new(0, RLIM64_INFINITY),
-        RlimitResource::Nproc => Rlimit64::new(4, 4),
-        RlimitResource::Nofile => Rlimit64::new(32, 32),
+        RlimitResource::Nproc => Rlimit64::new(64, 64),
+        RlimitResource::Nofile => Rlimit64::new(1024, 4096),
         RlimitResource::Memlock => Rlimit64::new(64 * 1024, 64 * 1024),
         RlimitResource::Sigpending => Rlimit64::new(64, 64),
         RlimitResource::Msgqueue => Rlimit64::new(819_200, 819_200),

@@ -28,10 +28,10 @@ use super::step_fd_util::{
     rollback_subsystem_fd_in_process,
 };
 
-/// Dedicated file-descriptor base for Step-34 sockets (`736..800`), partitioned cleanly above
-/// `EVENT_FD_BASE` (`672..736`) and `PROC_SYS_FD_BASE` (`416..672`).
-pub(super) const SOCK_FD_BASE: i32 = 736;
-const MAX_SOCKETS: usize = 64;
+/// Dedicated file-descriptor base for Step-34 sockets (`800..992`), partitioned cleanly above
+/// `EVENT_FD_BASE` (`672..800`) and `PROC_SYS_FD_BASE` (`416..672`).
+pub(super) const SOCK_FD_BASE: i32 = 800;
+const MAX_SOCKETS: usize = 192;
 const SOCK_BUF_CAP: usize = 4096;
 const MAX_INFLIGHT_SCM_RIGHTS: usize = 64;
 const MAX_IOV_BYTES: usize = 65_536;

@@ -46,9 +46,14 @@ fn exec_staging_restores_the_original_binding_before_success_or_recoverable_fail
     .min()
     .expect("exec staging must explicitly restore/prove the original binding current");
 
-    let success = stage
-        .find("Ok(StagedExecImage")
-        .expect("missing successful staged-image publication");
+    let success = [
+        stage.find("Ok(StagedExecImage"),
+        stage.find("Ok(alloc::boxed::Box::new(StagedExecImage"),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .expect("missing successful staged-image publication");
     let discard = stage
         .find("discard_exec_staging_anonymous_user_frames")
         .expect("failed fresh exec staging must drain through the canonical discard owner");

@@ -791,7 +791,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
     #[cfg(feature = "step31-debian-shell")]
     step32_dev::poll_console_rx_and_deliver_signals();
 
-    match step32_dev::try_handle_blocking_read(request, frame) {
+    match step32_dev::try_handle_blocking_io(request, frame) {
         Ok(Some(result)) => {
             frame.x[0] = result.as_u64_bits();
             return true;
@@ -799,7 +799,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         Ok(None) => {}
         Err(()) => {
             if let Some(serial) = step15_svc_serial() {
-                serial.write_str("KERNAL/ARM64: Step 32 /dev blocking read failed nr=");
+                serial.write_str("KERNAL/ARM64: Step 32 /dev blocking I/O failed nr=");
                 serial.write_u64(request.number);
                 serial.write_str("\n");
             }
@@ -1154,6 +1154,7 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         let outcome = if request.args[2] == 0x1
             && request.args[1] != 0
             && request.args[1] <= (runtime::STEP15_RUNTIME_VM_TX_PAGES as u64) * 4096
+            && !live_vm::has_prot_none_overlap(request.args[0], request.args[1])
         {
             step28_mprotect::handle(request.args[0], request.args[1], request.args[2])
         } else {

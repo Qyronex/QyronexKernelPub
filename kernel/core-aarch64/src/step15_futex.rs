@@ -19,12 +19,12 @@ pub(super) mod pipe_blocking;
 pub(super) mod pipe_wait;
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-pub const STEP15_FUTEX_BUCKETS: usize = 32;
+pub const STEP15_FUTEX_BUCKETS: usize = 64;
 #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 pub const STEP15_FUTEX_BUCKETS: usize = 16;
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-pub const STEP15_FUTEX_WAITERS: usize = 32;
+pub const STEP15_FUTEX_WAITERS: usize = 64;
 #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
 pub const STEP15_FUTEX_WAITERS: usize = 16;
 

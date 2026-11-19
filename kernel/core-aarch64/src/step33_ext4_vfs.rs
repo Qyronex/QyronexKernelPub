@@ -1342,7 +1342,7 @@ pub(super) fn try_select_ext4_exec(
 
 pub(super) fn read_ext4_file_all(mount_id: u32, ino: u32, size: u64) -> Result<Vec<u8>, Errno> {
     let total = usize::try_from(size).map_err(|_| Errno::ENOMEM)?;
-    if total > 16 * 1024 * 1024 {
+    if total > 48 * 1024 * 1024 {
         return Err(Errno::ENOMEM);
     }
     let mut out = vec![0u8; total];

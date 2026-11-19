@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
+#[cfg(test)]
+extern crate alloc;
+
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
@@ -24,19 +27,20 @@ use kernal_scheduler::ThreadId;
 use kernal_scheduler_smp::GlobalThreadId;
 
 pub const STEP15_RUNTIME_CAPS: usize = 32;
-pub const STEP15_RUNTIME_OBJECTS: usize = 128;
-pub const STEP15_RUNTIME_VMAS: usize = 256;
-pub const STEP15_RUNTIME_THREADS: usize = 32;
-/// Fixed process capacity for interactive Debian workloads and child pipelines. Twenty-four concurrent
-/// Process generations fit cleanly within the 128-object budget.
-pub const STEP15_RUNTIME_PROCESSES: usize = 24;
+pub const STEP15_RUNTIME_OBJECTS: usize = 192;
+pub const STEP15_RUNTIME_VMAS: usize = 1024;
+pub const STEP15_RUNTIME_THREADS: usize = 64;
+/// Fixed process capacity for interactive Debian workloads and child pipelines. Thirty-two
+/// concurrent Process generations fit cleanly within the 192-object budget.
+pub const STEP15_RUNTIME_PROCESSES: usize = 32;
 const STEP15_RUNTIME_ADDITIONAL_PROCESSES: usize = STEP15_RUNTIME_PROCESSES - 1;
 pub const STEP15_RUNTIME_GROUPS: usize = STEP15_RUNTIME_PROCESSES;
 pub const STEP15_RUNTIME_SIGNAL_PENDING: usize = 64;
 pub const STEP15_RUNTIME_VM_BREAKS: usize = STEP15_RUNTIME_PROCESSES;
 pub const STEP15_RUNTIME_VM_TX_PAGES: usize = STEP15_RUNTIME_VMAS;
-/// Transaction page cap for Step-31 dynamic `mmap(2)` / `mprotect(2)` (32 MiB per call).
-pub const STEP31_DYNAMIC_MMAP_TX_PAGES: usize = 8192;
+/// Transaction page cap for Step-31 dynamic `mmap(2)` / `mprotect(2)` (48 MiB per call,
+/// admitting large `.so` payloads like `libicudata` while failing-fast on 64 MiB arena probes).
+pub const STEP31_DYNAMIC_MMAP_TX_PAGES: usize = 12288;
 
 const EMPTY: u8 = 0;
 const INSTALLING: u8 = 1;
@@ -335,9 +339,9 @@ impl Step15LinuxRuntime {
     }
 
     #[cfg(test)]
-    fn create<B: Backend>(backend: &mut B) -> Result<Self, Error> {
-        let mut storage = MaybeUninit::<Self>::uninit();
-        // SAFETY: `storage` is properly aligned writable uninitialized memory for `Self`.
+    fn create<B: Backend>(backend: &mut B) -> Result<alloc::boxed::Box<Self>, Error> {
+        let mut storage = alloc::boxed::Box::<Self>::new_uninit();
+        // SAFETY: `storage` is properly aligned writable uninitialized heap memory for `Self`.
         unsafe {
             Self::initialize_in_place(storage.as_mut_ptr(), backend)?;
             Ok(storage.assume_init())
@@ -561,6 +565,7 @@ impl Step15LinuxRuntime {
                 objects,
                 bindings,
                 identities,
+                signals,
                 ..
             } = self;
             let selected = if process.id() == process_id {
@@ -581,6 +586,7 @@ impl Step15LinuxRuntime {
             identities
                 .bound_tid_for_scheduler_thread(&*selected, scheduler_thread)
                 .map_err(|_| Error::InvalidState)?;
+            let _ = signals.retire_thread(&*identities, &*selected, scheduler_thread);
             finalize(ticket, exits, selected, objects, bindings, identities).map_err(Error::Exit)?
         };
         self.pending_exits[pending_slot] = None;
@@ -2396,6 +2402,18 @@ impl RuntimeCell {
         }
     }
 
+    #[cfg(test)]
+    fn create_boxed() -> alloc::boxed::Box<Self> {
+        let mut storage = alloc::boxed::Box::<Self>::new_uninit();
+        let ptr = storage.as_mut_ptr();
+        // SAFETY: `ptr` points to writable uninitialized storage; `value` remains uninitialized until
+        // `initialize` populates it in place without staging `RuntimeCell` on a test stack.
+        unsafe {
+            core::ptr::addr_of_mut!((*ptr).state).write(AtomicU8::new(EMPTY));
+            storage.assume_init()
+        }
+    }
+
     fn initialize<B: Backend>(&self, backend: &mut B) -> Result<(), Error> {
         match self
             .state
@@ -3507,7 +3525,7 @@ mod tests {
                 additional_processes,
                 identities,
                 ..
-            } = &mut runtime;
+            } = &mut *runtime;
             let child_process = additional_processes
                 .iter()
                 .flatten()
@@ -3615,7 +3633,7 @@ mod tests {
 
     #[test]
     fn cell_initializes_once_and_serializes_runtime_borrows() {
-        let cell = RuntimeCell::new();
+        let cell = RuntimeCell::create_boxed();
         let mut backend = TestBackend::new(4);
         cell.initialize(&mut backend).unwrap();
         assert_eq!(
@@ -3634,7 +3652,7 @@ mod tests {
 
     #[test]
     fn failed_root_construction_poison_prevents_retry() {
-        let cell = RuntimeCell::new();
+        let cell = RuntimeCell::create_boxed();
         let mut empty = TestBackend::new(0);
         assert!(matches!(
             cell.initialize(&mut empty),

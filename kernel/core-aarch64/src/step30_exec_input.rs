@@ -474,7 +474,6 @@ fn stage_exec_from_source(
                         unsafe {
                             super::live_vm::stage_exec_image(current, image, interpreter, start)
                         }
-                        .map(alloc::boxed::Box::new)
                     })
                 },
             )

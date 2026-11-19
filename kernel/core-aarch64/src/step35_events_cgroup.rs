@@ -26,10 +26,10 @@ use super::step_fd_util::{
     lookup_aliased_subsystem, lookup_aliased_subsystem_current,
 };
 
-/// Dedicated file-descriptor base for Step-35 event/memfd/pidfd descriptors (`672..736`),
+/// Dedicated file-descriptor base for Step-35 event/memfd/pidfd descriptors (`672..800`),
 /// partitioned cleanly above `PROC_SYS_FD_BASE` (`416..672`).
 pub(super) const EVENT_FD_BASE: i32 = 672;
-const MAX_EVENT_FDS: usize = 64;
+const MAX_EVENT_FDS: usize = 128;
 const MEMFD_CAP: usize = 16 * 1024 * 1024;
 const MAX_EVENT_IO_CHUNK: usize = 65536;
 const MAX_CGROUPS: usize = 64;

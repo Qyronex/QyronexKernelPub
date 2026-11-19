@@ -6,8 +6,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use kernal_capability::{CapRights, Capability, ObjectId};
 use kernal_linux_abi::{
     Errno, KERNEL_TERMIOS_BYTES, POLLIN, POLLOUT, SyscallRequest, SyscallReturn, TCGETS, TCSETS,
-    TCSETSF, TCSETSW, TIOCGPGRP, TIOCGPTN, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK,
-    TIOCSWINSZ, WINSIZE_BYTES, WinSize, linux_signed_int, linux_unsigned_int,
+    TCSETSF, TCSETSW, TIOCGPGRP, TIOCGPTN, TIOCGPTPEER, TIOCGWINSZ, TIOCPKT, TIOCSCTTY, TIOCSPGRP,
+    TIOCSPTLCK, TIOCSWINSZ, WINSIZE_BYTES, WinSize, linux_signed_int, linux_unsigned_int,
 };
 use kernal_linux_dev::{
     DeviceNodeKind, EntropyReadiness, JobControlCheck, LineDiscipline, PtyMasterEndpoint,
@@ -15,9 +15,9 @@ use kernal_linux_dev::{
     read_pseudo_device, write_pseudo_device,
 };
 
-/// Dedicated file-descriptor base for Step-32 `/dev` pseudo-device descriptors (`64..96`),
-/// partitioned cleanly above `STEP29_RUNTIME_FDS` (`0..32`).
-pub(super) const DEV_FD_BASE: i32 = 64;
+/// Dedicated file-descriptor base for Step-32 `/dev` pseudo-device descriptors (`992..1024`),
+/// partitioned cleanly above `SOCK_FD_BASE` (`800..992`) and below `MAX_SELECT_NFDS` (`1024`).
+pub(super) const DEV_FD_BASE: i32 = 992;
 const MAX_DEV_FDS: usize = 32;
 const MAX_PTYS: usize = 16;
 const PTY_RING_BYTES: usize = 2048;
@@ -115,8 +115,10 @@ struct Step32DevState {
     ptys: PtyTable<MAX_PTYS, PTY_RING_BYTES>,
     console_ldisc: LineDiscipline<PTY_RING_BYTES>,
     console_session: TtySessionState,
+    console_owner_process: Option<ObjectId>,
     vt_ldisc: LineDiscipline<PTY_RING_BYTES>,
     vt_session: TtySessionState,
+    vt_owner_process: Option<ObjectId>,
 }
 
 impl Step32DevState {
@@ -130,8 +132,10 @@ impl Step32DevState {
             console_session: TtySessionState::with_session(NonZeroU32::MIN, NonZeroU32::MIN),
             #[cfg(not(feature = "step31-debian-shell"))]
             console_session: TtySessionState::new(),
+            console_owner_process: None,
             vt_ldisc: LineDiscipline::new(),
             vt_session: TtySessionState::new(),
+            vt_owner_process: None,
         }
     }
 }
@@ -429,6 +433,14 @@ pub(super) fn on_process_exec(process: ObjectId) {
 
 pub(super) fn on_process_exit(process: ObjectId) {
     let _ = with_dev_state(|state| {
+        if state.console_owner_process == Some(process) {
+            state.console_session.clear_controlling_session();
+            state.console_owner_process = None;
+        }
+        if state.vt_owner_process == Some(process) {
+            state.vt_session.clear_controlling_session();
+            state.vt_owner_process = None;
+        }
         for idx in 0..MAX_DEV_FDS {
             if state.fds[idx].live {
                 let _ = state.fds[idx].owners.close_owner(process);
@@ -611,6 +623,9 @@ pub(super) fn poll_console_rx_and_deliver_signals() {
 pub(super) fn detach_pid1_console_session_on_init_exec() {
     let _ = with_dev_state(|state| {
         state.console_session.clear_pid1_controlling_session();
+        if state.console_session.controlling_session().is_none() {
+            state.console_owner_process = None;
+        }
     });
 }
 
@@ -687,14 +702,14 @@ pub(super) fn read_console_into_user(
 #[cfg(feature = "step31-debian-shell")]
 pub(super) fn handle_console_ioctl(raw_request: u64, arg: u64) -> Result<SyscallReturn, ()> {
     let cmd = linux_unsigned_int(raw_request);
-    let (_proc, caller_pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
+    let (caller_process, caller_pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
     let sigttou_ignored_or_blocked = if cmd == TIOCSPGRP {
         super::step30_runtime::current_signal_is_ignored_or_blocked(kernal_linux_signal::SIGTTOU)?
     } else {
         false
     };
     let (res, stop_sig) = with_dev_state(|state| {
-        handle_console_backing_ioctl(
+        let out = handle_console_backing_ioctl(
             &mut state.console_ldisc,
             &mut state.console_session,
             caller_pid,
@@ -703,7 +718,15 @@ pub(super) fn handle_console_ioctl(raw_request: u64, arg: u64) -> Result<Syscall
             cmd,
             arg,
             sigttou_ignored_or_blocked,
-        )
+        )?;
+        sync_session_owner(
+            &state.console_session,
+            &mut state.console_owner_process,
+            caller_process,
+            caller_sid,
+            cmd,
+        );
+        Ok::<_, ()>(out)
     })??;
     if let Some(sig) = stop_sig {
         let _ = super::step30_runtime::deliver_tty_signal_to_pgid(
@@ -741,7 +764,7 @@ pub(super) fn is_dev_or_aliased_fd(raw_fd: u64) -> bool {
 
 /// Dispatches blocking `/dev` reads (`read = 63`, `readv = 65`) with the live `ExceptionFrame`
 /// so scheduler yields and Stop/Continue signal transitions rebind the frame generation cleanly.
-pub(super) fn try_handle_blocking_read(
+pub(super) fn try_handle_blocking_io(
     request: SyscallRequest,
     frame: &mut kernal_exceptions_aarch64::ExceptionFrame,
 ) -> Result<Option<SyscallReturn>, ()> {
@@ -753,7 +776,21 @@ pub(super) fn try_handle_blocking_read(
             Some(frame),
         )
         .map(Some),
+        64 if is_dev_or_aliased_fd(request.args[0]) => write_dev_fd(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            Some(frame),
+        )
+        .map(Some),
         65 if is_dev_or_aliased_fd(request.args[0]) => readv_dev_fd(
+            request.args[0],
+            request.args[1],
+            request.args[2],
+            Some(frame),
+        )
+        .map(Some),
+        66 if is_dev_or_aliased_fd(request.args[0]) => writev_dev_fd(
             request.args[0],
             request.args[1],
             request.args[2],
@@ -801,13 +838,13 @@ pub(super) fn try_handle_syscall(request: SyscallRequest) -> Result<Option<Sysca
             read_dev_fd(request.args[0], request.args[1], request.args[2], None).map(Some)
         }
         64 if is_dev_or_aliased_fd(request.args[0]) => {
-            write_dev_fd(request.args[0], request.args[1], request.args[2]).map(Some)
+            write_dev_fd(request.args[0], request.args[1], request.args[2], None).map(Some)
         }
         65 if is_dev_or_aliased_fd(request.args[0]) => {
             readv_dev_fd(request.args[0], request.args[1], request.args[2], None).map(Some)
         }
         66 if is_dev_or_aliased_fd(request.args[0]) => {
-            writev_dev_fd(request.args[0], request.args[1], request.args[2]).map(Some)
+            writev_dev_fd(request.args[0], request.args[1], request.args[2], None).map(Some)
         }
         79 => try_newfstatat(request.args[1], request.args[2]),
         80 if is_dev_or_aliased_fd(request.args[0]) => {
@@ -888,6 +925,68 @@ pub(super) fn handle_dev_ioctl(
                         }
                         SyscallReturn::success(0).ok_or(())?
                     }
+                    TIOCPKT => {
+                        if arg == 0 {
+                            return Ok((SyscallReturn::error(Errno::EFAULT), None));
+                        }
+                        let mut raw_pkt = [0u8; 4];
+                        if let Err(err) = kernal_usercopy_aarch64::copy_from_user(&mut raw_pkt, arg)
+                        {
+                            return Ok((map_usercopy(err)?, None));
+                        }
+                        let enabled = i32::from_le_bytes(raw_pkt) != 0;
+                        if let Err(err) = state.ptys.set_packet_mode(master, enabled) {
+                            return Ok((SyscallReturn::error(err.to_errno()), None));
+                        }
+                        SyscallReturn::success(0).ok_or(())?
+                    }
+                    TIOCGPTPEER => {
+                        let access = match arg & O_ACCMODE {
+                            O_RDONLY => DeviceAccess::ReadOnly,
+                            O_WRONLY => DeviceAccess::WriteOnly,
+                            O_RDWR => DeviceAccess::ReadWrite,
+                            _ => return Ok((SyscallReturn::error(Errno::EINVAL), None)),
+                        };
+                        let nonblocking = (arg & O_NONBLOCK) != 0;
+                        let close_on_exec = (arg & O_CLOEXEC) != 0;
+                        let ptn = match state.ptys.pts_number(master) {
+                            Ok(ptn) => ptn,
+                            Err(err) => return Ok((SyscallReturn::error(err.to_errno()), None)),
+                        };
+                        let cap = Capability {
+                            object: process,
+                            rights: CapRights::READ.union(CapRights::WRITE),
+                        };
+                        if let Err(err) = DeviceNodeKind::Pts(ptn)
+                            .authorize_capability(&cap, access.required_rights())
+                        {
+                            return Ok((SyscallReturn::error(err.to_errno()), None));
+                        }
+                        let Some((new_idx, new_slot)) =
+                            state.fds.iter_mut().enumerate().find(|(_, e)| !e.live)
+                        else {
+                            return Ok((SyscallReturn::error(Errno::EMFILE), None));
+                        };
+                        let slave = match state.ptys.open_slave(ptn) {
+                            Ok(slave) => slave,
+                            Err(err) => return Ok((SyscallReturn::error(err.to_errno()), None)),
+                        };
+                        let generation = state.next_generation;
+                        state.next_generation = state.next_generation.wrapping_add(1).max(1);
+                        let mut owners = DirectProcessRefs::empty();
+                        owners.init(process, close_on_exec);
+                        *new_slot = DevFdEntry {
+                            live: true,
+                            generation,
+                            alias_refs: 0,
+                            owners,
+                            backing: DevBacking::PtySlave(slave),
+                            access,
+                            nonblocking,
+                        };
+                        let fd = DEV_FD_BASE + (new_idx as i32);
+                        SyscallReturn::success(i64::from(fd)).ok_or(())?
+                    }
                     TCGETS | TCSETS | TCSETSW | TCSETSF | TIOCGWINSZ | TIOCSWINSZ => {
                         let ldisc = match state.ptys.master_ldisc_mut(master) {
                             Ok(ldisc) => ldisc,
@@ -901,26 +1000,46 @@ pub(super) fn handle_dev_ioctl(
             }
             DevBacking::Node(
                 DeviceNodeKind::Tty | DeviceNodeKind::Console | DeviceNodeKind::TtyAma0,
-            ) => handle_console_backing_ioctl(
-                &mut state.console_ldisc,
-                &mut state.console_session,
-                caller_pid,
-                caller_pgid,
-                caller_sid,
-                cmd,
-                arg,
-                sigttou_ignored_or_blocked,
-            ),
-            DevBacking::Node(DeviceNodeKind::Vt(_)) => handle_vt_backing_ioctl(
-                &mut state.vt_ldisc,
-                &mut state.vt_session,
-                caller_pid,
-                caller_pgid,
-                caller_sid,
-                cmd,
-                arg,
-                sigttou_ignored_or_blocked,
-            ),
+            ) => {
+                let out = handle_console_backing_ioctl(
+                    &mut state.console_ldisc,
+                    &mut state.console_session,
+                    caller_pid,
+                    caller_pgid,
+                    caller_sid,
+                    cmd,
+                    arg,
+                    sigttou_ignored_or_blocked,
+                )?;
+                sync_session_owner(
+                    &state.console_session,
+                    &mut state.console_owner_process,
+                    resolved_proc,
+                    caller_sid,
+                    cmd,
+                );
+                Ok(out)
+            }
+            DevBacking::Node(DeviceNodeKind::Vt(_)) => {
+                let out = handle_vt_backing_ioctl(
+                    &mut state.vt_ldisc,
+                    &mut state.vt_session,
+                    caller_pid,
+                    caller_pgid,
+                    caller_sid,
+                    cmd,
+                    arg,
+                    sigttou_ignored_or_blocked,
+                )?;
+                sync_session_owner(
+                    &state.vt_session,
+                    &mut state.vt_owner_process,
+                    resolved_proc,
+                    caller_sid,
+                    cmd,
+                );
+                Ok(out)
+            }
             DevBacking::PtySlave(slave) => {
                 if matches!(
                     cmd,
@@ -962,6 +1081,20 @@ pub(super) fn handle_dev_ioctl(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn sync_session_owner(
+    session: &TtySessionState,
+    owner_slot: &mut Option<ObjectId>,
+    caller_process: ObjectId,
+    caller_sid: NonZeroU32,
+    cmd: u32,
+) {
+    match (cmd, session.controlling_session()) {
+        (TIOCSCTTY, Some(sid)) if sid == caller_sid => *owner_slot = Some(caller_process),
+        (_, None) => *owner_slot = None,
+        _ => {}
+    }
+}
+
 fn handle_console_backing_ioctl(
     ldisc: &mut LineDiscipline<PTY_RING_BYTES>,
     session: &mut TtySessionState,
@@ -1568,7 +1701,12 @@ fn read_dev_entry(
     }
 }
 
-fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallReturn, ()> {
+fn write_dev_fd(
+    raw_fd: u64,
+    user_buffer: u64,
+    count: u64,
+    mut frame: Option<&mut kernal_exceptions_aarch64::ExceptionFrame>,
+) -> Result<SyscallReturn, ()> {
     let (process, _pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
     let Ok((slot_idx, alias_gen)) = resolve_dev_slot_idx(process, raw_fd) else {
         return Ok(SyscallReturn::error(Errno::EBADF));
@@ -1582,7 +1720,14 @@ fn write_dev_fd(raw_fd: u64, user_buffer: u64, count: u64) -> Result<SyscallRetu
     let Some(entry) = entry else {
         return Ok(SyscallReturn::error(Errno::EBADF));
     };
-    write_dev_entry(entry, caller_pgid, caller_sid, user_buffer, requested)
+    write_dev_entry(
+        entry,
+        caller_pgid,
+        caller_sid,
+        user_buffer,
+        requested,
+        frame.as_deref_mut(),
+    )
 }
 
 fn readv_dev_fd(
@@ -1662,7 +1807,12 @@ fn readv_dev_fd(
     Ok(SyscallReturn::success(total as i64).ok_or(())?)
 }
 
-fn writev_dev_fd(raw_fd: u64, user_iov: u64, raw_iovcnt: u64) -> Result<SyscallReturn, ()> {
+fn writev_dev_fd(
+    raw_fd: u64,
+    user_iov: u64,
+    raw_iovcnt: u64,
+    mut frame: Option<&mut kernal_exceptions_aarch64::ExceptionFrame>,
+) -> Result<SyscallReturn, ()> {
     let (process, _pid, caller_pgid, caller_sid) = current_process_tty_ids()?;
     let Ok((slot_idx, alias_gen)) = resolve_dev_slot_idx(process, raw_fd) else {
         return Ok(SyscallReturn::error(Errno::EBADF));
@@ -1709,7 +1859,14 @@ fn writev_dev_fd(raw_fd: u64, user_iov: u64, raw_iovcnt: u64) -> Result<SyscallR
         if len == 0 {
             continue;
         }
-        let res = write_dev_entry(entry, caller_pgid, caller_sid, base, len)?;
+        let res = write_dev_entry(
+            entry,
+            caller_pgid,
+            caller_sid,
+            base,
+            len,
+            frame.as_deref_mut(),
+        )?;
         let raw = res.raw();
         if raw < 0 {
             return if total == 0 {
@@ -1733,6 +1890,7 @@ fn write_dev_entry(
     caller_sid: NonZeroU32,
     user_buffer: u64,
     requested: usize,
+    mut frame: Option<&mut kernal_exceptions_aarch64::ExceptionFrame>,
 ) -> Result<SyscallReturn, ()> {
     if !entry.access.allows_write() {
         return Ok(SyscallReturn::error(Errno::EBADF));
@@ -1842,43 +2000,61 @@ fn write_dev_entry(
                 }
             }
             DevBacking::PtySlave(slave) => {
-                let sigttou_ignored_or_blocked =
-                    super::step30_runtime::current_signal_is_ignored_or_blocked(
-                        kernal_linux_signal::SIGTTOU,
-                    )?;
-                let write_res = with_dev_state(|state| {
-                    state.ptys.slave_write_checked(
-                        slave,
-                        caller_sid,
-                        caller_pgid,
-                        &chunk[..take],
-                        sigttou_ignored_or_blocked,
-                    )
-                })?;
-                match write_res {
-                    Ok(PtySlaveIoResult::Transferred(written)) => {
-                        total += written;
-                        if written < take {
-                            break;
-                        }
-                    }
-                    Ok(PtySlaveIoResult::JobControlStop(sig)) => {
-                        let _ = super::step30_runtime::deliver_tty_signal_to_pgid(
-                            caller_pgid,
-                            sig.linux_signal_number(),
+                let mut chunk_off = 0usize;
+                while chunk_off < take {
+                    let sigttou_ignored_or_blocked =
+                        super::step30_runtime::current_signal_is_ignored_or_blocked(
+                            kernal_linux_signal::SIGTTOU,
                         )?;
-                        return if total == 0 {
-                            Ok(SyscallReturn::error(Errno::EINTR))
-                        } else {
-                            Ok(SyscallReturn::success(total as i64).ok_or(())?)
-                        };
-                    }
-                    Err(err) => {
-                        return if total == 0 {
-                            Ok(SyscallReturn::error(err.to_errno()))
-                        } else {
-                            Ok(SyscallReturn::success(total as i64).ok_or(())?)
-                        };
+                    let write_res = with_dev_state(|state| {
+                        state.ptys.slave_write_checked(
+                            slave,
+                            caller_sid,
+                            caller_pgid,
+                            &chunk[chunk_off..take],
+                            sigttou_ignored_or_blocked,
+                        )
+                    })?;
+                    match write_res {
+                        Ok(PtySlaveIoResult::Transferred(written)) => {
+                            total += written;
+                            chunk_off += written;
+                            if chunk_off < take
+                                && (entry.nonblocking || frame.is_none() || written == 0)
+                            {
+                                return Ok(SyscallReturn::success(total as i64).ok_or(())?);
+                            }
+                        }
+                        Ok(PtySlaveIoResult::JobControlStop(sig)) => {
+                            let _ = super::step30_runtime::deliver_tty_signal_to_pgid(
+                                caller_pgid,
+                                sig.linux_signal_number(),
+                            )?;
+                            return if total == 0 {
+                                Ok(SyscallReturn::error(Errno::EINTR))
+                            } else {
+                                Ok(SyscallReturn::success(total as i64).ok_or(())?)
+                            };
+                        }
+                        Err(
+                            kernal_linux_dev::Error::BufferFull
+                            | kernal_linux_dev::Error::WouldBlock,
+                        ) if !entry.nonblocking && frame.is_some() => {
+                            if await_retry_or_signal(frame.as_deref_mut())? {
+                                return if total == 0 {
+                                    Ok(SyscallReturn::error(Errno::EINTR))
+                                } else {
+                                    Ok(SyscallReturn::success(total as i64).ok_or(())?)
+                                };
+                            }
+                        }
+                        Err(err) => {
+                            return if total == 0 {
+                                Ok(SyscallReturn::error(err.to_errno()))
+                            } else {
+                                Ok(SyscallReturn::success(total as i64).ok_or(())?)
+                            };
+                        }
                     }
                 }
             }

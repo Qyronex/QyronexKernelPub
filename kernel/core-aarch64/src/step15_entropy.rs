@@ -409,6 +409,90 @@ pub fn extract_at_random(blob: &Blob<'_>) -> Result<[u8; QEMU_RNG_SEED_BYTES], E
     found.ok_or(Error::MissingSeed)
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn read_be_cells(bytes: &[u8]) -> Option<u64> {
+    match bytes.len() {
+        4 => Some(u64::from(u32::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        ]))),
+        8 => Some(u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ])),
+        _ => None,
+    }
+}
+
+/// Extracts usable physical RAM size starting at `expected_base` from DTB `/memory`.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+fn extract_memory_bytes(blob: &Blob<'_>, expected_base: u64) -> Option<u64> {
+    let mut depth = 0usize;
+    let mut addr_cells: usize = 2;
+    let mut size_cells: usize = 1;
+    let mut in_mem_node = false;
+    let mut mem_name_match = false;
+    let mut mem_type_match = false;
+    let mut reg_buf = [0u8; 64];
+    let mut reg_len = 0usize;
+
+    for event in blob.events() {
+        match event.ok()? {
+            Event::BeginNode(name) => {
+                depth = depth.checked_add(1)?;
+                if depth == 2 {
+                    in_mem_node = true;
+                    mem_name_match = name == "memory" || name.starts_with("memory@");
+                    mem_type_match = false;
+                    reg_len = 0;
+                }
+            }
+            Event::Property { name, value } => {
+                if depth == 1 {
+                    if name == "#address-cells" && value.len() == 4 {
+                        addr_cells = usize::try_from(u32::from_be_bytes([
+                            value[0], value[1], value[2], value[3],
+                        ]))
+                        .ok()?
+                        .clamp(1, 2);
+                    } else if name == "#size-cells" && value.len() == 4 {
+                        size_cells = usize::try_from(u32::from_be_bytes([
+                            value[0], value[1], value[2], value[3],
+                        ]))
+                        .ok()?
+                        .clamp(1, 2);
+                    }
+                } else if depth == 2 && in_mem_node {
+                    if name == "device_type" && (value == b"memory\0" || value == b"memory") {
+                        mem_type_match = true;
+                    } else if name == "reg" {
+                        let take = value.len().min(reg_buf.len());
+                        reg_buf[..take].copy_from_slice(&value[..take]);
+                        reg_len = take;
+                    }
+                }
+            }
+            Event::EndNode => {
+                if depth == 2 && in_mem_node {
+                    if (mem_name_match || mem_type_match) && reg_len > 0 {
+                        let a_bytes = addr_cells * 4;
+                        let s_bytes = size_cells * 4;
+                        let stride = a_bytes + s_bytes;
+                        for entry in reg_buf[..reg_len].chunks_exact(stride) {
+                            let base = read_be_cells(&entry[..a_bytes])?;
+                            let size = read_be_cells(&entry[a_bytes..stride])?;
+                            if base == expected_base && size > 0 {
+                                return Some(size & !4095u64);
+                            }
+                        }
+                    }
+                    in_mem_node = false;
+                }
+                depth = depth.checked_sub(1)?;
+            }
+        }
+    }
+    None
+}
+
 /// Captures QEMU's complete DTB-provided randomness while the original DTB mapping is available.
 ///
 /// # Safety
@@ -420,6 +504,9 @@ pub unsafe fn publish_qemu_at_random() -> Result<(), Error> {
     let blob = unsafe {
         super::super::qemu_dtb(super::super::QEMU_VIRT_RAM_BASE).ok_or(Error::QemuDtbUnavailable)?
     };
+    if let Some(ram_bytes) = extract_memory_bytes(&blob, super::super::QEMU_VIRT_RAM_BASE) {
+        super::memory::publish_dtb_ram_bytes(ram_bytes);
+    }
     let seed = extract_at_random(&blob)?;
     QEMU_AT_RANDOM.publish(seed)?;
     QEMU_GETRANDOM.publish(seed)

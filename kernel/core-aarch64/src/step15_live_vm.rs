@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
 use super::{kmap, memory, runtime};
-use kernal_linux_abi::MinimumRuntimeCall;
-use kernal_linux_vm::Error as VmError;
+use alloc::vec::Vec;
+use kernal_capability::ObjectId;
+use kernal_linux_abi::{Errno, MinimumRuntimeCall};
+use kernal_linux_vm::{
+    DEFAULT_MMAP_CEILING, Error as VmError, MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE, MmapFileBacking,
+    STEP15_ANON_FLAGS, parse_step31_perms, validate_step31_mmap_spec,
+};
 use kernal_memory::PhysFrame;
 use kernal_object::ObjectTable;
 use kernal_page_table_aarch64::Backend;
@@ -10,17 +15,256 @@ use kernal_process::Process;
 use kernal_process_aarch64::{BoundProcessAddressSpace, Error as ProcessAddressSpaceError};
 use kernal_protected_boot_aarch64::RuntimeTablePool;
 use kernal_scheduler_smp::GlobalThreadId;
+use kernal_vm::{Backing, PAGE_SIZE, VmPerms, Vma};
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_exceptions_aarch64::ExceptionFrame;
-#[cfg(all(target_arch = "aarch64", target_os = "none"))]
-use kernal_linux_abi::Errno;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_linux_clone::ProcessClonePlan;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_scheduler_cpu::CpuSchedulerCell;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_user_entry_aarch64::El0ReturnState;
+
+/// Upper bound (`512 MiB`) for virtual unbacked `PROT_NONE` reservations (`glibc` arenas, guard spans).
+const PROT_NONE_RES_MAX_LEN: u64 = 512 * 1024 * 1024;
+
+struct ProtNoneResCell {
+    state: core::sync::atomic::AtomicU8,
+    entries: core::cell::UnsafeCell<Vec<(ObjectId, u64, u64)>>,
+}
+
+// SAFETY: synchronous kernel trap/lifecycle paths serialize all accesses via `state` CAS.
+unsafe impl Sync for ProtNoneResCell {}
+
+static PROT_NONE_RES: ProtNoneResCell = ProtNoneResCell {
+    state: core::sync::atomic::AtomicU8::new(0),
+    entries: core::cell::UnsafeCell::new(Vec::new()),
+};
+
+fn with_prot_none_res<R>(f: impl FnOnce(&mut Vec<(ObjectId, u64, u64)>) -> R) -> R {
+    use core::sync::atomic::Ordering;
+    while PROT_NONE_RES
+        .state
+        .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    // SAFETY: `state == 1` grants exclusive access; closures never re-enter `with_prot_none_res`.
+    let res = f(unsafe { &mut *PROT_NONE_RES.entries.get() });
+    PROT_NONE_RES.state.store(0, Ordering::Release);
+    res
+}
+
+fn res_earliest_overlap(
+    entries: &[(ObjectId, u64, u64)],
+    process: ObjectId,
+    start: u64,
+    end: u64,
+) -> Option<u64> {
+    let mut best: Option<u64> = None;
+    for &(p, rs, re) in entries {
+        if p == process && rs < end && start < re {
+            best = Some(match best {
+                Some(prev) if prev < rs => prev,
+                _ => rs,
+            });
+        }
+    }
+    best
+}
+
+fn res_punch_range(
+    entries: &mut Vec<(ObjectId, u64, u64)>,
+    process: ObjectId,
+    start: u64,
+    end: u64,
+) {
+    if start >= end {
+        return;
+    }
+    let mut add = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let (p, rs, re) = entries[i];
+        if p == process && rs < end && start < re {
+            entries.swap_remove(i);
+            if rs < start {
+                add.push((p, rs, start));
+            }
+            if re > end {
+                add.push((p, end, re));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    entries.extend(add);
+}
+
+fn res_insert_merged(
+    entries: &mut Vec<(ObjectId, u64, u64)>,
+    process: ObjectId,
+    mut start: u64,
+    mut end: u64,
+) {
+    if start >= end {
+        return;
+    }
+    res_punch_range(entries, process, start, end);
+    let mut i = 0;
+    while i < entries.len() {
+        let (p, rs, re) = entries[i];
+        if p == process && (re == start || end == rs) {
+            entries.swap_remove(i);
+            start = start.min(rs);
+            end = end.max(re);
+        } else {
+            i += 1;
+        }
+    }
+    entries.push((process, start, end));
+}
+
+fn split_against_res(
+    entries: &[(ObjectId, u64, u64)],
+    process: ObjectId,
+    start: u64,
+    end: u64,
+) -> Vec<(bool, u64, u64)> {
+    let mut overlaps: Vec<(u64, u64)> = Vec::new();
+    for &(p, rs, re) in entries {
+        if p == process && rs < end && start < re {
+            overlaps.push((rs.max(start), re.min(end)));
+        }
+    }
+    overlaps.sort_unstable_by_key(|r| r.0);
+    let mut out = Vec::new();
+    let mut cursor = start;
+    for (rs, re) in overlaps {
+        if rs > cursor {
+            out.push((false, cursor, rs));
+        }
+        if re > cursor {
+            let s = rs.max(cursor);
+            if re > s {
+                out.push((true, s, re));
+                cursor = re;
+            }
+        }
+    }
+    if cursor < end {
+        out.push((false, cursor, end));
+    }
+    out
+}
+
+fn align_len(length: u64) -> Result<u64, VmError> {
+    if length == 0 {
+        return Err(VmError::Linux(Errno::EINVAL));
+    }
+    length
+        .checked_add(PAGE_SIZE - 1)
+        .map(|v| v & !(PAGE_SIZE - 1))
+        .ok_or_else(enomem_err)
+}
+
+fn validate_range(start: u64, len: u64) -> Result<(), VmError> {
+    Vma::new(start, len, VmPerms::NONE, Backing::Anonymous)
+        .map(|_| ())
+        .map_err(|_| VmError::Linux(Errno::EINVAL))
+}
+
+fn enomem_err() -> VmError {
+    Errno::new(12).map_or(VmError::BackendInvariant, VmError::Linux)
+}
+
+fn find_gap_avoiding_res(
+    process_id: ObjectId,
+    process: &Process<{ runtime::STEP15_RUNTIME_CAPS }>,
+    objects: &ObjectTable<{ runtime::STEP15_RUNTIME_OBJECTS }>,
+    space: &BoundProcessAddressSpace<{ runtime::STEP15_RUNTIME_VMAS }>,
+    len: u64,
+    hint: u64,
+) -> Result<u64, VmError> {
+    if hint != 0
+        && validate_range(hint, len).is_ok()
+        && let Some(end) = hint.checked_add(len)
+        && space
+            .user_range_is_free(process, objects, process.address_space_handle(), hint, len)
+            .unwrap_or(false)
+        && with_prot_none_res(|e| res_earliest_overlap(e, process_id, hint, end).is_none())
+    {
+        return Ok(hint);
+    }
+
+    let mut ceiling = DEFAULT_MMAP_CEILING;
+    for _ in 0..1024 {
+        if ceiling < len {
+            return Err(enomem_err());
+        }
+        let cand = space
+            .find_user_gap_top_down(
+                process,
+                objects,
+                process.address_space_handle(),
+                len,
+                ceiling,
+            )
+            .map_err(|_| enomem_err())?;
+        let end = cand.checked_add(len).ok_or_else(enomem_err)?;
+        let overlap = with_prot_none_res(|e| res_earliest_overlap(e, process_id, cand, end));
+        match overlap {
+            None => return Ok(cand),
+            Some(r_start) => {
+                if r_start >= ceiling || r_start <= PAGE_SIZE {
+                    return Err(enomem_err());
+                }
+                ceiling = r_start;
+            }
+        }
+    }
+    Err(enomem_err())
+}
+
+pub(super) fn on_process_fork(parent: ObjectId, child: ObjectId) {
+    with_prot_none_res(|entries| {
+        let mut cloned = Vec::new();
+        for &(p, s, e) in entries.iter() {
+            if p == parent {
+                cloned.push((child, s, e));
+            }
+        }
+        entries.extend(cloned);
+    });
+}
+
+pub(super) fn on_process_exec(process: ObjectId) {
+    with_prot_none_res(|entries| entries.retain(|&(p, _, _)| p != process));
+}
+
+pub(super) fn on_process_exit(process: ObjectId) {
+    with_prot_none_res(|entries| entries.retain(|&(p, _, _)| p != process));
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(super) fn has_prot_none_overlap(address: u64, length: u64) -> bool {
+    let Some(process) = super::step_fd_util::current_process_object() else {
+        return false;
+    };
+    let len = if length == 0 {
+        PAGE_SIZE
+    } else {
+        match length.checked_add(PAGE_SIZE - 1) {
+            Some(v) => v & !(PAGE_SIZE - 1),
+            None => return true,
+        }
+    };
+    let start = address & !(PAGE_SIZE - 1);
+    let end = start.saturating_add(len);
+    with_prot_none_res(|e| res_earliest_overlap(e, process, start, end).is_some())
+}
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 fn current_scheduler_thread() -> Result<GlobalThreadId, ()> {
@@ -102,6 +346,66 @@ pub(super) fn handle(call: MinimumRuntimeCall) -> Result<Result<u64, VmError>, (
     let vm_result = unsafe {
         with_current_vm_tx(
             |vm, process, objects, space, page_tables, reserved, frames, zeroer| {
+                if let MinimumRuntimeCall::Munmap { address, length } = call {
+                    let len = match align_len(length) {
+                        Ok(l) => l,
+                        Err(e) => return Err(e),
+                    };
+                    validate_range(address, len)?;
+                    let end = address.checked_add(len).ok_or_else(enomem_err)?;
+                    let segs =
+                        with_prot_none_res(|e| split_against_res(e, process.id(), address, end));
+                    if segs.iter().any(|(in_res, ..)| *in_res) {
+                        for &(in_res, s, e) in &segs {
+                            if !in_res {
+                                kernal_linux_vm_aarch64::handle_current(
+                                    vm,
+                                    process,
+                                    objects,
+                                    space,
+                                    page_tables,
+                                    reserved,
+                                    frames,
+                                    zeroer,
+                                    MinimumRuntimeCall::Munmap {
+                                        address: s,
+                                        length: e - s,
+                                    },
+                                )?;
+                            }
+                        }
+                        with_prot_none_res(|el| res_punch_range(el, process.id(), address, end));
+                        return Ok(0);
+                    }
+                }
+
+                let mut adjusted_call = call;
+                if let MinimumRuntimeCall::Mmap {
+                    address,
+                    length,
+                    protection,
+                    flags,
+                    fd,
+                    offset,
+                } = call
+                    && flags == STEP15_ANON_FLAGS
+                    && fd == u64::MAX
+                    && offset == 0
+                    && let Ok(len) = align_len(length)
+                    && (len / PAGE_SIZE) <= runtime::STEP15_RUNTIME_VM_TX_PAGES as u64
+                {
+                    let chosen =
+                        find_gap_avoiding_res(process.id(), process, objects, space, len, address)?;
+                    adjusted_call = MinimumRuntimeCall::Mmap {
+                        address: chosen,
+                        length,
+                        protection,
+                        flags,
+                        fd,
+                        offset,
+                    };
+                }
+
                 // SAFETY: nested owner scopes provide exact Process/CSpace, address space, tables,
                 // reservation set, frame allocator and persistent KMap zeroer.
                 kernal_linux_vm_aarch64::handle_current(
@@ -113,7 +417,7 @@ pub(super) fn handle(call: MinimumRuntimeCall) -> Result<Result<u64, VmError>, (
                     reserved,
                     frames,
                     zeroer,
-                    call,
+                    adjusted_call,
                 )
             },
         )
@@ -134,13 +438,83 @@ pub(super) fn handle_step31_dynamic_mmap(
     offset: u64,
     backing: kernal_linux_vm::MmapFileBacking<'_>,
 ) -> Result<Result<u64, VmError>, ()> {
+    if let Ok(spec) = validate_step31_mmap_spec(protection, flags, fd, offset)
+        && spec.anonymous
+        && !spec.shared
+        && spec.perms == VmPerms::NONE
+        && matches!(backing, MmapFileBacking::Anonymous)
+    {
+        let vm_result = unsafe {
+            with_current_vm_tx(
+                |vm, process, objects, space, page_tables, reserved, frames, zeroer| {
+                    let len = align_len(length)?;
+                    if len > PROT_NONE_RES_MAX_LEN {
+                        return Err(enomem_err());
+                    }
+                    let start = if spec.fixed {
+                        validate_range(address, len)?;
+                        let end = address.checked_add(len).ok_or_else(enomem_err)?;
+                        let segs = with_prot_none_res(|e| {
+                            split_against_res(e, process.id(), address, end)
+                        });
+                        for &(in_res, s, e) in &segs {
+                            if !in_res {
+                                kernal_linux_vm_aarch64::handle_current(
+                                    vm,
+                                    process,
+                                    objects,
+                                    space,
+                                    page_tables,
+                                    reserved,
+                                    frames,
+                                    zeroer,
+                                    MinimumRuntimeCall::Munmap {
+                                        address: s,
+                                        length: e - s,
+                                    },
+                                )?;
+                            }
+                        }
+                        address
+                    } else {
+                        find_gap_avoiding_res(process.id(), process, objects, space, len, address)?
+                    };
+                    let end = start.checked_add(len).ok_or_else(enomem_err)?;
+                    with_prot_none_res(|e| res_insert_merged(e, process.id(), start, end));
+                    Ok(start)
+                },
+            )
+        }?;
+        return Ok(vm_result);
+    }
+
     // SAFETY: same synchronous lower-EL trap owner window as `handle`.
     let vm_result = unsafe {
         with_current_vm_tx(
             |_vm, process, objects, space, page_tables, reserved, frames, zeroer| {
+                let mut target_address = address;
+                let mut mapped_len: Option<(bool, u64)> = None;
+                if let Ok(spec) = validate_step31_mmap_spec(protection, flags, fd, offset)
+                    && let Ok(len) = align_len(length)
+                {
+                    if !spec.fixed {
+                        if (len / PAGE_SIZE) > runtime::STEP31_DYNAMIC_MMAP_TX_PAGES as u64 {
+                            return Err(enomem_err());
+                        }
+                        target_address = find_gap_avoiding_res(
+                            process.id(),
+                            process,
+                            objects,
+                            space,
+                            len,
+                            address,
+                        )?;
+                    }
+                    mapped_len = Some((spec.fixed, len));
+                }
                 // SAFETY: exact Process/CSpace, bound address space, live table cursor,
                 // reservation set, frame allocator and persistent KMap zeroer are held.
-                kernal_linux_vm_aarch64::handle_step31_dynamic_mmap::<
+                let res = kernal_linux_vm_aarch64::handle_step31_dynamic_mmap::<
                     { runtime::STEP31_DYNAMIC_MMAP_TX_PAGES },
                     _,
                     _,
@@ -157,14 +531,21 @@ pub(super) fn handle_step31_dynamic_mmap(
                     reserved,
                     frames,
                     zeroer,
-                    address,
+                    target_address,
                     length,
                     protection,
                     flags,
                     fd,
                     offset,
                     backing,
-                )
+                );
+                if let Ok(va) = res
+                    && let Some((true, len)) = mapped_len
+                    && let Some(end) = va.checked_add(len)
+                {
+                    with_prot_none_res(|e| res_punch_range(e, process.id(), va, end));
+                }
+                res
             },
         )
     }?;
@@ -178,33 +559,135 @@ pub(super) fn handle_step31_mprotect(
     length: u64,
     protection: u64,
 ) -> Result<Result<(), VmError>, ()> {
+    let perms = match parse_step31_perms(protection) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    if length == 0 {
+        return Ok(validate_range(address, PAGE_SIZE));
+    }
+    let len = match align_len(length) {
+        Ok(l) => l,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Err(e) = validate_range(address, len) {
+        return Ok(Err(e));
+    }
+
     // SAFETY: same synchronous lower-EL trap owner window as `handle`.
     let vm_result = unsafe {
         with_current_vm_tx(
             |_vm, process, objects, space, page_tables, reserved, frames, zeroer| {
-                // SAFETY: exact Process/CSpace, bound address space, live table cursor,
-                // reservation set, frame allocator and persistent KMap zeroer are held.
-                kernal_linux_vm_aarch64::handle_step31_mprotect::<
-                    { runtime::STEP31_DYNAMIC_MMAP_TX_PAGES },
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                    _,
-                >(
-                    process,
-                    objects,
-                    space,
-                    page_tables,
-                    reserved,
-                    frames,
-                    zeroer,
-                    address,
-                    length,
-                    protection,
-                )
+                let end = address.checked_add(len).ok_or_else(enomem_err)?;
+                let segs = with_prot_none_res(|e| split_against_res(e, process.id(), address, end));
+                if !segs.iter().any(|(in_res, ..)| *in_res) {
+                    // SAFETY: exact Process/CSpace, bound address space, live table cursor,
+                    // reservation set, frame allocator and persistent KMap zeroer are held.
+                    return kernal_linux_vm_aarch64::handle_step31_mprotect::<
+                        { runtime::STEP31_DYNAMIC_MMAP_TX_PAGES },
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                        _,
+                    >(
+                        process,
+                        objects,
+                        space,
+                        page_tables,
+                        reserved,
+                        frames,
+                        zeroer,
+                        address,
+                        length,
+                        protection,
+                    );
+                }
+
+                for &(in_res, s, e) in &segs {
+                    if !in_res {
+                        let mut va = s;
+                        while va < e {
+                            if space
+                                .translate_user(
+                                    process,
+                                    objects,
+                                    process.address_space_handle(),
+                                    page_tables,
+                                    va,
+                                )
+                                .is_err()
+                            {
+                                return Err(enomem_err());
+                            }
+                            va += PAGE_SIZE;
+                        }
+                    }
+                }
+
+                let max_chunk = (runtime::STEP31_DYNAMIC_MMAP_TX_PAGES as u64) * PAGE_SIZE;
+                for &(in_res, s, e) in &segs {
+                    let mut cur = s;
+                    while cur < e {
+                        let chunk = (e - cur).min(max_chunk);
+                        if !in_res {
+                            kernal_linux_vm_aarch64::handle_step31_mprotect::<
+                                { runtime::STEP31_DYNAMIC_MMAP_TX_PAGES },
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                            >(
+                                process,
+                                objects,
+                                space,
+                                page_tables,
+                                reserved,
+                                frames,
+                                zeroer,
+                                cur,
+                                chunk,
+                                protection,
+                            )?;
+                        } else if perms != VmPerms::NONE {
+                            kernal_linux_vm_aarch64::handle_step31_dynamic_mmap::<
+                                { runtime::STEP31_DYNAMIC_MMAP_TX_PAGES },
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                                _,
+                            >(
+                                process,
+                                objects,
+                                space,
+                                page_tables,
+                                reserved,
+                                frames,
+                                zeroer,
+                                cur,
+                                chunk,
+                                protection,
+                                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+                                u64::MAX,
+                                0,
+                                MmapFileBacking::Anonymous,
+                            )?;
+                            with_prot_none_res(|el| {
+                                res_punch_range(el, process.id(), cur, cur + chunk)
+                            });
+                        }
+                        cur += chunk;
+                    }
+                }
+                Ok(())
             },
         )
     }?;
@@ -608,7 +1091,7 @@ pub(super) unsafe fn stage_exec_image(
     image: &[u8],
     interpreter: Option<&[u8]>,
     start: kernal_user_elf_runtime_aarch64::LinuxProcessStart<'_>,
-) -> Result<StagedExecImage, ExecStageError> {
+) -> Result<alloc::boxed::Box<StagedExecImage>, ExecStageError> {
     // SAFETY: delegated caller contract owns the exact same synchronous live-table mutation window.
     let table_result = unsafe {
         RuntimeTablePool::with_live(|page_tables| {
@@ -693,10 +1176,10 @@ pub(super) unsafe fn stage_exec_image(
                             }
                         };
 
-                        Ok(StagedExecImage {
+                        Ok(alloc::boxed::Box::new(StagedExecImage {
                             replacement,
                             loaded,
-                        })
+                        }))
                     })
                 })
             })

@@ -367,6 +367,7 @@ pub(super) fn release_subsystem_handles(handles: &[Option<SubsystemHandle>]) {
 }
 
 pub(super) fn on_subsystem_process_fork(parent: ObjectId, child: ObjectId) {
+    super::live_vm::on_process_fork(parent, child);
     super::step32_dev::on_process_fork(parent, child);
     super::step33_mounts::on_process_fork(parent, child);
     super::step42_hardware::on_process_fork(parent, child);
@@ -379,6 +380,7 @@ pub(super) fn on_subsystem_process_fork(parent: ObjectId, child: ObjectId) {
 }
 
 pub(super) fn on_subsystem_process_exec(process: ObjectId) {
+    super::live_vm::on_process_exec(process);
     super::step32_dev::on_process_exec(process);
     super::step33_mounts::on_process_exec(process);
     super::step42_hardware::on_process_exec(process);
@@ -390,6 +392,8 @@ pub(super) fn on_subsystem_process_exec(process: ObjectId) {
 }
 
 pub(super) fn on_subsystem_process_exit(process: ObjectId) {
+    super::live_vm::on_process_exit(process);
+    super::step31_runtime::on_process_exit(process);
     super::step32_dev::on_process_exit(process);
     super::step33_mounts::on_process_exit(process);
     super::step42_hardware::on_process_exit(process);

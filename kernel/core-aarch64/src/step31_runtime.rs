@@ -1017,7 +1017,7 @@ enum SharedMmapBacking {
 }
 
 #[cfg(feature = "step29-qemu-proof")]
-const MAX_SHARED_MMAPS: usize = 64;
+const MAX_SHARED_MMAPS: usize = 256;
 
 #[cfg(feature = "step29-qemu-proof")]
 #[derive(Clone, Copy)]
@@ -1055,6 +1055,7 @@ impl SharedMmapEntry {
 struct SharedMmapCell {
     state: core::sync::atomic::AtomicU8,
     entries: core::cell::UnsafeCell<[SharedMmapEntry; MAX_SHARED_MMAPS]>,
+    hashes: core::cell::UnsafeCell<[alloc::vec::Vec<u64>; MAX_SHARED_MMAPS]>,
 }
 
 #[cfg(feature = "step29-qemu-proof")]
@@ -1065,11 +1066,48 @@ unsafe impl Sync for SharedMmapCell {}
 static SHARED_MMAPS: SharedMmapCell = SharedMmapCell {
     state: core::sync::atomic::AtomicU8::new(0),
     entries: core::cell::UnsafeCell::new([SharedMmapEntry::EMPTY; MAX_SHARED_MMAPS]),
+    hashes: core::cell::UnsafeCell::new([const { alloc::vec::Vec::new() }; MAX_SHARED_MMAPS]),
 };
 
 #[cfg(feature = "step29-qemu-proof")]
-fn with_shared_mmaps<R>(
-    f: impl FnOnce(&mut [SharedMmapEntry; MAX_SHARED_MMAPS]) -> R,
+fn page_hash_64(page: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut chunks = page.chunks_exact(8);
+    for chunk in &mut chunks {
+        let w = u64::from_le_bytes(chunk.try_into().unwrap_or([0; 8]));
+        h ^= w;
+        h = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    for &b in chunks.remainder() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn initial_page_hashes(aligned_len: u64, file_offset: u64, bytes: &[u8]) -> alloc::vec::Vec<u64> {
+    let pages = usize::try_from(aligned_len / 4096).unwrap_or(0);
+    let mut out = alloc::vec::Vec::with_capacity(pages);
+    let base_off = usize::try_from(file_offset).unwrap_or(bytes.len());
+    for p in 0..pages {
+        let mut page = [0u8; 4096];
+        let start = base_off.saturating_add(p.saturating_mul(4096));
+        if start < bytes.len() {
+            let take = (bytes.len() - start).min(4096);
+            page[..take].copy_from_slice(&bytes[start..start + take]);
+        }
+        out.push(page_hash_64(&page));
+    }
+    out
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn with_shared_mmap_state<R>(
+    f: impl FnOnce(
+        &mut [SharedMmapEntry; MAX_SHARED_MMAPS],
+        &mut [alloc::vec::Vec<u64>; MAX_SHARED_MMAPS],
+    ) -> R,
 ) -> Option<R> {
     use core::sync::atomic::Ordering;
     let mut spins = 0usize;
@@ -1085,9 +1123,37 @@ fn with_shared_mmaps<R>(
         core::hint::spin_loop();
     }
     // SAFETY: exclusive state `1` acquired above.
-    let res = f(unsafe { &mut *SHARED_MMAPS.entries.get() });
+    let res = f(unsafe { &mut *SHARED_MMAPS.entries.get() }, unsafe {
+        &mut *SHARED_MMAPS.hashes.get()
+    });
     SHARED_MMAPS.state.store(0, Ordering::Release);
     Some(res)
+}
+
+#[cfg(feature = "step29-qemu-proof")]
+fn with_shared_mmaps<R>(
+    f: impl FnOnce(&mut [SharedMmapEntry; MAX_SHARED_MMAPS]) -> R,
+) -> Option<R> {
+    with_shared_mmap_state(|entries, _| f(entries))
+}
+
+/// Clears tracked `MAP_SHARED` mappings owned by an exiting process.
+pub(super) fn on_process_exit(process: ObjectId) {
+    #[cfg(not(feature = "step29-qemu-proof"))]
+    {
+        let _ = process;
+    }
+    #[cfg(feature = "step29-qemu-proof")]
+    {
+        let _ = with_shared_mmap_state(|entries, hashes| {
+            for (idx, e) in entries.iter_mut().enumerate() {
+                if e.live && e.process == process {
+                    *e = SharedMmapEntry::EMPTY;
+                    hashes[idx] = alloc::vec::Vec::new();
+                }
+            }
+        });
+    }
 }
 
 #[cfg(feature = "step29-qemu-proof")]
@@ -1101,6 +1167,7 @@ fn record_shared_mmap(
     writable: bool,
     orig_prot: u64,
     rev: u64,
+    init_bytes: Option<&[u8]>,
 ) {
     let page_mask = 4096u64 - 1;
     let aligned = raw_len
@@ -1109,8 +1176,14 @@ fn record_shared_mmap(
         .unwrap_or(0)
         .saturating_mul(4096)
         .max(4096);
-    let _ = with_shared_mmaps(|entries| {
-        if let Some(slot) = entries.iter_mut().find(|e| !e.live) {
+    let init_hashes = match (&backing, init_bytes) {
+        (SharedMmapBacking::MemFd { .. } | SharedMmapBacking::MemFs { .. }, Some(bytes)) => {
+            initial_page_hashes(aligned, file_offset, bytes)
+        }
+        _ => alloc::vec::Vec::new(),
+    };
+    let _ = with_shared_mmap_state(|entries, hashes| {
+        if let Some((idx, slot)) = entries.iter_mut().enumerate().find(|(_, e)| !e.live) {
             *slot = SharedMmapEntry {
                 live: true,
                 writable,
@@ -1122,6 +1195,7 @@ fn record_shared_mmap(
                 rev,
                 backing,
             };
+            hashes[idx] = init_hashes;
         }
     });
 }
@@ -1173,28 +1247,34 @@ fn refresh_shared_memfd_mmaps_inner() {
     let Ok((process, _, _)) = current_process_identity() else {
         return;
     };
-    let mut snap = [SharedMmapEntry::EMPTY; MAX_SHARED_MMAPS];
-    let mut snap_n = 0usize;
-    let _ = with_shared_mmaps(|entries| {
-        for e in entries.iter() {
+    let mut snap: alloc::vec::Vec<(usize, SharedMmapEntry, alloc::vec::Vec<u64>)> =
+        alloc::vec::Vec::new();
+    let _ = with_shared_mmap_state(|entries, hashes| {
+        for (idx, e) in entries.iter().enumerate() {
             if e.live
-                && !e.writable
                 && e.process == process
                 && (e.orig_prot & PROT_EXEC) == 0
-                && matches!(e.backing, SharedMmapBacking::MemFd { .. })
+                && matches!(
+                    e.backing,
+                    SharedMmapBacking::MemFd { .. } | SharedMmapBacking::MemFs { .. }
+                )
             {
-                snap[snap_n] = *e;
-                snap_n += 1;
+                snap.push((idx, *e, hashes[idx].clone()));
             }
         }
     });
-    for e in &snap[..snap_n] {
-        let SharedMmapBacking::MemFd { idx, generation } = e.backing else {
-            continue;
+    for (idx, e, mut local_hashes) in snap {
+        let fetched = match e.backing {
+            SharedMmapBacking::MemFd {
+                idx: m_idx,
+                generation,
+            } => super::step35_events_cgroup::read_memfd_if_changed(m_idx, generation, e.rev),
+            SharedMmapBacking::MemFs { mount_id, mem_ino } => {
+                super::step33_mounts::read_memfs_if_changed(mount_id, mem_ino, e.rev)
+            }
+            _ => None,
         };
-        let Some((bytes, new_rev)) =
-            super::step35_events_cgroup::read_memfd_if_changed(idx, generation, e.rev)
-        else {
+        let Some((bytes, new_rev)) = fetched else {
             continue;
         };
         let Ok(file_off) = usize::try_from(e.file_offset) else {
@@ -1207,28 +1287,67 @@ fn refresh_shared_memfd_mmaps_inner() {
             continue;
         };
         let copy_len = (bytes.len() - file_off).min(max_bytes);
-        if matches!(
-            super::live_vm::handle_step31_mprotect(e.va_start, e.len, e.orig_prot | PROT_WRITE),
-            Ok(Ok(()))
-        ) {
-            let mut off = 0usize;
-            while off < copy_len {
-                let chunk = (copy_len - off).min(4096);
-                let _ = kernal_usercopy_aarch64::copy_to_user(
-                    e.va_start + off as u64,
-                    &bytes[file_off + off..file_off + off + chunk],
-                );
+        let need_mprotect = (e.orig_prot & PROT_WRITE) == 0;
+        let mut writable_now = !need_mprotect;
+        let mut wrote_any = false;
+        let mut off = 0usize;
+        let mut user_page = [0u8; 4096];
+        let mut mem_page = [0u8; 4096];
+        while off < copy_len {
+            let page_idx = off / 4096;
+            let chunk = (copy_len - off).min(4096);
+            mem_page.fill(0);
+            mem_page[..chunk].copy_from_slice(&bytes[file_off + off..file_off + off + chunk]);
+            let mem_h = page_hash_64(&mem_page);
+            if local_hashes.get(page_idx).copied() == Some(mem_h) {
                 off += chunk;
+                continue;
             }
+            let va = e.va_start + off as u64;
+            let can_overwrite = if let Some(prev_h) = local_hashes.get(page_idx).copied() {
+                user_page.fill(0);
+                kernal_usercopy_aarch64::copy_from_user(&mut user_page[..chunk], va)
+                    .is_ok_and(|()| page_hash_64(&user_page) == prev_h)
+            } else {
+                true
+            };
+            if can_overwrite {
+                if !writable_now {
+                    writable_now = matches!(
+                        super::live_vm::handle_step31_mprotect(
+                            e.va_start,
+                            e.len,
+                            e.orig_prot | PROT_WRITE,
+                        ),
+                        Ok(Ok(()))
+                    );
+                    if !writable_now {
+                        break;
+                    }
+                }
+                if kernal_usercopy_aarch64::copy_to_user(va, &mem_page[..chunk]).is_ok() {
+                    if page_idx < local_hashes.len() {
+                        local_hashes[page_idx] = mem_h;
+                    }
+                    wrote_any = true;
+                }
+            }
+            off += chunk;
+        }
+        if need_mprotect && writable_now {
             let _ = super::live_vm::handle_step31_mprotect(e.va_start, e.len, e.orig_prot);
-            let _ = with_shared_mmaps(|entries| {
-                for slot in entries.iter_mut() {
-                    if slot.live
-                        && slot.process == process
-                        && slot.va_start == e.va_start
-                        && slot.backing == e.backing
-                    {
-                        slot.rev = new_rev;
+        }
+        if wrote_any || new_rev != e.rev {
+            let _ = with_shared_mmap_state(|entries, hashes| {
+                let slot = &mut entries[idx];
+                if slot.live
+                    && slot.process == process
+                    && slot.va_start == e.va_start
+                    && slot.backing == e.backing
+                {
+                    slot.rev = new_rev;
+                    if wrote_any && hashes[idx].len() == local_hashes.len() {
+                        hashes[idx] = local_hashes;
                     }
                 }
             });
@@ -1256,10 +1375,10 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
         None => None,
     };
 
-    let mut snap = [SharedMmapEntry::EMPTY; MAX_SHARED_MMAPS];
-    let mut snap_n = 0usize;
-    let _ = with_shared_mmaps(|entries| {
-        for e in entries.iter_mut() {
+    let mut snap: alloc::vec::Vec<(usize, SharedMmapEntry, alloc::vec::Vec<u64>)> =
+        alloc::vec::Vec::new();
+    let _ = with_shared_mmap_state(|entries, hashes| {
+        for (idx, e) in entries.iter_mut().enumerate() {
             if !e.live || e.process != process {
                 continue;
             }
@@ -1276,27 +1395,43 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
                             SharedMmapBacking::MemFd { .. } | SharedMmapBacking::MemFs { .. }
                         ));
                 if should_flush {
-                    snap[snap_n] = *e;
-                    snap_n += 1;
+                    snap.push((idx, *e, hashes[idx].clone()));
                 }
                 if remove_matched && req_span.is_none() {
                     *e = SharedMmapEntry::EMPTY;
+                    hashes[idx] = alloc::vec::Vec::new();
                 }
             }
         }
     });
 
     let mut page_buf = [0u8; 4096];
-    for e in &snap[..snap_n] {
+    for (idx, e, mut local_hashes) in snap {
         let e_end = e.va_start.saturating_add(e.len);
         let (ov_start, ov_end) = match req_span {
             None => (e.va_start, e_end),
             Some((s, end)) => (e.va_start.max(s), e_end.min(end)),
         };
+        let track_hash = matches!(
+            e.backing,
+            SharedMmapBacking::MemFd { .. } | SharedMmapBacking::MemFs { .. }
+        );
+        let mut hashes_dirty = false;
         let mut va = ov_start;
         while va < ov_end {
             let chunk = usize::try_from(ov_end - va).unwrap_or(4096).min(4096);
+            page_buf.fill(0);
             if kernal_usercopy_aarch64::copy_from_user(&mut page_buf[..chunk], va).is_ok() {
+                let page_idx = usize::try_from((va - e.va_start) / 4096).unwrap_or(0);
+                let h = page_hash_64(&page_buf);
+                if track_hash && local_hashes.get(page_idx).copied() == Some(h) {
+                    va = va.saturating_add(chunk as u64);
+                    continue;
+                }
+                if track_hash && page_idx < local_hashes.len() {
+                    local_hashes[page_idx] = h;
+                    hashes_dirty = true;
+                }
                 let file_off = e.file_offset.saturating_add(va - e.va_start);
                 match e.backing {
                     SharedMmapBacking::MemFs { mount_id, mem_ino } => {
@@ -1309,10 +1444,13 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
                             );
                         }
                     }
-                    SharedMmapBacking::MemFd { idx, generation } => {
+                    SharedMmapBacking::MemFd {
+                        idx: m_idx,
+                        generation,
+                    } => {
                         if let Ok(off_usize) = usize::try_from(file_off) {
                             super::step35_events_cgroup::write_back_memfd_mmap(
-                                idx,
+                                m_idx,
                                 generation,
                                 off_usize,
                                 &page_buf[..chunk],
@@ -1338,11 +1476,24 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
             }
             va = va.saturating_add(chunk as u64);
         }
+        if hashes_dirty && !(remove_matched && req_span.is_none()) {
+            let _ = with_shared_mmap_state(|entries, hashes| {
+                let slot = &mut entries[idx];
+                if slot.live
+                    && slot.process == process
+                    && slot.va_start == e.va_start
+                    && slot.backing == e.backing
+                    && hashes[idx].len() == local_hashes.len()
+                {
+                    hashes[idx] = local_hashes;
+                }
+            });
+        }
     }
 
     if remove_matched && let Some((u_start, u_end)) = req_span {
-        let _ = with_shared_mmaps(|entries| {
-            for e in entries.iter_mut() {
+        let _ = with_shared_mmap_state(|entries, hashes| {
+            for (idx, e) in entries.iter_mut().enumerate() {
                 if !e.live || e.process != process {
                     continue;
                 }
@@ -1352,13 +1503,22 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
                 }
                 if u_start <= e.va_start && u_end >= e_end {
                     *e = SharedMmapEntry::EMPTY;
+                    hashes[idx] = alloc::vec::Vec::new();
                 } else if u_start <= e.va_start {
                     let cut = u_end - e.va_start;
                     e.va_start = u_end;
                     e.len -= cut;
                     e.file_offset = e.file_offset.saturating_add(cut);
+                    let cut_pages = usize::try_from(cut / 4096).unwrap_or(usize::MAX);
+                    if cut_pages < hashes[idx].len() {
+                        hashes[idx].drain(..cut_pages);
+                    } else {
+                        hashes[idx] = alloc::vec::Vec::new();
+                    }
                 } else {
                     e.len = u_start - e.va_start;
+                    let keep_pages = usize::try_from(e.len / 4096).unwrap_or(0);
+                    hashes[idx].truncate(keep_pages);
                 }
             }
         });
@@ -1475,7 +1635,15 @@ fn finish_file_backed_mmap(
         && let Some((backing, writable, rev)) = track_shared_backing
     {
         record_shared_mmap(
-            process, mapped_va, length, offset, backing, writable, protection, rev,
+            process,
+            mapped_va,
+            length,
+            offset,
+            backing,
+            writable,
+            protection,
+            rev,
+            Some(bytes),
         );
     }
     Ok(res)
@@ -1520,9 +1688,14 @@ fn handle_file_backed_mmap(
     }
     match super::step33_mounts::try_read_proc_sys_fd_for_mmap(process, raw_fd, need_write) {
         Ok(Some((file_bytes, mem_opt))) => {
-            let backing = if need_write {
+            let backing = if shared {
                 mem_opt.map(|(mount_id, mem_ino)| {
-                    (SharedMmapBacking::MemFs { mount_id, mem_ino }, true, 0)
+                    let rev = super::step33_mounts::current_memfs_rev(mount_id, mem_ino);
+                    (
+                        SharedMmapBacking::MemFs { mount_id, mem_ino },
+                        need_write,
+                        rev,
+                    )
                 })
             } else {
                 None
@@ -1589,6 +1762,7 @@ fn handle_file_backed_mmap(
                     true,
                     protection,
                     0,
+                    None,
                 );
             }
             return Ok(res);
@@ -1744,10 +1918,12 @@ fn try_handle_mremap_inner(
                     Ok(_) => {}
                     Err(e) => return Ok(Err(e)),
                 }
-                let _ = with_shared_mmaps(|entries| {
-                    for slot in entries.iter_mut() {
+                let _ = with_shared_mmap_state(|entries, hashes| {
+                    for (idx, slot) in entries.iter_mut().enumerate() {
                         if slot.live && slot.process == process && slot.va_start == old_address {
                             slot.len = new_len;
+                            let keep_pages = usize::try_from(new_len / 4096).unwrap_or(0);
+                            hashes[idx].truncate(keep_pages);
                         }
                     }
                 });
@@ -1767,7 +1943,10 @@ fn try_handle_mremap_inner(
             }
             SharedMmapBacking::MemFs { mount_id, mem_ino } => {
                 match super::step33_mounts::read_memfs_for_mremap(mount_id, mem_ino) {
-                    Some(b) => (b, entry.rev),
+                    Some(b) => (
+                        b,
+                        super::step33_mounts::current_memfs_rev(mount_id, mem_ino),
+                    ),
                     None => return Ok(Err(VmError::Linux(Errno::EFAULT))),
                 }
             }
@@ -1805,12 +1984,18 @@ fn try_handle_mremap_inner(
             Ok(_) => {}
             Err(e) => return Ok(Err(e)),
         }
-        let _ = with_shared_mmaps(|entries| {
-            for slot in entries.iter_mut() {
+        let _ = with_shared_mmap_state(|entries, hashes| {
+            for (idx, slot) in entries.iter_mut().enumerate() {
                 if slot.live && slot.process == process && slot.va_start == old_address {
                     slot.va_start = new_va;
                     slot.len = new_len;
                     slot.rev = new_rev;
+                    if matches!(
+                        slot.backing,
+                        SharedMmapBacking::MemFd { .. } | SharedMmapBacking::MemFs { .. }
+                    ) {
+                        hashes[idx] = initial_page_hashes(new_len, slot.file_offset, &bytes);
+                    }
                 }
             }
         });

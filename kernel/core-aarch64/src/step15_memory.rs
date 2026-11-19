@@ -2,16 +2,44 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU8, Ordering};
 use kernal_frame_allocator::{ExtentAllocator, FrameRange, PAGE_SIZE as FRAME_PAGE_SIZE};
 use kernal_memory::ReservationSet;
 use kernal_qemu_initrd_aarch64::{QEMU_VIRT_RAM_BASE, QEMU_VIRT_RAM_BYTES};
 
+const MAX_DYNAMIC_RAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+static DTB_DETECTED_RAM_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Records the validated QEMU `virt` RAM span reported by the DTB `/memory` node.
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "none")),
+    allow(dead_code)
+)]
+pub(super) fn publish_dtb_ram_bytes(bytes: u64) {
+    if bytes >= QEMU_VIRT_RAM_BYTES && bytes.is_multiple_of(FRAME_PAGE_SIZE) {
+        let clamped = bytes.min(MAX_DYNAMIC_RAM_BYTES);
+        let _ = QEMU_VIRT_RAM_BASE.checked_add(clamped).map(|_| {
+            DTB_DETECTED_RAM_BYTES.store(clamped, Ordering::Release);
+        });
+    }
+}
+
+/// Returns the active QEMU physical RAM size in bytes (DTB-detected or 512 MiB baseline).
+pub(super) fn effective_ram_bytes() -> u64 {
+    let detected = DTB_DETECTED_RAM_BYTES.load(Ordering::Acquire);
+    if detected >= QEMU_VIRT_RAM_BYTES && detected.is_multiple_of(FRAME_PAGE_SIZE) {
+        detected
+    } else {
+        QEMU_VIRT_RAM_BYTES
+    }
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_protected_boot_aarch64::ProtectedInitrd;
 
 pub const STEP15_RESERVED_RANGES: usize = 2;
-pub const STEP15_FRAME_EXTENTS: usize = 1024;
+pub const STEP15_FRAME_EXTENTS: usize = 2048;
 pub type Step15FrameAllocator = ExtentAllocator<STEP15_FRAME_EXTENTS>;
 
 const RES_EMPTY: u8 = 0;
@@ -243,16 +271,17 @@ fn build_reservations(
 fn build_live_frame_pool(
     reservations: ReservationSet<STEP15_RESERVED_RANGES>,
 ) -> Result<Step15FramePool, Error> {
+    let ram_bytes = effective_ram_bytes();
     if QEMU_VIRT_RAM_BASE & (FRAME_PAGE_SIZE - 1) != 0
-        || QEMU_VIRT_RAM_BYTES == 0
-        || !QEMU_VIRT_RAM_BYTES.is_multiple_of(FRAME_PAGE_SIZE)
+        || ram_bytes == 0
+        || !ram_bytes.is_multiple_of(FRAME_PAGE_SIZE)
     {
         return Err(Error::InvalidRamContract);
     }
     let ram_end = QEMU_VIRT_RAM_BASE
-        .checked_add(QEMU_VIRT_RAM_BYTES)
+        .checked_add(ram_bytes)
         .ok_or(Error::InvalidRamContract)?;
-    let ram_pages = QEMU_VIRT_RAM_BYTES / FRAME_PAGE_SIZE;
+    let ram_pages = ram_bytes / FRAME_PAGE_SIZE;
 
     let mut allocator = Step15FrameAllocator::new();
     allocator
