@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Qyronex OS — Debian 13 Desktop</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 16px;
+    background: #1e293b;
+    border-bottom: 1px solid #334155;
+    font-size: 13px;
+  }
+  .status { display: flex; align-items: center; gap: 8px; }
+  .dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: #f59e0b;
+  }
+  .dot.ok { background: #22c55e; }
+  .dot.err { background: #ef4444; }
+  main {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 12px;
+    overflow: auto;
+  }
+  canvas {
+    background: #000;
+    border: 1px solid #334155;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    max-width: 100%;
+    max-height: 100%;
+    outline: none;
+    cursor: default;
+  }
+  button {
+    background: #334155; color: #f8fafc; border: 1px solid #475569;
+    padding: 4px 10px; border-radius: 6px; cursor: pointer; font-size: 12px;
+  }
+  button:hover { background: #475569; }
+</style>
+</head>
+<body>
+<header>
+  <div class="status">
+    <span id="dot" class="dot"></span>
+    <span id="statusText">Verbinde mit QEMU WebSocket-VNC …</span>
+  </div>
+  <div style="display:flex; gap:8px; align-items:center;">
+    <span id="resText" style="color:#94a3b8;">–</span>
+    <button id="reconnectBtn" type="button">Neu verbinden</button>
+  </div>
+</header>
+<main>
+  <canvas id="screen" tabindex="0" width="800" height="600"></canvas>
+</main>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const wsPort = params.get("ws") || "6081";
+  const wsUrl = `ws://${location.hostname || "127.0.0.1"}:${wsPort}`;
+  const canvas = document.getElementById("screen");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const dot = document.getElementById("dot");
+  const statusText = document.getElementById("statusText");
+  const resText = document.getElementById("resText");
+
+  let ws = null;
+  let buf = new Uint8Array(0);
+  let state = "version";
+  let fbW = 800, fbH = 600;
+  let imgData = ctx.createImageData(fbW, fbH);
+  let rectsRemaining = 0;
+  let needFull = false;
+  let currentRect = null;
+  let btnMask = 0;
+  let retryTimer = null;
+
+  function setStatus(kind, msg) {
+    dot.className = "dot" + (kind ? " " + kind : "");
+    statusText.textContent = msg;
+  }
+
+  function appendBuf(chunk) {
+    const next = new Uint8Array(buf.length + chunk.length);
+    next.set(buf, 0);
+    next.set(chunk, buf.length);
+    buf = next;
+  }
+
+  function consume(n) {
+    buf = buf.subarray(n);
+  }
+
+  function u16(off) { return (buf[off] << 8) | buf[off + 1]; }
+  function u32(off) { return ((buf[off] << 24) | (buf[off + 1] << 16) | (buf[off + 2] << 8) | buf[off + 3]) >>> 0; }
+  function i32(off) { return (buf[off] << 24) | (buf[off + 1] << 16) | (buf[off + 2] << 8) | buf[off + 3]; }
+
+  function sendBytes(arr) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(new Uint8Array(arr));
+    }
+  }
+
+  function resizeFb(w, h) {
+    fbW = Math.max(1, w);
+    fbH = Math.max(1, h);
+    canvas.width = fbW;
+    canvas.height = fbH;
+    imgData = ctx.createImageData(fbW, fbH);
+    resText.textContent = `${fbW}×${fbH}`;
+  }
+
+  function sendPixelFormatAndEncodings() {
+    // SetPixelFormat: 32bpp, 24-depth, little-endian, true-color BGRX (shift R=16, G=8, B=0)
+    sendBytes([
+      0, 0, 0, 0,
+      32, 24, 0, 1,
+      0, 255, 0, 255, 0, 255,
+      16, 8, 0,
+      0, 0, 0
+    ]);
+    // SetEncodings: Raw (0), DesktopSize (-223 = 0xffffff21)
+    sendBytes([
+      2, 0, 0, 2,
+      0, 0, 0, 0,
+      0xff, 0xff, 0xff, 0x21
+    ]);
+  }
+
+  function requestUpdate(incremental) {
+    sendBytes([
+      3, incremental ? 1 : 0,
+      0, 0, 0, 0,
+      (fbW >> 8) & 0xff, fbW & 0xff,
+      (fbH >> 8) & 0xff, fbH & 0xff
+    ]);
+  }
+
+  function processBuffer() {
+    while (true) {
+      if (state === "version") {
+        if (buf.length < 12) return;
+        consume(12);
+        sendBytes(Array.from("RFB 003.008\n", c => c.charCodeAt(0)));
+        state = "secTypes";
+      } else if (state === "secTypes") {
+        if (buf.length < 1) return;
+        const n = buf[0];
+        if (n === 0) {
+          setStatus("err", "RFB-Fehler vom Server");
+          ws.close();
+          return;
+        }
+        if (buf.length < 1 + n) return;
+        const types = buf.subarray(1, 1 + n);
+        consume(1 + n);
+        if (!types.includes(1)) {
+          setStatus("err", "Server bietet kein Auth=None (Type 1)");
+          ws.close();
+          return;
+        }
+        sendBytes([1]);
+        state = "secResult";
+      } else if (state === "secResult") {
+        if (buf.length < 4) return;
+        const res = u32(0);
+        consume(4);
+        if (res !== 0) {
+          setStatus("err", "VNC-Handshake abgelehnt");
+          ws.close();
+          return;
+        }
+        sendBytes([1]); // ClientInit: shared=1
+        state = "serverInit";
+      } else if (state === "serverInit") {
+        if (buf.length < 24) return;
+        const w = u16(0);
+        const h = u16(2);
+        const nameLen = u32(20);
+        if (buf.length < 24 + nameLen) return;
+        consume(24 + nameLen);
+        resizeFb(w, h);
+        sendPixelFormatAndEncodings();
+        requestUpdate(false);
+        setStatus("ok", "Verbunden (Qyronex / Weston Desktop)");
+        state = "msg";
+      } else if (state === "msg") {
+        if (buf.length < 1) return;
+        const mtype = buf[0];
+        if (mtype === 0) {
+          if (buf.length < 4) return;
+          rectsRemaining = u16(2);
+          consume(4);
+          if (rectsRemaining === 0) {
+            const full = needFull;
+            needFull = false;
+            requestUpdate(!full);
+          } else {
+            state = "rectHdr";
+          }
+        } else if (mtype === 1) {
+          if (buf.length < 6) return;
+          const cnt = u16(4);
+          if (buf.length < 6 + cnt * 6) return;
+          consume(6 + cnt * 6);
+        } else if (mtype === 2) {
+          consume(1);
+        } else if (mtype === 3) {
+          if (buf.length < 8) return;
+          const len = u32(4);
+          if (buf.length < 8 + len) return;
+          consume(8 + len);
+        } else {
+          setStatus("err", `Unbekannte RFB-Nachricht ${mtype}`);
+          ws.close();
+          return;
+        }
+      } else if (state === "rectHdr") {
+        if (buf.length < 12) return;
+        const x = u16(0), y = u16(2), w = u16(4), h = u16(6), enc = i32(8);
+        consume(12);
+        if (enc === -223) {
+          resizeFb(w, h);
+          needFull = true;
+          rectsRemaining--;
+          if (rectsRemaining === 0) {
+            state = "msg";
+            needFull = false;
+            requestUpdate(false);
+          }
+        } else if (enc === 0) {
+          currentRect = { x, y, w, h, need: w * h * 4 };
+          state = "rectRaw";
+        } else {
+          setStatus("err", `Unerwartetes Encoding ${enc}`);
+          ws.close();
+          return;
+        }
+      } else if (state === "rectRaw") {
+        if (buf.length < currentRect.need) return;
+        const { x, y, w, h, need } = currentRect;
+        const dst = imgData.data;
+        let srcOff = 0;
+        for (let row = 0; row < h; row++) {
+          let dstOff = ((y + row) * fbW + x) * 4;
+          for (let col = 0; col < w; col++) {
+            // LE BGRX -> RGBA
+            dst[dstOff]     = buf[srcOff + 2];
+            dst[dstOff + 1] = buf[srcOff + 1];
+            dst[dstOff + 2] = buf[srcOff];
+            dst[dstOff + 3] = 255;
+            srcOff += 4;
+            dstOff += 4;
+          }
+        }
+        consume(need);
+        ctx.putImageData(imgData, 0, 0, x, y, w, h);
+        currentRect = null;
+        rectsRemaining--;
+        if (rectsRemaining === 0) {
+          state = "msg";
+          const full = needFull;
+          needFull = false;
+          requestUpdate(!full);
+        } else {
+          state = "rectHdr";
+        }
+      }
+    }
+  }
+
+  function connect() {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    if (ws) { try { ws.close(); } catch {} }
+    buf = new Uint8Array(0);
+    state = "version";
+    setStatus("", `Verbinde mit ${wsUrl} …`);
+    ws = new WebSocket(wsUrl, ["binary"]);
+    ws.binaryType = "arraybuffer";
+    ws.onmessage = (ev) => {
+      appendBuf(new Uint8Array(ev.data));
+      processBuffer();
+    };
+    ws.onerror = () => setStatus("err", "WebSocket-Fehler — warte auf QEMU …");
+    ws.onclose = () => {
+      setStatus("", "Verbindung getrennt — neuer Versuch in 1.5s …");
+      retryTimer = setTimeout(connect, 1500);
+    };
+  }
+
+  function pointerCoords(ev) {
+    const r = canvas.getBoundingClientRect();
+    const x = Math.max(0, Math.min(fbW - 1, Math.round((ev.clientX - r.left) * (fbW / r.width))));
+    const y = Math.max(0, Math.min(fbH - 1, Math.round((ev.clientY - r.top) * (fbH / r.height))));
+    return [x, y];
+  }
+
+  function sendPointer(ev) {
+    const [x, y] = pointerCoords(ev);
+    sendBytes([5, btnMask, (x >> 8) & 0xff, x & 0xff, (y >> 8) & 0xff, y & 0xff]);
+  }
+
+  canvas.addEventListener("contextmenu", e => e.preventDefault());
+  canvas.addEventListener("mousemove", sendPointer);
+  canvas.addEventListener("mousedown", e => {
+    canvas.focus();
+    const bit = e.button === 0 ? 1 : e.button === 1 ? 2 : e.button === 2 ? 4 : 0;
+    btnMask |= bit;
+    sendPointer(e);
+  });
+  window.addEventListener("mouseup", e => {
+    const bit = e.button === 0 ? 1 : e.button === 1 ? 2 : e.button === 2 ? 4 : 0;
+    btnMask &= ~bit;
+    sendPointer(e);
+  });
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    const bit = e.deltaY < 0 ? 8 : e.deltaY > 0 ? 16 : 0;
+    if (!bit) return;
+    const [x, y] = pointerCoords(e);
+    sendBytes([5, btnMask | bit, (x >> 8) & 0xff, x & 0xff, (y >> 8) & 0xff, y & 0xff]);
+    sendBytes([5, btnMask, (x >> 8) & 0xff, x & 0xff, (y >> 8) & 0xff, y & 0xff]);
+  }, { passive: false });
+
+  const SPECIAL_KEYSYMS = {
+    Backspace: 0xff08, Tab: 0xff09, Enter: 0xff0d, Escape: 0xff1b,
+    Delete: 0xffff, Home: 0xff50, ArrowLeft: 0xff51, ArrowUp: 0xff52,
+    ArrowRight: 0xff53, ArrowDown: 0xff54, PageUp: 0xff55, PageDown: 0xff56,
+    End: 0xff57, Insert: 0xff63,
+    Shift: 0xffe1, Control: 0xffe3, Meta: 0xffe7, Alt: 0xffe9, AltGraph: 0xfe03,
+    CapsLock: 0xffe5,
+    F1: 0xffbe, F2: 0xffbf, F3: 0xffc0, F4: 0xffc1, F5: 0xffc2, F6: 0xffc3,
+    F7: 0xffc4, F8: 0xffc5, F9: 0xffc6, F10: 0xffc7, F11: 0xffc8, F12: 0xffc9,
+  };
+
+  function toKeysym(e) {
+    if (SPECIAL_KEYSYMS[e.key]) return SPECIAL_KEYSYMS[e.key];
+    if (e.key.length === 1) {
+      const cp = e.key.codePointAt(0);
+      if (cp >= 0x20 && cp <= 0xff) return cp;
+      if (cp > 0xff) return 0x01000000 | cp;
+    }
+    return 0;
+  }
+
+  function sendKey(e, down) {
+    const ks = toKeysym(e);
+    if (!ks) return;
+    e.preventDefault();
+    sendBytes([4, down ? 1 : 0, 0, 0, (ks >>> 24) & 0xff, (ks >>> 16) & 0xff, (ks >>> 8) & 0xff, ks & 0xff]);
+  }
+
+  canvas.addEventListener("keydown", e => sendKey(e, true));
+  canvas.addEventListener("keyup", e => sendKey(e, false));
+  document.getElementById("reconnectBtn").addEventListener("click", connect);
+  connect();
+})();
+</script>
+</body>
+</html>
