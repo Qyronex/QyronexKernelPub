@@ -803,13 +803,13 @@ pub(super) fn read_dynamic_input_sysfs_attr(rel_path: &[u8], out: &mut [u8]) -> 
     if is_event_node && tail == b"uevent" {
         let bytes: &[u8] = match (idx, kind) {
             (0, VirtioInputKind::Tablet | VirtioInputKind::Mouse) => {
-                b"MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nID_INPUT=1\nID_INPUT_MOUSE=1\nID_INPUT_TOUCHSCREEN=1\n"
+                b"MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nID_INPUT=1\nID_INPUT_MOUSE=1\n"
             }
             (0, _) => {
                 b"MAJOR=13\nMINOR=64\nDEVNAME=input/event0\nID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\n"
             }
             (_, VirtioInputKind::Tablet | VirtioInputKind::Mouse) => {
-                b"MAJOR=13\nMINOR=65\nDEVNAME=input/event1\nID_INPUT=1\nID_INPUT_MOUSE=1\nID_INPUT_TOUCHSCREEN=1\n"
+                b"MAJOR=13\nMINOR=65\nDEVNAME=input/event1\nID_INPUT=1\nID_INPUT_MOUSE=1\n"
             }
             (_, _) => {
                 b"MAJOR=13\nMINOR=65\nDEVNAME=input/event1\nID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\n"

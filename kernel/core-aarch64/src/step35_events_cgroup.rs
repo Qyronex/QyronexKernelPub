@@ -15,7 +15,8 @@ use kernal_linux_cgroup::{
     PR_SET_NAME, PR_SET_NO_NEW_PRIVS, ProcessSecurityState,
 };
 use kernal_linux_events::{
-    CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, EpollEvent, EventTable, F_ADD_SEALS, F_GET_SEALS,
+    CLOSE_RANGE_CLOEXEC, CLOSE_RANGE_UNSHARE, EPOLL_CTL_DEL, EpollEvent, EventTable, F_ADD_SEALS,
+    F_GET_SEALS,
 };
 use kernal_linux_fd::{ExternalObject, OpenObjectKind, SubsystemHandle};
 use kernal_linux_pipe::End as PipeEnd;
@@ -907,11 +908,30 @@ fn handle_epoll_ctl(
         None
     };
     let process = slot_process_id();
+    let aliased_target = if op != EPOLL_CTL_DEL
+        && !is_event_fd(raw_fd)
+        && let Some(handle) = lookup_aliased_subsystem(process, raw_fd)
+        && handle.kind == SUBSYS_EVENT
+    {
+        Some((usize::from(handle.slot), handle.generation))
+    } else {
+        None
+    };
     with_step35_state(|state| {
         state.check_slot(process, ep_idx, alias_gen)?;
+        let internal_slot = if op == EPOLL_CTL_DEL {
+            None
+        } else if is_event_fd(raw_fd) {
+            Some((target_fd - EVENT_FD_BASE) as usize)
+        } else if let Some((idx, target_gen)) = aliased_target {
+            state.check_slot(process, idx, Some(target_gen))?;
+            Some(idx)
+        } else {
+            None
+        };
         state
             .events
-            .epoll_ctl(ep_idx, op, target_fd, ev)
+            .epoll_ctl_with_slot(ep_idx, op, target_fd, internal_slot, ev)
             .map(|()| 0)
     })
 }

@@ -197,7 +197,7 @@
         resizeFb(w, h);
         sendPixelFormatAndEncodings();
         requestUpdate(false);
-        setStatus("ok", "Verbunden (Qyronex / Weston Desktop)");
+        setStatus("ok", "Verbunden (Qyronex Desktop)");
         state = "msg";
       } else if (state === "msg") {
         if (buf.length < 1) return;

@@ -128,6 +128,7 @@ impl EpollEvent {
 pub struct EpollWatch {
     live: bool,
     target_fd: i32,
+    internal_slot: Option<u16>,
     events: u32,
     data: u64,
     armed: bool,
@@ -138,6 +139,7 @@ impl EpollWatch {
     const EMPTY: Self = Self {
         live: false,
         target_fd: -1,
+        internal_slot: None,
         events: 0,
         data: 0,
         armed: false,
@@ -291,9 +293,27 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         target_fd: i32,
         event: Option<EpollEvent>,
     ) -> Result<(), Errno> {
+        self.epoll_ctl_with_slot(epfd_idx, op, target_fd, None, event)
+    }
+
+    /// Adds, modifies, or deletes an `epoll` watch while optionally binding an aliased internal
+    /// event-table slot (for example a `dup`/`fcntl(F_DUPFD_CLOEXEC)` copy of an `epoll`,
+    /// `eventfd`, `timerfd`, `signalfd`, `inotify`, or `pidfd` descriptor below `fd_base`).
+    pub fn epoll_ctl_with_slot(
+        &mut self,
+        epfd_idx: usize,
+        op: u32,
+        target_fd: i32,
+        internal_slot: Option<usize>,
+        event: Option<EpollEvent>,
+    ) -> Result<(), Errno> {
         if target_fd < 0 {
             return Err(Errno::EBADF);
         }
+        if matches!(op, EPOLL_CTL_ADD | EPOLL_CTL_MOD) && internal_slot == Some(epfd_idx) {
+            return Err(Errno::EINVAL);
+        }
+        let resolved_slot = internal_slot.and_then(|s| u16::try_from(s).ok());
         let slot = self.slots.get_mut(epfd_idx).ok_or(Errno::EBADF)?;
         let EventObject::Epoll { watches, .. } = slot else {
             return Err(Errno::EINVAL);
@@ -308,6 +328,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
                 *free = EpollWatch {
                     live: true,
                     target_fd,
+                    internal_slot: resolved_slot,
                     events: ev.events,
                     data: ev.data,
                     armed: true,
@@ -321,6 +342,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
                     .iter_mut()
                     .find(|w| w.live && w.target_fd == target_fd)
                     .ok_or(Errno::ENOENT)?;
+                existing.internal_slot = resolved_slot;
                 existing.events = ev.events;
                 existing.data = ev.data;
                 existing.armed = true;
@@ -339,20 +361,33 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         }
     }
 
+    fn watch_internal_slot(&self, w: &EpollWatch, fd_base: i32) -> Option<usize> {
+        if let Some(slot) = w.internal_slot {
+            let idx = usize::from(slot);
+            if idx < MAX_FDS {
+                return Some(idx);
+            }
+        }
+        if w.target_fd >= fd_base && (w.target_fd - fd_base) < (MAX_FDS as i32) {
+            return Some((w.target_fd - fd_base) as usize);
+        }
+        None
+    }
+
     fn collect_external_fds_inner(
         &self,
         epfd_idx: usize,
         fd_base: i32,
         depth: usize,
-        visited_mask: &mut u64,
+        visited_mask: &mut u128,
         out: &mut [i32],
         out_len: &mut usize,
     ) {
         if depth >= 4 || epfd_idx >= MAX_FDS {
             return;
         }
-        if epfd_idx < 64 {
-            let bit = 1u64 << epfd_idx;
+        if epfd_idx < 128 {
+            let bit = 1u128 << epfd_idx;
             if (*visited_mask & bit) != 0 {
                 return;
             }
@@ -365,9 +400,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
             if !w.live || !w.armed {
                 continue;
             }
-            let fd = w.target_fd;
-            if fd >= fd_base && (fd - fd_base) < (MAX_FDS as i32) {
-                let target_idx = (fd - fd_base) as usize;
+            if let Some(target_idx) = self.watch_internal_slot(w, fd_base) {
                 if matches!(self.slots.get(target_idx), Some(EventObject::Epoll { .. })) {
                     self.collect_external_fds_inner(
                         target_idx,
@@ -378,8 +411,8 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
                         out_len,
                     );
                 }
-            } else if !out[..*out_len].contains(&fd) && *out_len < out.len() {
-                out[*out_len] = fd;
+            } else if !out[..*out_len].contains(&w.target_fd) && *out_len < out.len() {
+                out[*out_len] = w.target_fd;
                 *out_len += 1;
             }
         }
@@ -394,7 +427,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
         fd_base: i32,
         out: &mut [i32],
     ) -> usize {
-        let mut visited_mask = 0u64;
+        let mut visited_mask = 0u128;
         let mut count = 0usize;
         self.collect_external_fds_inner(epfd_idx, fd_base, 0, &mut visited_mask, out, &mut count);
         count
@@ -410,8 +443,7 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
     where
         F: Fn(i32) -> u32,
     {
-        let ready_mask = if w.target_fd >= fd_base && (w.target_fd - fd_base) < (MAX_FDS as i32) {
-            let target_idx = (w.target_fd - fd_base) as usize;
+        let ready_mask = if let Some(target_idx) = self.watch_internal_slot(w, fd_base) {
             self.slot_readiness_with(target_idx, fd_base, depth, external_readiness)
         } else {
             external_readiness(w.target_fd)
@@ -545,10 +577,14 @@ impl<const MAX_FDS: usize, const MEMFD_CAP: usize> EventTable<MAX_FDS, MEMFD_CAP
     /// the inner `epoll` instance has drained to unready so subsequent wakeups re-trigger `EPOLLET`.
     pub fn clear_parent_epoll_edge_bits(&mut self, child_epfd_idx: usize, fd_base: i32, bits: u32) {
         let target_fd = fd_base + (child_epfd_idx as i32);
+        let child_u16 = u16::try_from(child_epfd_idx).ok();
         for slot in &mut self.slots {
             if let EventObject::Epoll { watches, .. } = slot {
                 for w in watches {
-                    if w.live && w.target_fd == target_fd {
+                    if w.live
+                        && (w.target_fd == target_fd
+                            || (child_u16.is_some() && w.internal_slot == child_u16))
+                    {
                         w.last_edge_mask &= !bits;
                     }
                 }
@@ -1543,5 +1579,106 @@ mod tests {
         );
         assert_eq!(evs[0].data, 11);
         assert_eq!(fds[0], mountinfo_fd);
+    }
+
+    #[test]
+    fn aliased_nested_epoll_and_eventfd_watches_propagate_external_readiness() {
+        let mut table = EventTable::<8, 64>::new();
+        let outer = table.epoll_create1(0).unwrap();
+        let inner = table.epoll_create1(0).unwrap();
+        let efd = table.eventfd2(0, 0).unwrap();
+        let fd_base = 672;
+        let ext_input_fd = 11;
+        let aliased_inner_fd = 13;
+        let aliased_efd_fd = 15;
+
+        // Inner epoll watches external descriptor (e.g. /dev/input/event0 at fd 11).
+        table
+            .epoll_ctl(
+                inner,
+                EPOLL_CTL_ADD,
+                ext_input_fd,
+                Some(EpollEvent {
+                    events: EPOLLIN,
+                    data: 101,
+                }),
+            )
+            .unwrap();
+        // Outer epoll watches duplicated inner epoll (fd 13 < fd_base) with EPOLLET and duplicated eventfd (fd 15 < fd_base).
+        table
+            .epoll_ctl_with_slot(
+                outer,
+                EPOLL_CTL_ADD,
+                aliased_inner_fd,
+                Some(inner),
+                Some(EpollEvent {
+                    events: EPOLLIN | EPOLLET,
+                    data: 202,
+                }),
+            )
+            .unwrap();
+        table
+            .epoll_ctl_with_slot(
+                outer,
+                EPOLL_CTL_ADD,
+                aliased_efd_fd,
+                Some(efd),
+                Some(EpollEvent {
+                    events: EPOLLIN,
+                    data: 303,
+                }),
+            )
+            .unwrap();
+
+        let mut ext = [0i32; 8];
+        let ext_n = table.collect_epoll_external_fds(outer, fd_base, &mut ext);
+        assert_eq!(&ext[..ext_n], &[ext_input_fd]);
+
+        let mut evs = [EpollEvent { events: 0, data: 0 }; 4];
+        let mut fds = [0i32; 4];
+        assert_eq!(
+            table
+                .epoll_wait_with_fds(outer, fd_base, |_| 0, &mut evs, &mut fds)
+                .unwrap(),
+            0
+        );
+
+        // Trigger external input + eventfd -> outer wakes up with both!
+        table.write(efd, &1u64.to_le_bytes()).unwrap();
+        let n = table
+            .epoll_wait_with_fds(
+                outer,
+                fd_base,
+                |fd| if fd == ext_input_fd { EPOLLIN } else { 0 },
+                &mut evs,
+                &mut fds,
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(evs[0].data, 202);
+        assert_eq!(evs[1].data, 303);
+
+        // Drain eventfd and drain inner epoll -> EPOLLET edge on aliased inner epoll clears cleanly.
+        let mut buf8 = [0u8; 8];
+        table.read(efd, &mut buf8).unwrap();
+        assert_eq!(
+            table
+                .epoll_wait_with_fds(inner, fd_base, |_| 0, &mut evs, &mut fds)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            table
+                .epoll_wait_with_fds(
+                    outer,
+                    fd_base,
+                    |fd| if fd == ext_input_fd { EPOLLIN } else { 0 },
+                    &mut evs,
+                    &mut fds,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(evs[0].data, 202);
     }
 }
