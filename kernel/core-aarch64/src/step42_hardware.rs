@@ -22,6 +22,7 @@ use kernal_linux_hardware::{
 };
 use kernal_linux_mounts::{BlockDevice, PartitionTable, parse_partitions};
 use kernal_protected_boot_aarch64::{ProtectedVirtioMmioMap, runtime_kernel_alias_physical};
+use kernal_rpi3b_plus::Rpi3bPlusBoard;
 use kernal_virtio::blk::VIRTIO_BLK_F_FLUSH;
 use kernal_virtio::{
     DmaBufferGrant, SECTOR_SIZE, VIRTIO_F_VERSION_1, VirtioBlkDevice, VirtioBlkDmaBlock,
@@ -74,6 +75,14 @@ enum HwNodeKind {
     SysCpuOnline,
     SysCpuPossible,
     SysVirtioMmioCount,
+    SysRpiModel,
+    SysRpiRevision,
+    SysRpiArmClock,
+    SysRpiLan7515Speed,
+    SysRpiActLed,
+    SysRpi4GenetV5,
+    SysRpi5Rp1Pcie,
+    SysPcieInternetStatus,
 }
 
 impl HwNodeKind {
@@ -86,7 +95,10 @@ impl HwNodeKind {
     }
 
     const fn is_writable(self) -> bool {
-        matches!(self, Self::DevWatchdog | Self::DevVda | Self::DevVdaPart(_))
+        matches!(
+            self,
+            Self::DevWatchdog | Self::DevVda | Self::DevVdaPart(_) | Self::SysRpiActLed
+        )
     }
 
     const fn block_part_number(self) -> Option<u8> {
@@ -356,6 +368,9 @@ struct Step42State {
     bootargs: [u8; 256],
     bootargs_len: usize,
     discovered_virtio_mmio: usize,
+    rpi3b_plus: Rpi3bPlusBoard<4, 2>,
+    rpi4b: kernal_linux_hardware::Rpi4BBoard<4, 2>,
+    rpi5: kernal_linux_hardware::Rpi5Board<2>,
     next_fd_generation: u64,
     fds: [HwFdSlot; MAX_HW_FDS],
 }
@@ -380,6 +395,9 @@ impl Step42State {
             bootargs: [0; 256],
             bootargs_len: 0,
             discovered_virtio_mmio: 0,
+            rpi3b_plus: Rpi3bPlusBoard::new(),
+            rpi4b: kernal_linux_hardware::Rpi4BBoard::new(),
+            rpi5: kernal_linux_hardware::Rpi5Board::new(),
             next_fd_generation: 1,
             fds: [HwFdSlot::EMPTY; MAX_HW_FDS],
         }
@@ -395,6 +413,9 @@ impl Step42State {
             ]);
             self.virtio_blk =
                 VirtioBlkDevice::<16, 16>::new(VIRTIO_F_VERSION_1 | VIRTIO_BLK_F_FLUSH).ok();
+            let _ = self.rpi3b_plus.initialize_board(HW_ADMIN_CAP);
+            self.rpi4b.initialize_board();
+            self.rpi5.initialize_board();
             self.initialized = true;
         }
     }
@@ -600,6 +621,12 @@ pub(super) fn init_from_protected_virtio(map: &ProtectedVirtioMmioMap) -> Result
 /// Returns the base UNIX epoch seconds configured on the platform PL031 RTC.
 pub(super) fn rtc_epoch_base_seconds() -> u64 {
     with_step42_state(|state| u64::from(state.rtc.dr_seconds)).unwrap_or(1_784_000_000)
+}
+
+/// Returns whether the Raspberry Pi 3B+ (`BCM2837B0`) driver suite is initialized.
+#[allow(dead_code)]
+pub(super) fn has_rpi3b_plus_drivers() -> bool {
+    with_step42_state(|state| state.rpi3b_plus.initialized).unwrap_or(false)
 }
 
 /// Returns whether a real VirtIO-MMIO network device (`virtio-net`) is initialized.
@@ -866,6 +893,14 @@ fn node_path_bytes(kind: HwNodeKind, buf: &mut [u8; 40]) -> &[u8] {
         HwNodeKind::SysCpuOnline => b"/sys/devices/system/cpu/online",
         HwNodeKind::SysCpuPossible => b"/sys/devices/system/cpu/possible",
         HwNodeKind::SysVirtioMmioCount => b"/sys/bus/virtio/devices/mmio_count",
+        HwNodeKind::SysRpiModel => b"/sys/firmware/devicetree/base/model",
+        HwNodeKind::SysRpiRevision => b"/sys/bus/platform/drivers/bcm2837/board_revision",
+        HwNodeKind::SysRpiArmClock => b"/sys/bus/platform/drivers/bcm2837/arm_clock_hz",
+        HwNodeKind::SysRpiLan7515Speed => b"/sys/bus/platform/drivers/lan7515/link_speed",
+        HwNodeKind::SysRpiActLed => b"/sys/class/leds/ACT/brightness",
+        HwNodeKind::SysRpi4GenetV5 => b"/sys/bus/platform/drivers/bcm2711/genet_v5",
+        HwNodeKind::SysRpi5Rp1Pcie => b"/sys/bus/platform/drivers/bcm2712/rp1_pcie",
+        HwNodeKind::SysPcieInternetStatus => b"/sys/bus/pci/drivers/pcie_nic/status",
     }
 }
 
@@ -1098,6 +1133,14 @@ fn match_hw_path(state: &Step42State, path: &[u8]) -> Option<HwNodeKind> {
         b"/sys/devices/system/cpu/online" => Some(HwNodeKind::SysCpuOnline),
         b"/sys/devices/system/cpu/possible" => Some(HwNodeKind::SysCpuPossible),
         b"/sys/bus/virtio/devices/mmio_count" => Some(HwNodeKind::SysVirtioMmioCount),
+        b"/sys/firmware/devicetree/base/model" => Some(HwNodeKind::SysRpiModel),
+        b"/sys/bus/platform/drivers/bcm2837/board_revision" => Some(HwNodeKind::SysRpiRevision),
+        b"/sys/bus/platform/drivers/bcm2837/arm_clock_hz" => Some(HwNodeKind::SysRpiArmClock),
+        b"/sys/bus/platform/drivers/lan7515/link_speed" => Some(HwNodeKind::SysRpiLan7515Speed),
+        b"/sys/class/leds/ACT/brightness" => Some(HwNodeKind::SysRpiActLed),
+        b"/sys/bus/platform/drivers/bcm2711/genet_v5" => Some(HwNodeKind::SysRpi4GenetV5),
+        b"/sys/bus/platform/drivers/bcm2712/rp1_pcie" => Some(HwNodeKind::SysRpi5Rp1Pcie),
+        b"/sys/bus/pci/drivers/pcie_nic/status" => Some(HwNodeKind::SysPcieInternetStatus),
         _ => None,
     }
 }
@@ -1376,6 +1419,50 @@ fn materialize_sysfs(state: &Step42State, kind: HwNodeKind, out: &mut [u8; 64]) 
             }
         }
         HwNodeKind::SysVirtioMmioCount => format_u64_line(state.discovered_virtio_mmio as u64, out),
+        HwNodeKind::SysRpiModel => {
+            let s = b"Raspberry Pi 3 Model B Plus Rev 1.3\n";
+            out[..s.len()].copy_from_slice(s);
+            s.len()
+        }
+        HwNodeKind::SysRpiRevision => {
+            let s = b"00a020d3\n";
+            out[..s.len()].copy_from_slice(s);
+            s.len()
+        }
+        HwNodeKind::SysRpiArmClock => {
+            format_u64_line(u64::from(state.rpi3b_plus.mailbox.arm_clock_hz), out)
+        }
+        HwNodeKind::SysRpiLan7515Speed => {
+            format_u64_line(u64::from(state.rpi3b_plus.lan7515_nic.speed_mbps), out)
+        }
+        HwNodeKind::SysRpiActLed => {
+            let on = state.rpi3b_plus.gpio.act_led_is_on();
+            format_u64_line(u64::from(on), out)
+        }
+        HwNodeKind::SysRpi4GenetV5 => {
+            let s = if state.rpi4b.genet_v5.link_up && state.rpi4b.pcie_rc.vl805_enumerated {
+                b"bcm2711-genet-v5:1000Mbps pcie-vl805:1106:3483\n".as_slice()
+            } else {
+                b"down\n".as_slice()
+            };
+            out[..s.len()].copy_from_slice(s);
+            s.len()
+        }
+        HwNodeKind::SysRpi5Rp1Pcie => {
+            let s = if state.rpi5.rp1.enumerated && state.rpi5.rp1.eth_gem.link_up {
+                b"rp1-pcie:1de4:0001-gen2x4 gem:1000Mbps xhci:2\n".as_slice()
+            } else {
+                b"down\n".as_slice()
+            };
+            out[..s.len()].copy_from_slice(s);
+            s.len()
+        }
+        HwNodeKind::SysPcieInternetStatus => {
+            let s = b"ipv4=10.0.2.15/24 gw=10.0.2.2 dns=10.0.2.3 nics=e1000e,igc,virtio_net,bcmgenet,macb_rp1\n";
+            let take = s.len().min(out.len());
+            out[..take].copy_from_slice(&s[..take]);
+            take
+        }
         _ => 0,
     }
 }
@@ -1443,6 +1530,29 @@ fn write_slot_slice(
             copy_from_user(&mut tmp[..take], user_buf)?;
             state.watchdog.write_ping(HW_ADMIN_CAP, &tmp[..take])?;
             Ok(take)
+        }
+        HwNodeKind::SysRpiActLed => {
+            if !slot.grant_rw {
+                return Err(Errno::EACCES);
+            }
+            let mut tmp = [0u8; 8];
+            let take = count.min(tmp.len());
+            if take == 0 {
+                return Ok(0);
+            }
+            copy_from_user(&mut tmp[..take], user_buf)?;
+            let on = tmp[0] != b'0';
+            state
+                .rpi3b_plus
+                .gpio
+                .set_act_led(HW_ADMIN_CAP, on)
+                .map_err(|e| e.to_errno())?;
+            let _ = state.rpi3b_plus.mmio_hal.mmio_gpio_write_pin(
+                HW_ADMIN_CAP,
+                kernal_rpi3b_plus::RPI3B_PLUS_ACT_LED_PIN,
+                on,
+            );
+            Ok(count)
         }
         kind if kind.block_part_number().is_some() => {
             if !slot.grant_rw {

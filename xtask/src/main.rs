@@ -32,6 +32,7 @@ const HOST_TEST_PACKAGES: &[&str] = &[
     "kernal-memory-map",
     "kernal-transition-x86-64",
     "kernal-pci",
+    "kernal-rpi3b-plus",
     "kernal-acpi",
     "kernal-acpi-fadt",
     "kernal-acpi-fadt-physical",

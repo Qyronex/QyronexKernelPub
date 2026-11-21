@@ -10,10 +10,21 @@
 //!   cryptographic hardware entropy accumulator.
 
 pub mod nic;
+pub use kernal_rpi3b_plus::{Rpi4BBoard, Rpi5Board};
+pub use nic::{InternetEndpointState, PciNicModel};
 pub mod platform;
 pub mod storage;
 pub mod usb;
 
+pub use kernal_rpi3b_plus as rpi3b_plus;
+pub use kernal_rpi3b_plus::{
+    BCM2837_ARM_LOCAL_BASE, BCM2837_PERIPHERAL_BASE, Bcm2837ArasanSdhci, Bcm2837ArmCtrlIc,
+    Bcm2837BscI2c, Bcm2837Dwc2UsbHost, Bcm2837Gpio, Bcm2837HwRng, Bcm2837PmWatchdog, Bcm2837Spi0,
+    Bcm2837SysTimer, LAN7515_CHIP_ID_REV, LAN7515_USB_PRODUCT_ID, LAN7515_USB_VENDOR_ID,
+    Lan7515GigabitNic, MiniUart1, Pl011Uart0, Qa7LocalIntc, RPI3B_PLUS_BOARD_REVISION,
+    RPI3B_PLUS_MODEL_STRING, Rpi3bPlusBoard, Rpi3bPlusMmioHal, RpiError, RpiMmioBus,
+    SimulatedRpiMmioBus, VideoCoreMailbox, VolatileRpiMmioBus,
+};
 pub use nic::{NicConfig, NicError, WiredEthernetNic};
 pub use platform::{
     HardwareEntropyPool, PlatformTelemetry, RTC_AIE_OFF, RTC_AIE_ON, RTC_ALM_READ, RTC_ALM_SET,
@@ -243,5 +254,22 @@ mod tests {
         assert!(pool.is_seeded());
         pool.fill_bytes(&mut rnd).unwrap();
         assert_ne!(rnd, [0u8; 32]);
+    }
+
+    #[test]
+    fn raspberry_pi_3b_plus_board_driver_suite_integrates_with_hardware_layer() {
+        let cap_rw = Capability {
+            object: ObjectId(44),
+            rights: CapRights::CONTROL
+                .union(CapRights::READ)
+                .union(CapRights::WRITE),
+        };
+        let mut rpi = Rpi3bPlusBoard::<8, 4>::new();
+        rpi.initialize_board(cap_rw).unwrap();
+        assert!(rpi.initialized);
+        assert_eq!(rpi.mailbox.board_revision, RPI3B_PLUS_BOARD_REVISION);
+        assert_eq!(rpi.lan7515_nic.chip_id_rev, LAN7515_CHIP_ID_REV);
+        assert_eq!(rpi.lan7515_nic.speed_mbps, 1000);
+        assert!(rpi.gpio.act_led_is_on());
     }
 }

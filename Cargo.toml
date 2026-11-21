@@ -14,6 +14,7 @@ members = [
     "boot/transition-x86_64",
     "boot/uefi",
     "drivers/pci",
+    "drivers/rpi3b-plus",
     "drivers/virtio",
     "firmware/acpi",
     "firmware/acpi-fadt",

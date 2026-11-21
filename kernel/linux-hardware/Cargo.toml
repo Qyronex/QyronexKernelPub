@@ -14,4 +14,5 @@ kernal-iommu = { path = "../iommu" }
 kernal-linux-abi = { path = "../../abi/linux" }
 kernal-linux-systemd = { path = "../linux-systemd" }
 kernal-pci = { path = "../../drivers/pci" }
+kernal-rpi3b-plus = { path = "../../drivers/rpi3b-plus" }
 kernal-virtio = { path = "../../drivers/virtio" }

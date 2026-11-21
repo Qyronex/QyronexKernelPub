@@ -44,6 +44,400 @@ impl FeatureLeaves {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CpuVendor {
+    Intel,
+    Amd,
+    #[default]
+    Unknown,
+}
+
+impl CpuVendor {
+    #[must_use]
+    pub const fn from_cpuid0(ebx: u32, edx: u32, ecx: u32) -> Self {
+        let b0 = ebx.to_le_bytes();
+        let b1 = edx.to_le_bytes();
+        let b2 = ecx.to_le_bytes();
+        let vendor = [
+            b0[0], b0[1], b0[2], b0[3], b1[0], b1[1], b1[2], b1[3], b2[0], b2[1], b2[2], b2[3],
+        ];
+        if matches!(&vendor, b"GenuineIntel") {
+            Self::Intel
+        } else if matches!(&vendor, b"AuthenticAMD") {
+            Self::Amd
+        } else {
+            Self::Unknown
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Intel => "GenuineIntel",
+            Self::Amd => "AuthenticAMD",
+            Self::Unknown => "UnknownX86_64",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CpuFamilyModel {
+    pub stepping: u8,
+    pub base_model: u8,
+    pub base_family: u8,
+    pub extended_model: u8,
+    pub extended_family: u8,
+}
+
+impl CpuFamilyModel {
+    #[must_use]
+    pub const fn from_leaf1_eax(eax: u32) -> Self {
+        Self {
+            stepping: (eax & 0x0F) as u8,
+            base_model: ((eax >> 4) & 0x0F) as u8,
+            base_family: ((eax >> 8) & 0x0F) as u8,
+            extended_model: ((eax >> 16) & 0x0F) as u8,
+            extended_family: ((eax >> 20) & 0xFF) as u8,
+        }
+    }
+
+    #[must_use]
+    pub const fn display_family(self) -> u16 {
+        if self.base_family == 0x0F {
+            self.base_family as u16 + self.extended_family as u16
+        } else {
+            self.base_family as u16
+        }
+    }
+
+    #[must_use]
+    pub const fn display_model(self) -> u8 {
+        if self.base_family == 0x06 || self.base_family == 0x0F {
+            (self.extended_model << 4) | self.base_model
+        } else {
+            self.base_model
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessorLeaves {
+    pub leaf0_eax: u32,
+    pub leaf0_ebx: u32,
+    pub leaf0_ecx: u32,
+    pub leaf0_edx: u32,
+    pub leaf1_eax: u32,
+    pub leaf1_ecx: u32,
+    pub leaf1_edx: u32,
+    pub leaf7_ebx: u32,
+    pub leaf7_ecx: u32,
+    pub ext0_eax: u32,
+    pub ext1_ecx: u32,
+    pub ext1_edx: u32,
+    pub ext7_edx: u32,
+    pub ext8_eax: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExtendedCpuFeatures {
+    pub sse2: bool,
+    pub sse3: bool,
+    pub ssse3: bool,
+    pub sse4_1: bool,
+    pub sse4_2: bool,
+    pub popcnt: bool,
+    pub aesni: bool,
+    pub xsave: bool,
+    pub osxsave: bool,
+    pub avx: bool,
+    pub avx2: bool,
+    pub pcid: bool,
+    pub invpcid: bool,
+    pub fsgsbase: bool,
+    pub rdrand: bool,
+    pub rdseed: bool,
+    pub umip: bool,
+    pub vmx: bool,
+    pub svm: bool,
+    pub syscall_sysret: bool,
+    pub lahf_lm: bool,
+    pub abm_lzcnt: bool,
+    pub sse4a: bool,
+    pub topoext: bool,
+    pub page1gb: bool,
+    pub physical_address_bits: u8,
+    pub linear_address_bits: u8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProcessorProfile {
+    pub vendor: CpuVendor,
+    pub family_model: CpuFamilyModel,
+    pub core_features: CpuFeatures,
+    pub extended: ExtendedCpuFeatures,
+}
+
+impl ProcessorProfile {
+    #[must_use]
+    pub const fn from_leaves(leaves: ProcessorLeaves) -> Self {
+        let vendor = CpuVendor::from_cpuid0(leaves.leaf0_ebx, leaves.leaf0_edx, leaves.leaf0_ecx);
+        let family_model = CpuFamilyModel::from_leaf1_eax(leaves.leaf1_eax);
+        let core_features = CpuFeatures::from_leaves(FeatureLeaves {
+            leaf1_ecx: leaves.leaf1_ecx,
+            leaf7_ebx: leaves.leaf7_ebx,
+            ext1_edx: leaves.ext1_edx,
+            ext7_edx: leaves.ext7_edx,
+        });
+        let phys_bits = (leaves.ext8_eax & 0xFF) as u8;
+        let lin_bits = ((leaves.ext8_eax >> 8) & 0xFF) as u8;
+        let extended = ExtendedCpuFeatures {
+            sse2: (leaves.leaf1_edx & (1 << 26)) != 0,
+            sse3: (leaves.leaf1_ecx & (1 << 0)) != 0,
+            ssse3: (leaves.leaf1_ecx & (1 << 9)) != 0,
+            sse4_1: (leaves.leaf1_ecx & (1 << 19)) != 0,
+            sse4_2: (leaves.leaf1_ecx & (1 << 20)) != 0,
+            popcnt: (leaves.leaf1_ecx & (1 << 23)) != 0,
+            aesni: (leaves.leaf1_ecx & (1 << 25)) != 0,
+            xsave: (leaves.leaf1_ecx & (1 << 26)) != 0,
+            osxsave: (leaves.leaf1_ecx & (1 << 27)) != 0,
+            avx: (leaves.leaf1_ecx & (1 << 28)) != 0,
+            avx2: (leaves.leaf7_ebx & (1 << 5)) != 0,
+            pcid: (leaves.leaf1_ecx & (1 << 17)) != 0,
+            invpcid: (leaves.leaf7_ebx & (1 << 10)) != 0,
+            fsgsbase: (leaves.leaf7_ebx & (1 << 0)) != 0,
+            rdrand: (leaves.leaf1_ecx & (1 << 30)) != 0,
+            rdseed: (leaves.leaf7_ebx & (1 << 18)) != 0,
+            umip: (leaves.leaf7_ecx & (1 << 2)) != 0,
+            vmx: (leaves.leaf1_ecx & (1 << 5)) != 0,
+            svm: (leaves.ext1_ecx & (1 << 2)) != 0,
+            syscall_sysret: (leaves.ext1_edx & (1 << 11)) != 0,
+            lahf_lm: (leaves.ext1_ecx & (1 << 0)) != 0,
+            abm_lzcnt: (leaves.ext1_ecx & (1 << 5)) != 0,
+            sse4a: (leaves.ext1_ecx & (1 << 6)) != 0,
+            topoext: (leaves.ext1_ecx & (1 << 22)) != 0,
+            page1gb: (leaves.ext1_edx & (1 << 26)) != 0,
+            physical_address_bits: if phys_bits == 0 { 36 } else { phys_bits },
+            linear_address_bits: if lin_bits == 0 { 48 } else { lin_bits },
+        };
+
+        Self {
+            vendor,
+            family_model,
+            core_features,
+            extended,
+        }
+    }
+
+    #[must_use]
+    pub const fn supports_hardware_virtualization(self) -> bool {
+        self.extended.vmx || self.extended.svm
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[must_use]
+    pub fn detect() -> Self {
+        use core::arch::x86_64::{__cpuid, __cpuid_count};
+
+        let leaf0 = __cpuid(0);
+        let leaf1 = if leaf0.eax >= 1 {
+            __cpuid(1)
+        } else {
+            core::arch::x86_64::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            }
+        };
+        let leaf7 = if leaf0.eax >= 7 {
+            __cpuid_count(7, 0)
+        } else {
+            core::arch::x86_64::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            }
+        };
+        let ext0 = __cpuid(0x8000_0000);
+        let ext1 = if ext0.eax >= 0x8000_0001 {
+            __cpuid(0x8000_0001)
+        } else {
+            core::arch::x86_64::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            }
+        };
+        let ext7 = if ext0.eax >= 0x8000_0007 {
+            __cpuid(0x8000_0007)
+        } else {
+            core::arch::x86_64::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            }
+        };
+        let ext8 = if ext0.eax >= 0x8000_0008 {
+            __cpuid(0x8000_0008)
+        } else {
+            core::arch::x86_64::CpuidResult {
+                eax: 0,
+                ebx: 0,
+                ecx: 0,
+                edx: 0,
+            }
+        };
+
+        Self::from_leaves(ProcessorLeaves {
+            leaf0_eax: leaf0.eax,
+            leaf0_ebx: leaf0.ebx,
+            leaf0_ecx: leaf0.ecx,
+            leaf0_edx: leaf0.edx,
+            leaf1_eax: leaf1.eax,
+            leaf1_ecx: leaf1.ecx,
+            leaf1_edx: leaf1.edx,
+            leaf7_ebx: leaf7.ebx,
+            leaf7_ecx: leaf7.ecx,
+            ext0_eax: ext0.eax,
+            ext1_ecx: ext1.ecx,
+            ext1_edx: ext1.edx,
+            ext7_edx: ext7.edx,
+            ext8_eax: ext8.eax,
+        })
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    #[must_use]
+    pub const fn detect() -> Self {
+        Self::from_leaves(ProcessorLeaves {
+            leaf0_eax: 0,
+            leaf0_ebx: 0,
+            leaf0_ecx: 0,
+            leaf0_edx: 0,
+            leaf1_eax: 0,
+            leaf1_ecx: 0,
+            leaf1_edx: 0,
+            leaf7_ebx: 0,
+            leaf7_ecx: 0,
+            ext0_eax: 0,
+            ext1_ecx: 0,
+            ext1_edx: 0,
+            ext7_edx: 0,
+            ext8_eax: 0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod vendor_profile_tests {
+    use super::{CpuVendor, ProcessorLeaves, ProcessorProfile};
+
+    #[test]
+    fn decodes_genuine_intel_processor_profile() {
+        let profile = ProcessorProfile::from_leaves(ProcessorLeaves {
+            leaf0_eax: 0x20,
+            leaf0_ebx: u32::from_le_bytes(*b"Genu"),
+            leaf0_edx: u32::from_le_bytes(*b"ineI"),
+            leaf0_ecx: u32::from_le_bytes(*b"ntel"),
+            // Family 6, Extended Model 0x9, Base Model 0x7 (Alder Lake 0x97), Stepping 2
+            leaf1_eax: (0x09 << 16) | (0x06 << 8) | (0x07 << 4) | 0x02,
+            leaf1_ecx: (1 << 0)
+                | (1 << 5)
+                | (1 << 9)
+                | (1 << 17)
+                | (1 << 19)
+                | (1 << 20)
+                | (1 << 21)
+                | (1 << 23)
+                | (1 << 24)
+                | (1 << 25)
+                | (1 << 26)
+                | (1 << 27)
+                | (1 << 28)
+                | (1 << 30),
+            leaf1_edx: 1 << 26,
+            leaf7_ebx: (1 << 0) | (1 << 5) | (1 << 7) | (1 << 10) | (1 << 18) | (1 << 20),
+            leaf7_ecx: 1 << 2,
+            ext0_eax: 0x8000_0008,
+            ext1_ecx: 1 << 0,
+            ext1_edx: (1 << 11) | (1 << 20) | (1 << 26) | (1 << 27),
+            ext7_edx: 1 << 8,
+            ext8_eax: (48 << 8) | 46,
+        });
+
+        assert_eq!(profile.vendor, CpuVendor::Intel);
+        assert_eq!(profile.vendor.as_str(), "GenuineIntel");
+        assert_eq!(profile.family_model.display_family(), 6);
+        assert_eq!(profile.family_model.display_model(), 0x97);
+        assert_eq!(profile.family_model.stepping, 2);
+        assert!(profile.extended.vmx);
+        assert!(!profile.extended.svm);
+        assert!(profile.extended.avx2);
+        assert!(profile.extended.pcid);
+        assert!(profile.extended.invpcid);
+        assert!(profile.extended.aesni);
+        assert!(profile.extended.rdrand);
+        assert!(profile.extended.rdseed);
+        assert!(profile.core_features.nx);
+        assert!(profile.core_features.x2apic);
+        assert!(profile.core_features.smep);
+        assert!(profile.core_features.smap);
+        assert_eq!(profile.extended.physical_address_bits, 46);
+        assert_eq!(profile.extended.linear_address_bits, 48);
+        assert!(profile.supports_hardware_virtualization());
+    }
+
+    #[test]
+    fn decodes_authentic_amd_zen_processor_profile() {
+        let profile = ProcessorProfile::from_leaves(ProcessorLeaves {
+            leaf0_eax: 0x10,
+            leaf0_ebx: u32::from_le_bytes(*b"Auth"),
+            leaf0_edx: u32::from_le_bytes(*b"enti"),
+            leaf0_ecx: u32::from_le_bytes(*b"cAMD"),
+            // Base family 0x0F + Extended family 0x0A = Family 0x19 (Zen 3/4), Model 0x61, Stepping 1
+            leaf1_eax: (0x0A << 20) | (0x06 << 16) | (0x0F << 8) | (0x01 << 4) | 0x01,
+            leaf1_ecx: (1 << 0)
+                | (1 << 9)
+                | (1 << 19)
+                | (1 << 20)
+                | (1 << 21)
+                | (1 << 23)
+                | (1 << 25)
+                | (1 << 26)
+                | (1 << 27)
+                | (1 << 28)
+                | (1 << 30),
+            leaf1_edx: 1 << 26,
+            leaf7_ebx: (1 << 0) | (1 << 5) | (1 << 7) | (1 << 18) | (1 << 20),
+            leaf7_ecx: 1 << 2,
+            ext0_eax: 0x8000_001F,
+            ext1_ecx: (1 << 0) | (1 << 2) | (1 << 5) | (1 << 6) | (1 << 22),
+            ext1_edx: (1 << 11) | (1 << 20) | (1 << 26) | (1 << 27),
+            ext7_edx: 1 << 8,
+            ext8_eax: (48 << 8) | 48,
+        });
+
+        assert_eq!(profile.vendor, CpuVendor::Amd);
+        assert_eq!(profile.vendor.as_str(), "AuthenticAMD");
+        assert_eq!(profile.family_model.display_family(), 0x19);
+        assert_eq!(profile.family_model.display_model(), 0x61);
+        assert_eq!(profile.family_model.stepping, 1);
+        assert!(profile.extended.svm);
+        assert!(!profile.extended.vmx);
+        assert!(profile.extended.topoext);
+        assert!(profile.extended.sse4a);
+        assert!(profile.extended.abm_lzcnt);
+        assert!(profile.extended.page1gb);
+        assert!(profile.extended.syscall_sysret);
+        assert!(profile.core_features.invariant_tsc);
+        assert_eq!(profile.extended.physical_address_bits, 48);
+        assert!(profile.supports_hardware_virtualization());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CpuFeatures {
     pub nx: bool,
     pub x2apic: bool,

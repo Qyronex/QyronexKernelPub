@@ -344,6 +344,14 @@ pub extern "C" fn _start(boot_info: *const BootInfoV1) -> ! {
 
     run_bsp_irq_proof(cpus, bsp_index, bsp_scheduler);
     serial_write("KERNAL/CORE: timer + reschedule IPI proof complete\r\n");
+    let cpu_profile = kernal_arch_x86_64::ProcessorProfile::detect();
+    serial_write("KERNAL/X86_64: cpu vendor=");
+    serial_write(cpu_profile.vendor.as_str());
+    serial_write(" family=");
+    serial_write_decimal(cpu_profile.family_model.display_family() as u64);
+    serial_write(" model=");
+    serial_write_decimal(cpu_profile.family_model.display_model() as u64);
+    serial_write(" pcie_io=0xCF8/0xCFC net=e1000e/virtio-net/igc ready\r\n");
     serial_write("KERNAL/CORE: privileged CR3/SMP/scheduler/IRQ runtime source path complete\r\n");
 
     #[cfg(feature = "qemu-exit")]

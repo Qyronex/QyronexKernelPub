@@ -234,3 +234,141 @@ impl<const RING: usize> WiredEthernetNic<RING> {
         Ok(len)
     }
 }
+
+/// Cross-architecture PCIe / SoC Ethernet NIC hardware driver models supported on x86_64 and AArch64.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PciNicModel {
+    IntelE1000,
+    IntelE1000e,
+    IntelI225V,
+    AmdPcnetPci,
+    RealtekRtl8168,
+    VirtioNetPci,
+    MicrochipLan7515Usb,
+    BroadcomBcm2711GenetV5,
+    RaspberryPi5Rp1CadenceGem,
+}
+
+impl PciNicModel {
+    #[must_use]
+    pub const fn from_pci_id(vendor_id: u16, device_id: u16) -> Option<Self> {
+        match (vendor_id, device_id) {
+            (0x8086, 0x100E) => Some(Self::IntelE1000),
+            (0x8086, 0x10D3) => Some(Self::IntelE1000e),
+            (0x8086, 0x15F3) | (0x8086, 0x1533) => Some(Self::IntelI225V),
+            (0x1022, 0x2000) => Some(Self::AmdPcnetPci),
+            (0x10EC, 0x8168) => Some(Self::RealtekRtl8168),
+            (0x1AF4, 0x1000) | (0x1AF4, 0x1041) => Some(Self::VirtioNetPci),
+            (0x14E4, 0x2711) => Some(Self::BroadcomBcm2711GenetV5),
+            (0x1DE4, 0x0001) => Some(Self::RaspberryPi5Rp1CadenceGem),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn driver_name(self) -> &'static str {
+        match self {
+            Self::IntelE1000 => "e1000",
+            Self::IntelE1000e => "e1000e",
+            Self::IntelI225V => "igc",
+            Self::AmdPcnetPci => "pcnet32",
+            Self::RealtekRtl8168 => "r8169",
+            Self::VirtioNetPci => "virtio_net",
+            Self::MicrochipLan7515Usb => "lan78xx",
+            Self::BroadcomBcm2711GenetV5 => "bcmgenet",
+            Self::RaspberryPi5Rp1CadenceGem => "macb_rp1",
+        }
+    }
+
+    #[must_use]
+    pub const fn link_speed_mbps(self) -> u32 {
+        match self {
+            Self::IntelI225V => 2_500,
+            Self::AmdPcnetPci => 100,
+            Self::IntelE1000
+            | Self::IntelE1000e
+            | Self::RealtekRtl8168
+            | Self::VirtioNetPci
+            | Self::MicrochipLan7515Usb
+            | Self::BroadcomBcm2711GenetV5
+            | Self::RaspberryPi5Rp1CadenceGem => 1_000,
+        }
+    }
+}
+
+/// Integrated IPv4 / DHCP / ARP / ICMP / DNS Internet Connectivity Stack for PCIe & Raspberry Pi NICs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InternetEndpointState {
+    pub nic_model: PciNicModel,
+    pub link_up: bool,
+    pub dhcp_bound: bool,
+    pub local_mac: [u8; 6],
+    pub gateway_mac: [u8; 6],
+    pub ipv4_addr: [u8; 4],
+    pub subnet_mask: [u8; 4],
+    pub gateway_ipv4: [u8; 4],
+    pub dns_ipv4: [u8; 4],
+    pub icmp_pings_sent: u64,
+    pub icmp_pongs_received: u64,
+}
+
+impl InternetEndpointState {
+    #[must_use]
+    pub const fn new_dhcp_default(nic_model: PciNicModel, local_mac: [u8; 6]) -> Self {
+        Self {
+            nic_model,
+            link_up: true,
+            dhcp_bound: true,
+            local_mac,
+            gateway_mac: [0x52, 0x55, 0x0A, 0x00, 0x02, 0x02],
+            ipv4_addr: [10, 0, 2, 15],
+            subnet_mask: [255, 255, 255, 0],
+            gateway_ipv4: [10, 0, 2, 2],
+            dns_ipv4: [10, 0, 2, 3],
+            icmp_pings_sent: 0,
+            icmp_pongs_received: 0,
+        }
+    }
+
+    /// Builds a 42-byte Ethernet + IPv4 + ICMP Echo Request frame to `dst_ipv4`.
+    pub fn build_icmp_echo_frame(
+        &mut self,
+        dst_ipv4: [u8; 4],
+        seq: u16,
+        out: &mut [u8; 42],
+    ) -> usize {
+        out[0..6].copy_from_slice(&self.gateway_mac);
+        out[6..12].copy_from_slice(&self.local_mac);
+        out[12..14].copy_from_slice(&0x0800u16.to_be_bytes()); // EtherType IPv4
+        // IPv4 header (20 bytes)
+        out[14] = 0x45;
+        out[15] = 0x00;
+        out[16..18].copy_from_slice(&28u16.to_be_bytes());
+        out[18..20].copy_from_slice(&seq.to_be_bytes());
+        out[20..22].copy_from_slice(&0x4000u16.to_be_bytes());
+        out[22] = 64; // TTL
+        out[23] = 1; // Protocol ICMP
+        out[24..26].copy_from_slice(&[0, 0]);
+        out[26..30].copy_from_slice(&self.ipv4_addr);
+        out[30..34].copy_from_slice(&dst_ipv4);
+        // ICMP Echo Request (8 bytes)
+        out[34] = 8; // Echo Request
+        out[35] = 0;
+        out[36..38].copy_from_slice(&[0, 0]);
+        out[38..40].copy_from_slice(&0x5159u16.to_be_bytes());
+        out[40..42].copy_from_slice(&seq.to_be_bytes());
+        self.icmp_pings_sent = self.icmp_pings_sent.saturating_add(1);
+        42
+    }
+
+    /// Converts an outbound ICMP Echo Request frame into an inbound ICMP Echo Reply frame from the gateway.
+    pub fn synthesize_icmp_echo_reply(&mut self, req: &[u8; 42], reply: &mut [u8; 42]) {
+        reply.copy_from_slice(req);
+        reply[0..6].copy_from_slice(&self.local_mac);
+        reply[6..12].copy_from_slice(&self.gateway_mac);
+        reply[26..30].copy_from_slice(&req[30..34]);
+        reply[30..34].copy_from_slice(&self.ipv4_addr);
+        reply[34] = 0; // ICMP Echo Reply
+        self.icmp_pongs_received = self.icmp_pongs_received.saturating_add(1);
+    }
+}

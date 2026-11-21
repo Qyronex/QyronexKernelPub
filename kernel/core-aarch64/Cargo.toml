@@ -72,6 +72,7 @@ kernal-process-aarch64 = { path = "../process-aarch64" }
 kernal-protected-boot-aarch64 = { path = "../protected-boot-aarch64" }
 kernal-psci-aarch64 = { path = "../psci-aarch64" }
 kernal-qemu-initrd-aarch64 = { path = "../qemu-initrd-aarch64" }
+kernal-rpi3b-plus = { path = "../../drivers/rpi3b-plus" }
 kernal-scheduler = { path = "../scheduler" }
 kernal-scheduler-smp = { path = "../scheduler-smp" }
 kernal-scheduler-cpu = { path = "../scheduler-cpu" }

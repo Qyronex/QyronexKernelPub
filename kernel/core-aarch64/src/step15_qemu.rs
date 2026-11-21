@@ -177,6 +177,11 @@ unsafe fn run_protected(
     if step42_hardware::has_hardware_net() {
         serial.write_str("KERNAL/ARM64: VirtIO-Net MMIO attached\n");
     }
+    if step42_hardware::has_rpi3b_plus_drivers() {
+        serial.write_str(
+            "KERNAL/ARM64: BCM2837 (Raspberry Pi 3B+) drivers attached (Mailbox/GPIO54/PL011/MiniUART/QA7/SDHCI/DWC2/LAN7515-GbE/I2C/SPI/WDT)\n",
+        );
+    }
 
     // Publish physical exclusions before the first safe byte borrow. This records the protected QEMU
     // low prefix plus the complete page-covering initrd range.

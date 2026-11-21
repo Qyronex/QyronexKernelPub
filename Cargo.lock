@@ -266,6 +266,7 @@ dependencies = [
  "kernal-protected-boot-aarch64",
  "kernal-psci-aarch64",
  "kernal-qemu-initrd-aarch64",
+ "kernal-rpi3b-plus",
  "kernal-scheduler",
  "kernal-scheduler-cpu",
  "kernal-scheduler-smp",
@@ -755,6 +756,7 @@ dependencies = [
  "kernal-linux-abi",
  "kernal-linux-systemd",
  "kernal-pci",
+ "kernal-rpi3b-plus",
  "kernal-virtio",
 ]
 
@@ -1130,6 +1132,15 @@ dependencies = [
  "kernal-scheduler",
  "kernal-scheduler-cpu",
  "kernal-scheduler-smp",
+]
+
+[[package]]
+name = "kernal-rpi3b-plus"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-iommu",
+ "kernal-linux-abi",
 ]
 
 [[package]]

@@ -165,6 +165,127 @@ impl ChosenBootInfo {
     }
 }
 
+/// Discovered Broadcom BCM2711 / Raspberry Pi 4 Model B SoC peripheral MMIO apertures from FDT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bcm2711SocInventory {
+    pub is_rpi4b: bool,
+    pub genet_v5: Option<MmioRegion>,
+    pub pcie_rc: Option<MmioRegion>,
+    pub emmc2_sdhci: Option<MmioRegion>,
+}
+
+impl Bcm2711SocInventory {
+    pub const fn empty() -> Self {
+        Self {
+            is_rpi4b: false,
+            genet_v5: None,
+            pcie_rc: None,
+            emmc2_sdhci: None,
+        }
+    }
+
+    pub const fn is_populated(&self) -> bool {
+        self.is_rpi4b
+            || self.genet_v5.is_some()
+            || self.pcie_rc.is_some()
+            || self.emmc2_sdhci.is_some()
+    }
+}
+
+/// Discovered Broadcom BCM2712 / Raspberry Pi 5 + RP1 PCIe Southbridge MMIO apertures from FDT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bcm2712SocInventory {
+    pub is_rpi5: bool,
+    pub pcie_rp1: Option<MmioRegion>,
+    pub rp1_southbridge: Option<MmioRegion>,
+    pub rp1_eth_gem: Option<MmioRegion>,
+}
+
+impl Bcm2712SocInventory {
+    pub const fn empty() -> Self {
+        Self {
+            is_rpi5: false,
+            pcie_rp1: None,
+            rp1_southbridge: None,
+            rp1_eth_gem: None,
+        }
+    }
+
+    pub const fn is_populated(&self) -> bool {
+        self.is_rpi5
+            || self.pcie_rp1.is_some()
+            || self.rp1_southbridge.is_some()
+            || self.rp1_eth_gem.is_some()
+    }
+}
+
+/// Discovered Broadcom BCM2837 / Raspberry Pi 3B+ SoC peripheral MMIO apertures from FDT.
+///
+/// VideoCore bus addresses (`0x7E00_0000..0x7F00_0000`) declared under `/soc` are automatically
+/// translated to their ARM physical addresses (`0x3F00_0000..0x4000_0000`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bcm2837SocInventory {
+    pub is_rpi3b_plus: bool,
+    pub mailbox: Option<MmioRegion>,
+    pub gpio: Option<MmioRegion>,
+    pub pl011_uart0: Option<MmioRegion>,
+    pub aux_mini_uart: Option<MmioRegion>,
+    pub armctrl_ic: Option<MmioRegion>,
+    pub qa7_local_intc: Option<MmioRegion>,
+    pub sdhci_emmc: Option<MmioRegion>,
+    pub dwc2_usb: Option<MmioRegion>,
+    pub systimer: Option<MmioRegion>,
+    pub pm_wdog: Option<MmioRegion>,
+    pub hwrng: Option<MmioRegion>,
+    pub i2c_bsc: Option<MmioRegion>,
+    pub spi0: Option<MmioRegion>,
+}
+
+impl Bcm2837SocInventory {
+    pub const fn empty() -> Self {
+        Self {
+            is_rpi3b_plus: false,
+            mailbox: None,
+            gpio: None,
+            pl011_uart0: None,
+            aux_mini_uart: None,
+            armctrl_ic: None,
+            qa7_local_intc: None,
+            sdhci_emmc: None,
+            dwc2_usb: None,
+            systimer: None,
+            pm_wdog: None,
+            hwrng: None,
+            i2c_bsc: None,
+            spi0: None,
+        }
+    }
+
+    /// Returns whether any BCM2837 / Raspberry Pi 3B+ peripheral node was discovered in the FDT.
+    pub const fn is_populated(&self) -> bool {
+        self.is_rpi3b_plus
+            || self.mailbox.is_some()
+            || self.gpio.is_some()
+            || self.armctrl_ic.is_some()
+            || self.qa7_local_intc.is_some()
+            || self.sdhci_emmc.is_some()
+            || self.dwc2_usb.is_some()
+    }
+}
+
+/// Translates a BCM2837 VideoCore bus MMIO region (`0x7E00_0000..0x7F00_0000`) to ARM physical
+/// space (`0x3F00_0000..0x4000_0000`). Regions already in ARM physical space are returned unchanged.
+pub const fn translate_bcm2837_bus_region(region: MmioRegion) -> MmioRegion {
+    if region.base >= 0x7E00_0000 && region.base < 0x7F00_0000 {
+        MmioRegion {
+            base: region.base - 0x7E00_0000 + 0x3F00_0000,
+            size: region.size,
+        }
+    } else {
+        region
+    }
+}
+
 /// Hardware device inventory parsed from an AArch64 FDT without fixed board addresses.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceInventory<const M: usize> {
@@ -173,6 +294,9 @@ pub struct DeviceInventory<const M: usize> {
     pub pl011: Option<MmioRegion>,
     pub pl031_rtc: Option<RtcMmioInfo>,
     pub pcie_ecam: Option<PciHostEcamInfo>,
+    pub bcm2837: Bcm2837SocInventory,
+    pub bcm2711: Bcm2711SocInventory,
+    pub bcm2712: Bcm2712SocInventory,
     pub chosen: ChosenBootInfo,
 }
 
@@ -184,6 +308,9 @@ impl<const M: usize> DeviceInventory<M> {
             pl011: None,
             pl031_rtc: None,
             pcie_ecam: None,
+            bcm2837: Bcm2837SocInventory::empty(),
+            bcm2711: Bcm2711SocInventory::empty(),
+            bcm2712: Bcm2712SocInventory::empty(),
             chosen: ChosenBootInfo::empty(),
         }
     }
@@ -243,6 +370,27 @@ struct NodeScratch {
     pl031_compatible: bool,
     virtio_mmio_compatible: bool,
     ecam_compatible: bool,
+    bcm2837_board_compatible: bool,
+    bcm_mbox_compatible: bool,
+    bcm_gpio_compatible: bool,
+    bcm_aux_uart_compatible: bool,
+    bcm_armctrl_ic_compatible: bool,
+    bcm_qa7_intc_compatible: bool,
+    bcm_sdhci_compatible: bool,
+    bcm_dwc2_usb_compatible: bool,
+    bcm_systimer_compatible: bool,
+    bcm_pm_wdog_compatible: bool,
+    bcm_hwrng_compatible: bool,
+    bcm_i2c_compatible: bool,
+    bcm_spi_compatible: bool,
+    bcm2711_board_compatible: bool,
+    bcm2711_genet_compatible: bool,
+    bcm2711_pcie_compatible: bool,
+    bcm2711_emmc2_compatible: bool,
+    bcm2712_board_compatible: bool,
+    bcm2712_pcie_compatible: bool,
+    rp1_southbridge_compatible: bool,
+    rp1_eth_gem_compatible: bool,
     chosen_node: bool,
     psci_method: Option<PsciConduit>,
     reg: [u32; MAX_PROPERTY_CELLS],
@@ -269,6 +417,27 @@ impl NodeScratch {
         pl031_compatible: false,
         virtio_mmio_compatible: false,
         ecam_compatible: false,
+        bcm2837_board_compatible: false,
+        bcm_mbox_compatible: false,
+        bcm_gpio_compatible: false,
+        bcm_aux_uart_compatible: false,
+        bcm_armctrl_ic_compatible: false,
+        bcm_qa7_intc_compatible: false,
+        bcm_sdhci_compatible: false,
+        bcm_dwc2_usb_compatible: false,
+        bcm_systimer_compatible: false,
+        bcm_pm_wdog_compatible: false,
+        bcm_hwrng_compatible: false,
+        bcm_i2c_compatible: false,
+        bcm_spi_compatible: false,
+        bcm2711_board_compatible: false,
+        bcm2711_genet_compatible: false,
+        bcm2711_pcie_compatible: false,
+        bcm2711_emmc2_compatible: false,
+        bcm2712_board_compatible: false,
+        bcm2712_pcie_compatible: false,
+        rp1_southbridge_compatible: false,
+        rp1_eth_gem_compatible: false,
         chosen_node: false,
         psci_method: None,
         reg: [0; MAX_PROPERTY_CELLS],
@@ -377,10 +546,54 @@ fn walk_fdt(
                             || compatible_contains(value, "arm,psci-1.0");
                         node.gicv3_compatible = compatible_contains(value, "arm,gic-v3");
                         node.timer_compatible = compatible_contains(value, "arm,armv8-timer");
-                        node.pl011_compatible = compatible_contains(value, "arm,pl011");
+                        node.pl011_compatible = compatible_contains(value, "arm,pl011")
+                            || compatible_contains(value, "brcm,bcm2835-pl011");
                         node.pl031_compatible = compatible_contains(value, "arm,pl031");
                         node.virtio_mmio_compatible = compatible_contains(value, "virtio,mmio");
                         node.ecam_compatible = compatible_contains(value, "pci-host-ecam-generic");
+                        node.bcm2837_board_compatible = compatible_contains(value, "brcm,bcm2837")
+                            || compatible_contains(value, "raspberrypi,3-model-b-plus");
+                        node.bcm_mbox_compatible = compatible_contains(value, "brcm,bcm2835-mbox");
+                        node.bcm_gpio_compatible = compatible_contains(value, "brcm,bcm2835-gpio");
+                        node.bcm_aux_uart_compatible =
+                            compatible_contains(value, "brcm,bcm2835-aux-uart")
+                                || compatible_contains(value, "brcm,bcm2835-aux");
+                        node.bcm_armctrl_ic_compatible =
+                            compatible_contains(value, "brcm,bcm2836-armctrl-ic")
+                                || compatible_contains(value, "brcm,bcm2835-armctrl-ic");
+                        node.bcm_qa7_intc_compatible =
+                            compatible_contains(value, "brcm,bcm2836-l1-intc");
+                        node.bcm_sdhci_compatible =
+                            compatible_contains(value, "brcm,bcm2835-sdhci")
+                                || compatible_contains(value, "brcm,bcm2835-mmc")
+                                || compatible_contains(value, "brcm,bcm2835-sdhost");
+                        node.bcm_dwc2_usb_compatible =
+                            compatible_contains(value, "brcm,bcm2835-usb");
+                        node.bcm_systimer_compatible =
+                            compatible_contains(value, "brcm,bcm2835-system-timer");
+                        node.bcm_pm_wdog_compatible =
+                            compatible_contains(value, "brcm,bcm2835-pm-wdt")
+                                || compatible_contains(value, "brcm,bcm2835-pm");
+                        node.bcm_hwrng_compatible = compatible_contains(value, "brcm,bcm2835-rng");
+                        node.bcm_i2c_compatible = compatible_contains(value, "brcm,bcm2835-i2c");
+                        node.bcm_spi_compatible = compatible_contains(value, "brcm,bcm2835-spi");
+                        node.bcm2711_board_compatible = compatible_contains(value, "brcm,bcm2711")
+                            || compatible_contains(value, "raspberrypi,4-model-b");
+                        node.bcm2711_genet_compatible =
+                            compatible_contains(value, "brcm,bcm2711-genet-v5")
+                                || compatible_contains(value, "brcm,genet-v5");
+                        node.bcm2711_pcie_compatible =
+                            compatible_contains(value, "brcm,bcm2711-pcie");
+                        node.bcm2711_emmc2_compatible =
+                            compatible_contains(value, "brcm,bcm2711-emmc2");
+                        node.bcm2712_board_compatible = compatible_contains(value, "brcm,bcm2712")
+                            || compatible_contains(value, "raspberrypi,5-model-b");
+                        node.bcm2712_pcie_compatible =
+                            compatible_contains(value, "brcm,bcm2712-pcie");
+                        node.rp1_southbridge_compatible =
+                            compatible_contains(value, "raspberrypi,rp1");
+                        node.rp1_eth_gem_compatible = compatible_contains(value, "cdns,gem")
+                            || compatible_contains(value, "cdns,macb");
                     }
                     "method" => {
                         node.psci_method = match property_string(value) {
@@ -462,15 +675,122 @@ fn finalize_device_node<const M: usize>(
     node: NodeScratch,
     inventory: &mut DeviceInventory<M>,
 ) -> Result<(), Error> {
-    if node.pl011_compatible && node.reg_len != 0 {
+    if node.bcm2837_board_compatible {
+        inventory.bcm2837.is_rpi3b_plus = true;
+    }
+    if node.bcm2711_board_compatible {
+        inventory.bcm2711.is_rpi4b = true;
+    }
+    if node.bcm2712_board_compatible {
+        inventory.bcm2712.is_rpi5 = true;
+    }
+
+    if node.reg_len != 0
+        && (node.bcm2711_genet_compatible
+            || node.bcm2711_pcie_compatible
+            || node.bcm2711_emmc2_compatible
+            || node.bcm2712_pcie_compatible
+            || node.rp1_southbridge_compatible
+            || node.rp1_eth_gem_compatible)
+    {
         let region = decode_reg_tuple(
             &node.reg,
             0,
             node.parent_address_cells,
             node.parent_size_cells,
         )?;
+        let _ = validate_nonzero_region(region)?;
+        if node.bcm2711_genet_compatible {
+            inventory.bcm2711.genet_v5 = Some(region);
+        }
+        if node.bcm2711_pcie_compatible {
+            inventory.bcm2711.pcie_rc = Some(region);
+        }
+        if node.bcm2711_emmc2_compatible {
+            inventory.bcm2711.emmc2_sdhci = Some(region);
+        }
+        if node.bcm2712_pcie_compatible {
+            inventory.bcm2712.pcie_rp1 = Some(region);
+        }
+        if node.rp1_southbridge_compatible {
+            inventory.bcm2712.rp1_southbridge = Some(region);
+        }
+        if node.rp1_eth_gem_compatible {
+            inventory.bcm2712.rp1_eth_gem = Some(region);
+        }
+    }
+
+    if node.pl011_compatible && node.reg_len != 0 {
+        let region = translate_bcm2837_bus_region(decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?);
         inventory.check_non_overlapping(region)?;
         inventory.pl011 = Some(region);
+        if region.base >= 0x3F00_0000 && region.base < 0x4000_0000 {
+            inventory.bcm2837.pl011_uart0 = Some(region);
+        }
+    }
+
+    if node.reg_len != 0
+        && (node.bcm_mbox_compatible
+            || node.bcm_gpio_compatible
+            || node.bcm_aux_uart_compatible
+            || node.bcm_armctrl_ic_compatible
+            || node.bcm_qa7_intc_compatible
+            || node.bcm_sdhci_compatible
+            || node.bcm_dwc2_usb_compatible
+            || node.bcm_systimer_compatible
+            || node.bcm_pm_wdog_compatible
+            || node.bcm_hwrng_compatible
+            || node.bcm_i2c_compatible
+            || node.bcm_spi_compatible)
+    {
+        let region = translate_bcm2837_bus_region(decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?);
+        let _ = validate_nonzero_region(region)?;
+        if node.bcm_mbox_compatible {
+            inventory.bcm2837.mailbox = Some(region);
+        }
+        if node.bcm_gpio_compatible {
+            inventory.bcm2837.gpio = Some(region);
+        }
+        if node.bcm_aux_uart_compatible {
+            inventory.bcm2837.aux_mini_uart = Some(region);
+        }
+        if node.bcm_armctrl_ic_compatible {
+            inventory.bcm2837.armctrl_ic = Some(region);
+        }
+        if node.bcm_qa7_intc_compatible {
+            inventory.bcm2837.qa7_local_intc = Some(region);
+        }
+        if node.bcm_sdhci_compatible {
+            inventory.bcm2837.sdhci_emmc = Some(region);
+        }
+        if node.bcm_dwc2_usb_compatible {
+            inventory.bcm2837.dwc2_usb = Some(region);
+        }
+        if node.bcm_systimer_compatible {
+            inventory.bcm2837.systimer = Some(region);
+        }
+        if node.bcm_pm_wdog_compatible {
+            inventory.bcm2837.pm_wdog = Some(region);
+        }
+        if node.bcm_hwrng_compatible {
+            inventory.bcm2837.hwrng = Some(region);
+        }
+        if node.bcm_i2c_compatible {
+            inventory.bcm2837.i2c_bsc = Some(region);
+        }
+        if node.bcm_spi_compatible {
+            inventory.bcm2837.spi0 = Some(region);
+        }
     }
 
     if node.pl031_compatible {
@@ -1037,6 +1357,61 @@ mod tests {
             b"root=/dev/vda1 rw rootfstype=ext4 console=ttyAMA0"
         );
         assert_eq!(inv.chosen.rng_seed_len, 32);
+    }
+
+    #[test]
+    fn device_inventory_discovers_bcm2837_raspberry_pi_3b_plus_peripherals_and_translates_vc_bus() {
+        let dtb = build_dtb_with_nodes(|strings, structure| {
+            let compatible = intern(strings, "compatible");
+            let reg = intern(strings, "reg");
+
+            property(
+                structure,
+                compatible,
+                b"raspberrypi,3-model-b-plus\0brcm,bcm2837\0",
+            );
+
+            begin_node(structure, "mailbox@7e00b880");
+            property(structure, compatible, b"brcm,bcm2835-mbox\0");
+            property(structure, reg, &cells(&[0, 0x7e00_b880, 0, 0x40]));
+            end_node(structure);
+
+            begin_node(structure, "gpio@7e200000");
+            property(structure, compatible, b"brcm,bcm2835-gpio\0");
+            property(structure, reg, &cells(&[0, 0x7e20_0000, 0, 0xb4]));
+            end_node(structure);
+
+            begin_node(structure, "serial@7e201000");
+            property(structure, compatible, b"brcm,bcm2835-pl011\0arm,pl011\0");
+            property(structure, reg, &cells(&[0, 0x7e20_1000, 0, 0x200]));
+            end_node(structure);
+
+            begin_node(structure, "mmc@7e300000");
+            property(structure, compatible, b"brcm,bcm2835-sdhci\0");
+            property(structure, reg, &cells(&[0, 0x7e30_0000, 0, 0x100]));
+            end_node(structure);
+
+            begin_node(structure, "usb@7e980000");
+            property(structure, compatible, b"brcm,bcm2835-usb\0");
+            property(structure, reg, &cells(&[0, 0x7e98_0000, 0, 0x10000]));
+            end_node(structure);
+
+            begin_node(structure, "local_intc@40000000");
+            property(structure, compatible, b"brcm,bcm2836-l1-intc\0");
+            property(structure, reg, &cells(&[0, 0x4000_0000, 0, 0x100]));
+            end_node(structure);
+        });
+
+        let blob = Blob::parse(&dtb).unwrap();
+        let inv = parse_device_inventory::<8>(&blob).unwrap();
+        assert!(inv.bcm2837.is_populated());
+        assert!(inv.bcm2837.is_rpi3b_plus);
+        assert_eq!(inv.bcm2837.mailbox.unwrap().base, 0x3f00_b880);
+        assert_eq!(inv.bcm2837.gpio.unwrap().base, 0x3f20_0000);
+        assert_eq!(inv.bcm2837.pl011_uart0.unwrap().base, 0x3f20_1000);
+        assert_eq!(inv.bcm2837.sdhci_emmc.unwrap().base, 0x3f30_0000);
+        assert_eq!(inv.bcm2837.dwc2_usb.unwrap().base, 0x3f98_0000);
+        assert_eq!(inv.bcm2837.qa7_local_intc.unwrap().base, 0x4000_0000);
     }
 
     #[test]
