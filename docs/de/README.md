@@ -7,7 +7,8 @@ Diese Sammlung ergänzt die englische technische Dokumentation des Projekts. Sie
 ## Einstieg
 
 - [`../../README_DE.md`](../../README_DE.md) – Projektübersicht, Build und Verifikation
-- [`STATUS.md`](STATUS.md) – aktueller Stand (Debian 13, systemd, labwc + XFCE), bekannte Lücken, Starten
+- [`STATUS.md`](STATUS.md) – aktueller Stand (Debian 13, systemd, labwc + XFCE, x86_64, RPi 3B+/4/5, ISO), bekannte Lücken, Starten
+- [`HARDWARE_UND_TREIBER.md`](HARDWARE_UND_TREIBER.md) – Hybrid-Treiberschicht (x86_64 Intel/AMD, PCIe, RPi 3B+/4/5) & ISO-Aufbau mit Systemgrafiken
 - [`DISSERTATION_QYRONEX_KERNAL.md`](DISSERTATION_QYRONEX_KERNAL.md) – ausführliche wissenschaftliche Projektarbeit mit Linux-Vergleich
 - [`BOOT_PROTOKOLL.md`](BOOT_PROTOKOLL.md) – Boot-Handoff und Speicherbesitz
 - [`SPEICHERLAYOUT.md`](SPEICHERLAYOUT.md) – virtuelles Speicherlayout und harte Invarianten

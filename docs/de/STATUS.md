@@ -1,29 +1,35 @@
 # Qyronex Kernal — Status
 
-Stand: 19.11.2026 (Quellcode-Head `b0cc59c`). Englische Version: [../../STATUS.md](../../STATUS.md).
+Stand: 21.11.2026 (Quellcode-Head `2129339`). Englische Version: [../../STATUS.md](../../STATUS.md).
 
-> Forschungskernel. Nicht produktionsreif, keine Sicherheitsgrenze. Die Aussagen beruhen auf der Commit-Historie und dem beobachteten QEMU-Bootlog. Sie sind kein abgeschlossenes Konformitäts- oder Audit-Ergebnis.
+> Forschungskernel. Nicht produktionsreif, keine Sicherheitsgrenze. Die Aussagen beruhen auf der Commit-Historie und den beobachteten QEMU- und Testläufen. Sie sind kein abgeschlossenes Konformitäts- oder Audit-Ergebnis.
 
 ## Was Qyronex ist
 
-- Ein **eigenständiger Kernel in Rust** (rund 157.000 Zeilen unter `kernel/`), **kein Linux und kein Linux-Fork**.
+- Ein **eigenständiger Hybrid-Kernel in Rust** (über 163.000 Zeilen unter `kernel/` & `drivers/`), **kein Linux und kein Linux-Fork**.
 - Eigene Architektur: Capabilities, W^X, Null-Page- und Guard-Stack-Invarianten, fail-closed IOMMU/IRQ, eigener Scheduler und eigene Speicherverwaltung.
 - Stellt das **Linux-Userspace-ABI** bereit (Syscalls, VFS, `/proc`, `/sys`, Geräte, Netlink), damit unveränderte Linux-Programme laufen. Linux-Kernelmodule (`.ko`) werden nicht unterstützt.
-- Hauptziel: **AArch64 / ARM64 in QEMU** (`virt`, GICv3). x86_64-Komponenten existieren, sind aber nicht das aktive Laufzeitziel.
+- **Multi-Architektur-Ziele:**
+  - **AArch64 / ARM64:** QEMU `virt` (GICv3) **und** Hybrid-Treiberschicht für **Raspberry Pi 3B+ (`BCM2837B0`), Raspberry Pi 4B (`BCM2711`) und Raspberry Pi 5 (`BCM2712` + `RP1`)** (`drivers/rpi3b-plus`, `firmware/fdt-aarch64`).
+  - **x86_64:** UEFI + ACPI + APIC/IOAPIC SMP (1/2/4 vCPUs), Intel- (`GenuineIntel`) & AMD- (`AuthenticAMD`) CPUID-Erkennung (`kernel/arch-x86_64`), PCIe ECAM + x86 Legacy-Port-I/O (`0xCF8`/`0xCFC`) (`drivers/pci`).
 
 ## Aktueller Stand (beobachtet)
 
 | Bereich | Stand | Hinweise |
 |---|---|---|
 | Geschützter Boot, EL0/EL1, PAN, W^X, TTBR0/TTBR1 | Läuft in QEMU | Bootlog belegt jeden Schritt (S7–S15) |
+| x86_64 UEFI-Boot, SMP (1/2/4 vCPUs), Intel & AMD CPUID | Läuft in QEMU | `cargo xtask qemu` & `cargo xtask qemu-smp` Exit 0 |
+| PCIe (ECAM + `0xCF8`/`0xCFC`, MSI/MSI-X) & NIC/Internet-Stack | Implementiert & getestet | `e1000`, `e1000e`, `I225-V`, `pcnet32`, `RTL8168`, `virtio-net`, DHCP/IPv4/ICMP |
+| Raspberry Pi 3B+ / 4B / 5 Hybrid-Treiberschicht | Implementiert & getestet | `BCM2837B0` + `LAN7515`, `BCM2711` + `GENET v5` + `VL805`, `BCM2712` + `RP1` |
+| Installierbare Raspberry-Pi-ISO & SD-Karten-Image | Gebaut & verifiziert | `tools/build-rpi-iso.sh` -> `qyronex-rpi-installer.iso` & `qyronex-rpi-sdcard.img` |
 | Linux-Syscall-Persönlichkeit (arm64) | Läuft | Unveränderte statische und dynamische ELF-Programme |
 | VFS: initramfs, memfs (tmpfs), ext4 auf virtio-blk (GPT) | Läuft | |
 | Netzwerk: virtio-net, DHCP, AF_UNIX, TCP/UDP, Netlink | Läuft | DHCP-Adresse `10.0.2.15` im QEMU-User-Netz |
 | Events/cgroups: epoll, eventfd, timerfd, signalfd, inotify, memfd, cgroups v2 | Implementiert | |
 | **Debian 13 (trixie/arm64) mit systemd 257 als PID 1** | **Bootet bis `multi-user.target`** | Unverändertes Debian-Userspace; udevd, journald, dbus, serieller getty laufen |
 | Grafik/Eingabe: virtio-gpu (KMS/mmap), virtio-input evdev (Tastatur, Tablet) | Implementiert | `drivers/virtio`, `kernel/linux-desktop` |
-| **Desktop: labwc (Wayland-Compositor) + XFCE 4.20** | **Startet über `qyronex-desktop.service`** | Visuell geprüft: XFCE-Leiste, Terminal, Dateimanager über noVNC |
-| SMP | Standard `smp=1`; 1/2/4/8 wählbar | Höhere Werte weniger getestet |
+| **Desktop: labwc (Wayland) + XFCE 4.20 + NetSurf Browser** | **Startet über `qyronex-desktop.service`** | Klickbare Desktop-Icons via `qyronex-filemanager`, noVNC-Viewer |
+| SMP | Standard `smp=1` (AArch64); 1/2/4 vCPUs getestet | Sowohl `x86_64`- als auch `AArch64`-1/2/4-vCPU-Matrix bestanden |
 
 ## Wayland und XFCE: wie es funktioniert
 

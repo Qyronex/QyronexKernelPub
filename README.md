@@ -19,39 +19,63 @@ The project explores a small privileged core, explicit capability-based authorit
 - Keep architecture-specific mechanisms separated from architecture-neutral policy.
 - Make important runtime behavior reproducible and testable in QEMU.
 
-## Current platform
+## Current platforms & hybrid driver layer
 
-The primary runtime target is **AArch64 / ARM64**. The tree also contains x86_64 components and architecture-neutral subsystems.
+Qyronex Kernal runs as a **multi-architecture hybrid kernel** across **AArch64 / ARM64** and **x86_64**, keeping hardware-specific drivers isolated behind a capability- and IOMMU-mediated driver layer (`MmioBus` / `PciConfigBus` / FDT & CPUID discovery) so the same kernel boots both in QEMU and on real-hardware register layouts:
 
-The repository includes protected EL0 execution, AArch64 exception/syscall/context handling, virtual memory, ELF loading, process and thread lifecycle infrastructure, signals, futexes, file-descriptor and VFS work, firmware parsing, secure-storage architecture work, and QEMU-based verification.
+- **AArch64 / ARM64 (QEMU `virt` & Raspberry Pi 3B+ / 4 / 5):**
+  - Protected EL0 execution, AArch64 exception/syscall/context handling, TTBR0/TTBR1 virtual memory, ELF loading, signals, futexes, epoll, VFS (`initramfs`, `memfs`, `ext4`), FDT discovery (`firmware/fdt-aarch64`), and VirtIO (`virtio-blk`, `virtio-net`, `virtio-gpu`, `virtio-input`).
+  - **Raspberry Pi 3B+ (`BCM2837B0`)**, **Raspberry Pi 4B (`BCM2711`, `GENET v5`, `PCIe 2.0 -> VIA VL805`, `EMMC2`)**, and **Raspberry Pi 5 (`BCM2712`, `PCIe Gen2x4 -> RP1 Southbridge`, `Cadence GEM`, `Dual xHCI`, `RIO GPIO`)** in `drivers/rpi3b-plus`.
+- **x86_64 (Intel & AMD CPUs, UEFI + ACPI + SMP):**
+  - CPUID vendor & feature detection (`GenuineIntel` VMX/AVX2/PCID/INVPCID and `AuthenticAMD` Zen/SVM/TopoExt/1GiB pages) in `kernel/arch-x86_64`, APIC/IOAPIC SMP boot (1/2/4 vCPUs), and x86 legacy PCI port I/O (`0xCF8`/`0xCFC`) + PCIe ECAM (`drivers/pci`).
+- **PCIe & Networking / Internet:**
+  - PCIe Gen1–Gen5 capability & MSI/MSI-X decoding (`drivers/pci`) and NIC profiles (`e1000`, `e1000e`, `I225-V`, `pcnet32`, `RTL8168`, `virtio-net`, `LAN7515`, `BCM2711 GENET v5`, `RP1 Cadence GEM`) with IPv4/DHCP/ICMP/TCP/UDP stack (`kernel/linux-hardware`).
 
 Linux compatibility targets the **userspace ABI**. Linux kernel modules are not a compatibility target.
 
-**Current milestone:** an unchanged Debian 13 (trixie/arm64) userspace with systemd 257 boots on Kernal in QEMU, and a labwc (Wayland) + XFCE desktop starts via `qyronex-desktop.service`. Wayland and XFCE are Debian userspace programs, not part of the kernel. See [STATUS.md](STATUS.md) for the verified state, known gaps and how to run it.
+**Current milestone:** an unchanged Debian 13 (trixie/arm64) userspace with systemd 257 boots on Kernal in QEMU, and a labwc (Wayland) + XFCE 4.20 desktop with NetSurf browser and desktop icons starts via `qyronex-desktop.service`. An installable Raspberry Pi ISO (`qyronex-rpi-installer.iso`) and flashable SD-card image (`qyronex-rpi-sdcard.img`) can be built via `tools/build-rpi-iso.sh`. See [STATUS.md](STATUS.md) for the verified state, known gaps and how to run it.
 
-## Build
+![Qyronex Hybrid Driver Architecture](docs/assets/qyronex_hybrid_driver_architecture.png)
+
+## Raspberry Pi & x86_64 Architecture Diagrams
+
+| System View | Diagram |
+|---|---|
+| **Cross-Arch Hybrid Driver Layer** | [Hybrid Driver Architecture](docs/assets/qyronex_hybrid_driver_architecture.png) |
+| **Raspberry Pi 3B+ / 4 / 5 SoC & PCIe Stack** | [RPi Hardware Stack](docs/assets/qyronex_rpi_hardware_stack.png) |
+| **Installable ISO & MBR SD-Card Layout** | [RPi Boot & ISO Layout](docs/assets/qyronex_rpi_boot_iso_layout.png) |
+
+## Build & Raspberry Pi ISO
 
 The workspace currently pins Rust **1.98.0**.
 
 ```bash
 rustup toolchain install 1.98.0 --profile minimal --component rust-src,rustfmt,clippy,llvm-tools-preview
-rustup target add --toolchain 1.98.0 aarch64-unknown-none-softfloat
+rustup target add --toolchain 1.98.0 aarch64-unknown-none-softfloat x86_64-unknown-none x86_64-unknown-uefi
 cargo xtask arm-build
+```
+
+Build the installable Raspberry Pi ISO (`dist/qyronex-rpi-installer.iso`) and flashable SD-card image (`dist/qyronex-rpi-sdcard.img`):
+
+```bash
+bash tools/build-rpi-iso.sh
 ```
 
 ## Run in QEMU
 
 ```bash
-cargo xtask arm-qemu
+cargo xtask arm-qemu    # AArch64 runtime & filesystem proofs
+cargo xtask qemu        # x86_64 1-vCPU UEFI/SMP/PCIe proof
+cargo xtask qemu-smp    # x86_64 2- and 4-vCPU SMP proofs
 ```
 
 ## Verification
 
 ```bash
-bash tools/arm-first-verify.sh
+./tools/docker/verify-in-docker.sh all
 ```
 
-The public verification path covers formatting, workspace tests, strict Clippy checks, the AArch64 build, and the QEMU runtime path.
+The verification pipeline covers formatting, strict Clippy checks, all host/workspace unit tests, `x86_64` QEMU boots (1, 2, 4 vCPUs), and `AArch64` QEMU runtime proofs.
 
 ## Repository structure
 
