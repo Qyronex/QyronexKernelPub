@@ -93,6 +93,31 @@ static void handle_transaction(int fd, const struct binder_transaction_data *tx)
             snprintf(reply, sizeof(reply), "PONG qyronex-servicemanager pid=%d proto=8", (int)getpid());
             break;
 
+        case SM_CMD_ECHO_FD: {
+            /* Expects one `flat_binder_object` (`BINDER_TYPE_FD`) in payload at offset 0. */
+            if (tx->data_ptr != 0 && tx->data_size >= sizeof(struct flat_binder_object) &&
+                tx->offsets_size >= 8) {
+                struct flat_binder_object fbo;
+                memcpy(&fbo, (const void *)(uintptr_t)tx->data_ptr, sizeof(fbo));
+                if (fbo.hdr_type == BINDER_TYPE_FD) {
+                    int rfd = (int)fbo.binder_or_handle;
+                    char fbuf[64] = {0};
+                    ssize_t rn = pread(rfd, fbuf, sizeof(fbuf) - 1, 0);
+                    if (rn > 0) {
+                        fbuf[rn] = '\0';
+                        (void)pwrite(rfd, "SM_SAW_FD_OK", 12, 32);
+                        snprintf(reply, sizeof(reply), "FD_OK fd=%d data=%s", rfd, fbuf);
+                    } else {
+                        snprintf(reply, sizeof(reply), "FD_ERR pread fd=%d errno=%d", rfd, errno);
+                    }
+                    close(rfd);
+                    break;
+                }
+            }
+            snprintf(reply, sizeof(reply), "FD_ERR missing_flat_object");
+            break;
+        }
+
         case SM_CMD_ADD_SERVICE: {
             int idx = add_service(req, tx->sender_pid, tx->sender_euid);
             if (idx >= 0) {

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
+# Debian 13 (trixie/arm64) native GTK3 + gtk-layer-shell compiler image for Qyronex GrapheneOS UI.
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libc6-dev \
+    pkg-config \
+    libgtk-3-dev \
+    libgtk-layer-shell-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace

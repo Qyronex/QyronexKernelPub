@@ -11,7 +11,8 @@
 use super::step_fd_util::{
     DirectProcessRefs, S_IFCHR_MODE, S_IFREG_MODE, SUBSYS_ANDROID, StatMeta, copy_from_user,
     copy_to_user, current_process_object, current_uid_gid, encode_result, fd_in_close_range,
-    lookup_aliased_subsystem, lookup_aliased_subsystem_current, read_user_cstr, read_user_iovec,
+    install_subsystem_fd_in_process, lookup_aliased_subsystem, lookup_aliased_subsystem_current,
+    read_user_cstr, read_user_iovec, release_subsystem_handle, retain_any_subsystem_fd,
     seek_bounded, write_aarch64_stat_meta, write_aarch64_statx_meta,
 };
 use alloc::format;
@@ -30,11 +31,14 @@ use kernal_linux_android::{
     ASHMEM_SET_PROT_MASK, ASHMEM_SET_SIZE, ASHMEM_UNPIN, AndroidKernelState, BC_ACQUIRE,
     BC_DEAD_BINDER_DONE, BC_DECREFS, BC_ENTER_LOOPER, BC_EXIT_LOOPER, BC_FREE_BUFFER, BC_INCREFS,
     BC_REGISTER_LOOPER, BC_RELEASE, BC_REPLY, BC_REQUEST_DEATH_NOTIFICATION, BC_TRANSACTION,
-    BINDER_CURRENT_PROTOCOL_VERSION, BINDER_SET_CONTEXT_MGR, BINDER_SET_CONTEXT_MGR_EXT,
-    BINDER_SET_IDLE_PRIORITY, BINDER_SET_IDLE_TIMEOUT, BINDER_SET_MAX_THREADS, BINDER_THREAD_EXIT,
-    BINDER_TRANSACTION_DATA_BYTES, BINDER_VERSION, BINDER_WRITE_READ, BINDER_WRITE_READ_BYTES,
-    BR_NOOP, BR_REPLY, BR_TRANSACTION, BR_TRANSACTION_COMPLETE, BinderDomain,
-    BinderTransactionData, BinderWriteRead, DMA_HEAP_IOCTL_ALLOC, MAX_BINDER_PAYLOAD_BYTES,
+    BINDER_CTL_ADD, BINDER_CURRENT_PROTOCOL_VERSION, BINDER_SET_CONTEXT_MGR,
+    BINDER_SET_CONTEXT_MGR_EXT, BINDER_SET_IDLE_PRIORITY, BINDER_SET_IDLE_TIMEOUT,
+    BINDER_SET_MAX_THREADS, BINDER_THREAD_EXIT, BINDER_TRANSACTION_DATA_BYTES, BINDER_TYPE_FD,
+    BINDER_VERSION, BINDER_WRITE_READ, BINDER_WRITE_READ_BYTES, BR_NOOP, BR_REPLY, BR_TRANSACTION,
+    BR_TRANSACTION_COMPLETE, BinderDomain, BinderTransactionData, BinderTransferredFd,
+    BinderWriteRead, DMA_HEAP_IOCTL_ALLOC, FLAT_BINDER_OBJECT_BYTES, FlatBinderObject,
+    MAX_BINDER_PAYLOAD_BYTES, MEMBARRIER_CMD_QUERY, MEMBARRIER_SUPPORTED_MASK, UFFD_API_VERSION,
+    UFFDIO_API,
 };
 use kernal_linux_fd::SubsystemHandle;
 
@@ -52,13 +56,18 @@ const MAX_LOG_RING_BYTES: usize = 16 * 1024;
 enum AndroidNodeKind {
     None,
     Binder(BinderDomain),
+    BinderControl,
     Ashmem,
     DmaHeapSystem,
+    Fuse,
+    UserfaultFd,
     AndroidLogMain,
     SelinuxEnforce,
     SelinuxMls,
     SelinuxPolicyvers,
     SelinuxStatus,
+    SelinuxCheckreqprot,
+    SelinuxDenyUnknown,
     PowerWakeLock,
     PowerWakeUnlock,
     PowerState,
@@ -74,9 +83,13 @@ enum AndroidNodeKind {
 impl AndroidNodeKind {
     const fn stat_mode(self) -> u32 {
         match self {
-            Self::Binder(_) | Self::Ashmem | Self::DmaHeapSystem | Self::AndroidLogMain => {
-                S_IFCHR_MODE
-            }
+            Self::Binder(_)
+            | Self::BinderControl
+            | Self::Ashmem
+            | Self::DmaHeapSystem
+            | Self::Fuse
+            | Self::UserfaultFd
+            | Self::AndroidLogMain => S_IFCHR_MODE,
             _ => S_IFREG_MODE,
         }
     }
@@ -87,13 +100,18 @@ impl AndroidNodeKind {
             Self::Binder(BinderDomain::Framework) => ((10u64 << 8) | 60, 45_001),
             Self::Binder(BinderDomain::HardwareHal) => ((10u64 << 8) | 61, 45_002),
             Self::Binder(BinderDomain::Vendor) => ((10u64 << 8) | 62, 45_003),
+            Self::BinderControl => ((240u64 << 8), 45_007),
             Self::Ashmem => ((10u64 << 8) | 63, 45_004),
             Self::DmaHeapSystem => ((252u64 << 8), 45_005),
+            Self::Fuse => ((10u64 << 8) | 229, 45_008),
+            Self::UserfaultFd => (0, 45_009),
             Self::AndroidLogMain => ((10u64 << 8) | 64, 45_006),
             Self::SelinuxEnforce => (0, 45_010),
             Self::SelinuxMls => (0, 45_011),
             Self::SelinuxPolicyvers => (0, 45_012),
             Self::SelinuxStatus => (0, 45_013),
+            Self::SelinuxCheckreqprot => (0, 45_014),
+            Self::SelinuxDenyUnknown => (0, 45_015),
             Self::PowerWakeLock => (0, 45_020),
             Self::PowerWakeUnlock => (0, 45_021),
             Self::PowerState => (0, 45_022),
@@ -113,13 +131,18 @@ impl AndroidNodeKind {
             Self::Binder(BinderDomain::Framework) => b"/dev/binder",
             Self::Binder(BinderDomain::HardwareHal) => b"/dev/hwbinder",
             Self::Binder(BinderDomain::Vendor) => b"/dev/vndbinder",
+            Self::BinderControl => b"/dev/binderfs/binder-control",
             Self::Ashmem => b"/dev/ashmem",
             Self::DmaHeapSystem => b"/dev/dma_heap/system",
+            Self::Fuse => b"/dev/fuse",
+            Self::UserfaultFd => b"anon_inode:[userfaultfd]",
             Self::AndroidLogMain => b"/dev/log/main",
             Self::SelinuxEnforce => b"/sys/fs/selinux/enforce",
             Self::SelinuxMls => b"/sys/fs/selinux/mls",
             Self::SelinuxPolicyvers => b"/sys/fs/selinux/policyvers",
             Self::SelinuxStatus => b"/sys/fs/selinux/status",
+            Self::SelinuxCheckreqprot => b"/sys/fs/selinux/checkreqprot",
+            Self::SelinuxDenyUnknown => b"/sys/fs/selinux/deny_unknown",
             Self::PowerWakeLock => b"/sys/power/wake_lock",
             Self::PowerWakeUnlock => b"/sys/power/wake_unlock",
             Self::PowerState => b"/sys/power/state",
@@ -699,8 +722,10 @@ fn match_android_path(path: &[u8]) -> Option<AndroidNodeKind> {
         b"/dev/vndbinder" | b"/dev/binderfs/vndbinder" => {
             Some(AndroidNodeKind::Binder(BinderDomain::Vendor))
         }
+        b"/dev/binderfs/binder-control" => Some(AndroidNodeKind::BinderControl),
         b"/dev/ashmem" => Some(AndroidNodeKind::Ashmem),
         b"/dev/dma_heap/system" => Some(AndroidNodeKind::DmaHeapSystem),
+        b"/dev/fuse" => Some(AndroidNodeKind::Fuse),
         b"/dev/pmsg0" | b"/dev/log/main" | b"/dev/log/system" => {
             Some(AndroidNodeKind::AndroidLogMain)
         }
@@ -708,6 +733,8 @@ fn match_android_path(path: &[u8]) -> Option<AndroidNodeKind> {
         b"/sys/fs/selinux/mls" => Some(AndroidNodeKind::SelinuxMls),
         b"/sys/fs/selinux/policyvers" => Some(AndroidNodeKind::SelinuxPolicyvers),
         b"/sys/fs/selinux/status" => Some(AndroidNodeKind::SelinuxStatus),
+        b"/sys/fs/selinux/checkreqprot" => Some(AndroidNodeKind::SelinuxCheckreqprot),
+        b"/sys/fs/selinux/deny_unknown" => Some(AndroidNodeKind::SelinuxDenyUnknown),
         b"/sys/power/wake_lock" => Some(AndroidNodeKind::PowerWakeLock),
         b"/sys/power/wake_unlock" => Some(AndroidNodeKind::PowerWakeUnlock),
         b"/sys/power/state" => Some(AndroidNodeKind::PowerState),
@@ -766,6 +793,8 @@ fn render_node_bytes(state: &Step45State, kind: AndroidNodeKind) -> Vec<u8> {
             buf[12..16].copy_from_slice(&1u32.to_le_bytes());
             buf.to_vec()
         }
+        AndroidNodeKind::SelinuxCheckreqprot => b"0".to_vec(),
+        AndroidNodeKind::SelinuxDenyUnknown => b"1".to_vec(),
         AndroidNodeKind::PowerWakeLock => {
             let mut s = String::new();
             for (i, w) in a.wakelocks.iter().enumerate() {
@@ -800,12 +829,14 @@ fn render_node_bytes(state: &Step45State, kind: AndroidNodeKind) -> Vec<u8> {
         AndroidNodeKind::QyronexBinderStats => {
             let st = a.binder_audit_stats();
             format!(
-                "protocol_version={}\ncontext_managers={}\nactive_endpoints={}\ntotal_transactions={}\ntotal_replies={}\ncapability_denials={}\n",
+                "protocol_version={}\ncontext_managers={}\nactive_endpoints={}\ntotal_transactions={}\ntotal_replies={}\ntotal_fd_transfers={}\nbinderfs_devices={}\ncapability_denials={}\n",
                 BINDER_CURRENT_PROTOCOL_VERSION,
                 st.context_managers_bound,
                 st.active_endpoints,
                 st.total_transactions,
                 st.total_replies,
+                st.total_fd_transfers,
+                a.binderfs_devices.len(),
                 st.capability_denials
             )
             .into_bytes()
@@ -916,6 +947,12 @@ pub(super) fn try_handle_syscall(
             request.args[0],
             request.args[1],
         )?))),
+        // userfaultfd(flags) — Android 14/15 ART Concurrent Mark-Compact GC support
+        282 => Ok(Some(encode_result(handle_userfaultfd(request.args[0])?))),
+        // membarrier(cmd, flags, cpu_id) — Android Bionic / Scudo / ART barrier support
+        283 => Ok(Some(encode_result(handle_membarrier(
+            request.args[0] as i32,
+        )))),
         291 => handle_statx_if_android(
             request.args[0],
             request.args[1],
@@ -1253,11 +1290,92 @@ fn handle_ioctl(
 
     match entry.kind {
         AndroidNodeKind::Binder(domain) => handle_binder_ioctl(domain, entry, cmd, arg, frame),
+        AndroidNodeKind::BinderControl => handle_binderfs_control_ioctl(cmd, arg),
+        AndroidNodeKind::UserfaultFd => handle_userfaultfd_ioctl(cmd, arg),
         AndroidNodeKind::Ashmem | AndroidNodeKind::DmaHeapSystem => {
             handle_ashmem_ioctl(entry.ashmem_region_id, cmd, arg)
         }
         _ => Ok(Err(Errno::ENOTTY)),
     }
+}
+
+fn handle_userfaultfd(flags: u64) -> Result<Result<i64, Errno>, ()> {
+    let Some(process) = current_process_object() else {
+        return Err(());
+    };
+    let cloexec = (flags & O_CLOEXEC_U64) != 0;
+    with_step45_state(|state| {
+        let Some(idx) = state.fds.iter().position(|s| !s.live) else {
+            return Err(Errno::EMFILE);
+        };
+        let fd_gen = state.next_fd_generation;
+        state.next_fd_generation = state.next_fd_generation.wrapping_add(1).max(1);
+        let mut owners = DirectProcessRefs::empty();
+        owners.init(process, cloexec);
+        state.fds[idx] = AndroidFdSlot {
+            live: true,
+            kind: AndroidNodeKind::UserfaultFd,
+            generation: fd_gen,
+            owners,
+            alias_refs: 0,
+            offset: 0,
+            status_flags: flags & O_NONBLOCK_U64,
+            binder_endpoint_id: 0,
+            ashmem_region_id: 0,
+        };
+        Ok(i64::from(ANDROID_FD_BASE + (idx as i32)))
+    })
+}
+
+fn handle_membarrier(cmd: i32) -> Result<i64, Errno> {
+    if cmd == MEMBARRIER_CMD_QUERY {
+        return Ok(MEMBARRIER_SUPPORTED_MASK);
+    }
+    Ok(0)
+}
+
+fn handle_binderfs_control_ioctl(cmd: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {
+    if (cmd & 0xFFFF_FFFF) != BINDER_CTL_ADD {
+        return Ok(Err(Errno::ENOTTY));
+    }
+    let mut raw = [0u8; 264];
+    if let Err(e) = copy_from_user(&mut raw, arg) {
+        return Ok(Err(e));
+    }
+    let nul_pos = raw[..256].iter().position(|&b| b == 0).unwrap_or(256);
+    let name = core::str::from_utf8(&raw[..nul_pos]).unwrap_or("");
+    let res = with_step45_state(|state| state.android_mut().add_binderfs_device(name))?;
+    match res {
+        Ok((major, minor)) => {
+            raw[256..260].copy_from_slice(&major.to_le_bytes());
+            raw[260..264].copy_from_slice(&minor.to_le_bytes());
+            if let Err(e) = copy_to_user(arg, &raw) {
+                return Ok(Err(e));
+            }
+            Ok(Ok(0))
+        }
+        Err(e) => Ok(Err(e)),
+    }
+}
+
+fn handle_userfaultfd_ioctl(cmd: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {
+    if (cmd & 0xFFFF_FFFF) != UFFDIO_API {
+        return Ok(Err(Errno::ENOTTY));
+    }
+    let mut raw = [0u8; 24];
+    if let Err(e) = copy_from_user(&mut raw, arg) {
+        return Ok(Err(e));
+    }
+    let api = u64::from_le_bytes(raw[0..8].try_into().unwrap_or([0; 8]));
+    if api != UFFD_API_VERSION {
+        return Ok(Err(Errno::EINVAL));
+    }
+    let supported_ioctls: u64 = 0x7;
+    raw[16..24].copy_from_slice(&supported_ioctls.to_le_bytes());
+    if let Err(e) = copy_to_user(arg, &raw) {
+        return Ok(Err(e));
+    }
+    Ok(Ok(0))
 }
 
 fn handle_binder_ioctl(
@@ -1371,12 +1489,73 @@ fn handle_binder_write_read(
                     {
                         return Ok(Err(e));
                     }
+                    // Parse `flat_binder_object` offsets and retain any `BINDER_TYPE_FD` objects
+                    // for cross-process capability-validated FD transfer.
+                    let mut offsets = Vec::<u64>::new();
+                    let mut transferred_fds = Vec::<BinderTransferredFd>::new();
+                    if tx.offsets_size > 0 && tx.offsets_ptr != 0 {
+                        let count = ((tx.offsets_size as usize) / 8).min(16);
+                        let mut off_bytes = vec![0u8; count * 8];
+                        if let Err(e) = copy_from_user(&mut off_bytes, tx.offsets_ptr) {
+                            return Ok(Err(e));
+                        }
+                        let Some(sender_process) = current_process_object() else {
+                            return Err(());
+                        };
+                        for i in 0..count {
+                            let obj_off = u64::from_le_bytes(
+                                off_bytes[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]),
+                            );
+                            offsets.push(obj_off);
+                            let off_usize = obj_off as usize;
+                            if let Some(obj) = payload
+                                .get(off_usize..)
+                                .and_then(FlatBinderObject::from_le_bytes)
+                                && obj.obj_type == BINDER_TYPE_FD
+                            {
+                                match retain_any_subsystem_fd(sender_process, obj.binder_or_handle)
+                                {
+                                    Ok(Some((handle, status_flags))) => {
+                                        transferred_fds.push(BinderTransferredFd {
+                                            payload_offset: off_usize,
+                                            subsys_kind: handle.kind,
+                                            subsys_slot: handle.slot,
+                                            subsys_generation: handle.generation,
+                                            status_flags,
+                                        });
+                                    }
+                                    Ok(None) | Err(_) => {
+                                        for tfd in transferred_fds {
+                                            release_subsystem_handle(SubsystemHandle {
+                                                kind: tfd.subsys_kind,
+                                                slot: tfd.subsys_slot,
+                                                generation: tfd.subsys_generation,
+                                            });
+                                        }
+                                        return Ok(Err(Errno::EBADF));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let dispatch_res = with_step45_state(|state| {
                         let broker = state.android_mut().broker_mut(domain);
                         if bc == BC_TRANSACTION {
-                            broker.dispatch_transaction(ep_id, tx, payload)
+                            broker.dispatch_transaction_with_objects(
+                                ep_id,
+                                tx,
+                                payload,
+                                offsets,
+                                transferred_fds,
+                            )
                         } else {
-                            broker.dispatch_reply(ep_id, tx, payload)
+                            broker.dispatch_reply_with_objects(
+                                ep_id,
+                                tx,
+                                payload,
+                                offsets,
+                                transferred_fds,
+                            )
                         }
                     })?;
                     if let Err(e) = dispatch_res {
@@ -1428,19 +1607,73 @@ fn handle_binder_write_read(
                     if rbuf.len() + 4 + BINDER_TRANSACTION_DATA_BYTES > max_read {
                         break;
                     }
+                    let mut payload = work.payload;
+                    // Install any transferred `BINDER_TYPE_FD` handles into receiver's FD table.
+                    if !work.transferred_fds.is_empty()
+                        && let Some(receiver_process) = current_process_object()
+                    {
+                        for tfd in work.transferred_fds {
+                            let h = SubsystemHandle {
+                                kind: tfd.subsys_kind,
+                                slot: tfd.subsys_slot,
+                                generation: tfd.subsys_generation,
+                            };
+                            match install_subsystem_fd_in_process(
+                                receiver_process,
+                                h,
+                                false,
+                                tfd.status_flags,
+                            ) {
+                                Ok(new_fd) => {
+                                    if let Some(mut obj) = payload
+                                        .get(tfd.payload_offset..)
+                                        .and_then(FlatBinderObject::from_le_bytes)
+                                    {
+                                        obj.binder_or_handle = new_fd as u64;
+                                        payload[tfd.payload_offset
+                                            ..tfd.payload_offset + FLAT_BINDER_OBJECT_BYTES]
+                                            .copy_from_slice(&obj.to_le_bytes());
+                                    }
+                                }
+                                Err(_) => {
+                                    release_subsystem_handle(h);
+                                }
+                            }
+                        }
+                    }
                     let mut user_payload_ptr = 0u64;
-                    if !work.payload.is_empty() {
+                    if !payload.is_empty() {
                         if let Some(dst_va) = with_step45_state(|state| {
                             state
                                 .android_mut()
                                 .broker_mut(domain)
-                                .alloc_mmap_slice(ep_id, work.payload.len())
+                                .alloc_mmap_slice(ep_id, payload.len())
                         })
                         .ok()
                         .flatten()
                         {
-                            let _ = copy_to_user(dst_va, &work.payload);
+                            let _ = copy_to_user(dst_va, &payload);
                             user_payload_ptr = dst_va;
+                        }
+                    }
+                    let mut user_offsets_ptr = 0u64;
+                    let offsets_byte_len = work.offsets.len() * 8;
+                    if offsets_byte_len > 0 {
+                        let mut raw_offs = Vec::with_capacity(offsets_byte_len);
+                        for o in &work.offsets {
+                            raw_offs.extend_from_slice(&o.to_le_bytes());
+                        }
+                        if let Some(off_va) = with_step45_state(|state| {
+                            state
+                                .android_mut()
+                                .broker_mut(domain)
+                                .alloc_mmap_slice(ep_id, offsets_byte_len)
+                        })
+                        .ok()
+                        .flatten()
+                        {
+                            let _ = copy_to_user(off_va, &raw_offs);
+                            user_offsets_ptr = off_va;
                         }
                     }
                     let tx_out = BinderTransactionData {
@@ -1450,10 +1683,10 @@ fn handle_binder_write_read(
                         flags: work.flags,
                         sender_pid: work.sender_pid,
                         sender_euid: work.sender_euid,
-                        data_size: work.payload.len() as u64,
-                        offsets_size: 0,
+                        data_size: payload.len() as u64,
+                        offsets_size: offsets_byte_len as u64,
                         data_ptr: user_payload_ptr,
-                        offsets_ptr: 0,
+                        offsets_ptr: user_offsets_ptr,
                     };
                     rbuf.extend_from_slice(&work.return_cmd.to_le_bytes());
                     rbuf.extend_from_slice(&tx_out.to_le_bytes());

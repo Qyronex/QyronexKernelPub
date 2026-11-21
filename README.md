@@ -47,7 +47,7 @@ Linux compatibility targets the **userspace ABI**. Linux kernel modules are not 
 | **x86_64 SMP, PCIe & Internet Stack** | [x86_64, PCIe & Internet](docs/assets/qyronex_x86_pcie_internet_stack.png) | [x86_64, PCIe & Network (DE)](docs/de/X86_PCIE_UND_NETZWERK.md) |
 | **Raspberry Pi 3B+ / 4 / 5 SoC Stack** | [RPi Hardware Stack](docs/assets/qyronex_rpi_hardware_stack.png) | [Hardware & Drivers (DE)](docs/de/HARDWARE_UND_TREIBER.md) |
 | **Wayland (`labwc`) & XFCE 4.20 Desktop** | [Desktop Graphics Stack](docs/assets/qyronex_desktop_wayland_stack.png) | [Desktop & Graphics (DE)](docs/de/DESKTOP_UND_GRAFIK.md) |
-| **Android 15 / GrapheneOS Pixel Edition** | [Android 15 Emulator UI](docs/assets/qyronex_android_grapheneos_emulator.png) | [Android / Pixel / GrapheneOS Guide](docs/ANDROID_PIXEL_GRAPHENEOS.md) |
+| **Android 15 / GrapheneOS Pixel Edition** | [Clickable GrapheneOS 15 UI](docs/assets/qyronex_android_grapheneos_emulator.png) | [Android / Pixel / GrapheneOS Guide (10/10 + 10 Apps)](docs/ANDROID_PIXEL_GRAPHENEOS.md) |
 | **Installable ISO & MBR SD-Card Layout** | [RPi Boot & ISO Layout](docs/assets/qyronex_rpi_boot_iso_layout.png) | [Boot Protocol](docs/BOOT_PROTOCOL.md) · [DE](docs/de/BOOT_PROTOKOLL.md) |
 
 ## Build & ISOs (Raspberry Pi, x86_64 UEFI, Android 15 / GrapheneOS Pixel)

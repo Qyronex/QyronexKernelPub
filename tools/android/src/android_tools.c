@@ -5,6 +5,7 @@
 
 #include "binder_abi.h"
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 
 static int read_entire_file(const char *path, char *buf, size_t cap) {
@@ -159,7 +160,7 @@ static int cmd_logcat(void) {
 
 static int cmd_selftest(void) {
     int passed = 0;
-    int total = 8;
+    int total = 10;
     char buf[2048];
 
     printf("\n============================================================\n");
@@ -177,7 +178,7 @@ static int cmd_selftest(void) {
             }
         }
     }
-    printf("[TEST 1/8] SELINUX_ENFORCING_LOCKDOWN ....... %s\n", ok1 ? "PASS" : "FAIL");
+    printf("[TEST 1/10] SELINUX_ENFORCING_LOCKDOWN ...... %s\n", ok1 ? "PASS" : "FAIL");
     passed += ok1;
 
     /* 2. Cross-Process Binder v8 IPC with servicemanager */
@@ -193,7 +194,7 @@ static int cmd_selftest(void) {
         }
         binder_client_close(&bc);
     }
-    printf("[TEST 2/8] BINDER_V8_IPC_SERVICEMANAGER ..... %s\n", ok2 ? "PASS" : "FAIL");
+    printf("[TEST 2/10] BINDER_V8_IPC_SERVICEMANAGER .... %s\n", ok2 ? "PASS" : "FAIL");
     passed += ok2;
 
     /* 3. Ashmem mmap(MAP_SHARED) writeback + pin/unpin */
@@ -223,7 +224,7 @@ static int cmd_selftest(void) {
         }
         close(afd);
     }
-    printf("[TEST 3/8] ASHMEM_MMAP_PIN_ZERO_ON_FREE ..... %s\n", ok3 ? "PASS" : "FAIL");
+    printf("[TEST 3/10] ASHMEM_MMAP_PIN_ZERO_ON_FREE .... %s\n", ok3 ? "PASS" : "FAIL");
     passed += ok3;
 
     /* 4. DMA-Heap /dev/dma_heap/system allocation */
@@ -245,7 +246,7 @@ static int cmd_selftest(void) {
         }
         close(dfd);
     }
-    printf("[TEST 4/8] DMA_HEAP_SYSTEM_ALLOC ............ %s\n", ok4 ? "PASS" : "FAIL");
+    printf("[TEST 4/10] DMA_HEAP_SYSTEM_ALLOC ........... %s\n", ok4 ? "PASS" : "FAIL");
     passed += ok4;
 
     /* 5. Immutable ro.* System Properties + Mutable Property Write */
@@ -262,7 +263,7 @@ static int cmd_selftest(void) {
             }
         }
     }
-    printf("[TEST 5/8] RO_PROPERTIES_IMMUTABLE .......... %s\n", ok5 ? "PASS" : "FAIL");
+    printf("[TEST 5/10] RO_PROPERTIES_IMMUTABLE ......... %s\n", ok5 ? "PASS" : "FAIL");
     passed += ok5;
 
     /* 6. Power Wakelocks & PSI */
@@ -275,7 +276,7 @@ static int cmd_selftest(void) {
         strstr(buf, "some avg10=") != NULL) {
         ok6 = 1;
     }
-    printf("[TEST 6/8] POWER_WAKELOCK_AND_PSI ........... %s\n", ok6 ? "PASS" : "FAIL");
+    printf("[TEST 6/10] POWER_WAKELOCK_AND_PSI .......... %s\n", ok6 ? "PASS" : "FAIL");
     passed += ok6;
 
     /* 7. GrapheneOS Hardening Status */
@@ -287,7 +288,7 @@ static int cmd_selftest(void) {
         strstr(buf, "zero_on_free=1") != NULL) {
         ok7 = 1;
     }
-    printf("[TEST 7/8] GRAPHENEOS_HARDENING_STATUS ...... %s\n", ok7 ? "PASS" : "FAIL");
+    printf("[TEST 7/10] GRAPHENEOS_HARDENING_STATUS ..... %s\n", ok7 ? "PASS" : "FAIL");
     passed += ok7;
 
     /* 8. Google Pixel Titan M2 + Shannon Modem IOMMU Telemetry */
@@ -298,13 +299,124 @@ static int cmd_selftest(void) {
         strstr(buf, "modem_iommu_sandbox=enforced") != NULL) {
         ok8 = 1;
     }
-    printf("[TEST 8/8] PIXEL_TITAN_M2_MODEM_IOMMU ....... %s\n", ok8 ? "PASS" : "FAIL");
+    printf("[TEST 8/10] PIXEL_TITAN_M2_MODEM_IOMMU ...... %s\n", ok8 ? "PASS" : "FAIL");
     passed += ok8;
+
+    /* 9. Real Cross-Process Binder v8 FD Passing (`BINDER_TYPE_FD`) */
+    int ok9 = 0;
+    {
+        int sfd = open("/dev/ashmem", O_RDWR | O_CLOEXEC);
+        struct binder_client fbc;
+        if (sfd >= 0 && binder_client_open(&fbc, "/dev/binder") == 0) {
+            (void)ioctl(sfd, ASHMEM_SET_SIZE, (unsigned long)4096);
+            (void)pwrite(sfd, "FD_PASSED_OK", 12, 0);
+
+            struct flat_binder_object fbo;
+            memset(&fbo, 0, sizeof(fbo));
+            fbo.hdr_type = BINDER_TYPE_FD;
+            fbo.flags = 0x7f;
+            fbo.binder_or_handle = (uint64_t)sfd;
+            uint64_t obj_off = 0;
+
+            uint8_t wbuf[4 + sizeof(struct binder_transaction_data)];
+            uint32_t wcmd = BC_TRANSACTION;
+            struct binder_transaction_data tx;
+            memset(&tx, 0, sizeof(tx));
+            tx.target_handle_or_ptr = 0;
+            tx.code = SM_CMD_ECHO_FD;
+            tx.flags = 0x10; /* TF_ACCEPT_FDS */
+            tx.data_size = sizeof(fbo);
+            tx.offsets_size = sizeof(obj_off);
+            tx.data_ptr = (uint64_t)(uintptr_t)&fbo;
+            tx.offsets_ptr = (uint64_t)(uintptr_t)&obj_off;
+            memcpy(wbuf, &wcmd, 4);
+            memcpy(wbuf + 4, &tx, sizeof(tx));
+
+            uint8_t rbuf[512];
+            struct binder_write_read bwr;
+            memset(&bwr, 0, sizeof(bwr));
+            bwr.write_size = sizeof(wbuf);
+            bwr.write_buffer = (uint64_t)(uintptr_t)wbuf;
+            bwr.read_size = sizeof(rbuf);
+            bwr.read_buffer = (uint64_t)(uintptr_t)rbuf;
+
+            if (ioctl(fbc.fd, BINDER_WRITE_READ, &bwr) == 0) {
+                char freply[192] = {0};
+                for (int tries = 0; tries < 64 && !freply[0]; tries++) {
+                    size_t off = 0;
+                    while (off + 4 <= (size_t)bwr.read_consumed) {
+                        uint32_t br = 0;
+                        memcpy(&br, rbuf + off, 4);
+                        off += 4;
+                        if (br == BR_REPLY && off + sizeof(tx) <= (size_t)bwr.read_consumed) {
+                            struct binder_transaction_data rtx;
+                            memcpy(&rtx, rbuf + off, sizeof(rtx));
+                            off += sizeof(rtx);
+                            if (rtx.data_ptr && rtx.data_size > 0) {
+                                size_t n = (size_t)rtx.data_size;
+                                if (n >= sizeof(freply)) n = sizeof(freply) - 1;
+                                memcpy(freply, (const void *)(uintptr_t)rtx.data_ptr, n);
+                                freply[n] = '\0';
+                            }
+                            break;
+                        }
+                    }
+                    if (!freply[0]) {
+                        memset(&bwr, 0, sizeof(bwr));
+                        bwr.read_size = sizeof(rbuf);
+                        bwr.read_buffer = (uint64_t)(uintptr_t)rbuf;
+                        if (ioctl(fbc.fd, BINDER_WRITE_READ, &bwr) < 0) break;
+                    }
+                }
+                char verify_back[16] = {0};
+                (void)pread(sfd, verify_back, 12, 32);
+                if (strstr(freply, "FD_OK") && strstr(freply, "FD_PASSED_OK") &&
+                    memcmp(verify_back, "SM_SAW_FD_OK", 12) == 0) {
+                    ok9 = 1;
+                }
+            }
+            binder_client_close(&fbc);
+        }
+        if (sfd >= 0) close(sfd);
+    }
+    printf("[TEST 9/10] BINDER_FD_PASSING_CROSS_PROC .... %s\n", ok9 ? "PASS" : "FAIL");
+    passed += ok9;
+
+    /* 10. binderfs BINDER_CTL_ADD + Android 15 ART userfaultfd + membarrier */
+    int ok10 = 0;
+    {
+        int ctl_ok = 0, uffd_ok = 0, mb_ok = 0;
+        int cfd = open("/dev/binderfs/binder-control", O_RDWR | O_CLOEXEC);
+        if (cfd >= 0) {
+            struct binderfs_device dev;
+            memset(&dev, 0, sizeof(dev));
+            snprintf(dev.name, sizeof(dev.name), "qyronex-hal");
+            if (ioctl(cfd, BINDER_CTL_ADD, &dev) == 0 && dev.major == 240) {
+                ctl_ok = 1;
+            }
+            close(cfd);
+        }
+        long ufd = syscall(282 /* SYS_userfaultfd */, O_CLOEXEC);
+        if (ufd >= 0) {
+            struct uffdio_api ua;
+            memset(&ua, 0, sizeof(ua));
+            ua.api = 0xAA;
+            if (ioctl((int)ufd, UFFDIO_API, &ua) == 0 && ua.ioctls != 0) {
+                uffd_ok = 1;
+            }
+            close((int)ufd);
+        }
+        long mb = syscall(283 /* SYS_membarrier */, 0, 0, 0);
+        if (mb > 0) mb_ok = 1;
+        if (ctl_ok && uffd_ok && mb_ok) ok10 = 1;
+    }
+    printf("[TEST 10/10] BINDERFS_USERFAULTFD_MEMBARRIER  %s\n", ok10 ? "PASS" : "FAIL");
+    passed += ok10;
 
     printf("------------------------------------------------------------\n");
     if (passed == total) {
         printf("QYRONEX_ANDROID_SELFTEST: ALL %d/%d PASSED\n", passed, total);
-        android_log_write("I/QyronexSelftest: ALL 8/8 Android 15 / GrapheneOS kernel checks PASSED");
+        android_log_write("I/QyronexSelftest: ALL 10/10 Android 15 / GrapheneOS kernel checks PASSED");
         return 0;
     } else {
         printf("QYRONEX_ANDROID_SELFTEST: FAILED (%d/%d passed)\n", passed, total);

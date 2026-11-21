@@ -62,12 +62,39 @@
 #define ASHMEM_IS_PINNED            1
 
 #define DMA_HEAP_IOCTL_ALLOC        0xc0184800UL
+#define BINDER_CTL_ADD              0xc1086201UL
+#define UFFDIO_API                  0xc018aa3fUL
+
+/* 64-bit flat_binder_object types (Linux UAPI). */
+#define BINDER_TYPE_BINDER          0x73622a85U
+#define BINDER_TYPE_HANDLE          0x73682a85U
+#define BINDER_TYPE_FD              0x66642a85U
 
 /* Qyronex Android ServiceManager RPC codes (target handle = 0). */
 #define SM_CMD_ADD_SERVICE          1U
 #define SM_CMD_GET_SERVICE          2U
 #define SM_CMD_LIST_SERVICES        3U
 #define SM_CMD_PING                 4U
+#define SM_CMD_ECHO_FD              5U
+
+struct flat_binder_object {
+    uint32_t hdr_type;
+    uint32_t flags;
+    uint64_t binder_or_handle;
+    uint64_t cookie;
+};
+
+struct binderfs_device {
+    char name[256];
+    uint32_t major;
+    uint32_t minor;
+};
+
+struct uffdio_api {
+    uint64_t api;
+    uint64_t features;
+    uint64_t ioctls;
+};
 
 struct binder_write_read {
     uint64_t write_size;

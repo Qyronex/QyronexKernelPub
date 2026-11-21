@@ -9,7 +9,7 @@ DIST_DIR="${DIST_DIR:-$REPO_DIR/dist}"
 
 MODE="vnc"
 SMP="1"
-MEM="1G"
+MEM="2G"
 SOC="zumapro"
 OPEN_UI="auto"
 BUILD_FIRST=0
@@ -73,7 +73,7 @@ if [ "$BUILD_FIRST" = "1" ] || [ ! -f "$KERNEL_ELF" ] || [ ! -f "$SYSTEM_IMG" ] 
   fi
 fi
 
-APPEND_LINE="console=ttyAMA0 root=/dev/vda1 rw init=/system/bin/android-init androidboot.hardware=${SOC} androidboot.selinux=enforcing androidboot.verifiedbootstate=green"
+APPEND_LINE="console=ttyAMA0 root=/dev/vda1 rw init=/sbin/init udev.children_max=2 systemd.unit=multi-user.target androidboot.hardware=${SOC} androidboot.selinux=enforcing androidboot.verifiedbootstate=green"
 
 echo "==================================================================="
 echo "  Qyronex OS - Android 15 / GrapheneOS Pixel Emulator"

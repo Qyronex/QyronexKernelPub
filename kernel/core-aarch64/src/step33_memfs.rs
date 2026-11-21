@@ -372,6 +372,7 @@ impl MemFs {
             (b"vndbinder", 10, 62, 0o666),
             (b"ashmem", 10, 63, 0o666),
             (b"pmsg0", 10, 64, 0o222),
+            (b"fuse", 10, 229, 0o666),
         ] {
             let rdev = makedev(maj, min);
             let _ = self.seed_node(
@@ -477,6 +478,28 @@ impl MemFs {
                 MemNodeKind::ChrDev(rdev),
                 S_IFCHR | 0o666,
                 rdev,
+                b"",
+                now,
+            );
+        }
+        if let Some(bfs_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"binderfs",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            let ctl_rdev = makedev(240, 0);
+            let _ = self.seed_node(
+                mount_id,
+                bfs_ino,
+                b"binder-control",
+                MemNodeKind::ChrDev(ctl_rdev),
+                S_IFCHR | 0o666,
+                ctl_rdev,
                 b"",
                 now,
             );

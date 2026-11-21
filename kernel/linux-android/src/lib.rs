@@ -36,6 +36,27 @@ pub const BINDER_SET_CONTEXT_MGR: u64 = 0x4004_6207;
 pub const BINDER_THREAD_EXIT: u64 = 0x4004_6208;
 pub const BINDER_VERSION: u64 = 0xC004_6209;
 pub const BINDER_SET_CONTEXT_MGR_EXT: u64 = 0x4018_620D;
+/// Linux `BINDER_CTL_ADD` ioctl on `/dev/binderfs/binder-control` (`struct binderfs_device` = 264B).
+pub const BINDER_CTL_ADD: u64 = 0xC108_6201;
+
+// Binder flat object types (`flat_binder_object.hdr.type`)
+pub const BINDER_TYPE_BINDER: u32 = 0x7362_2A85;
+pub const BINDER_TYPE_WEAK_BINDER: u32 = 0x7762_2A85;
+pub const BINDER_TYPE_HANDLE: u32 = 0x7368_2A85;
+pub const BINDER_TYPE_WEAK_HANDLE: u32 = 0x7768_2A85;
+pub const BINDER_TYPE_FD: u32 = 0x6664_2A85;
+pub const FLAT_BINDER_OBJECT_BYTES: usize = 24;
+
+// Android 15 ART / Bionic syscalls (`userfaultfd` + `membarrier`)
+pub const UFFDIO_API: u64 = 0xC018_AA3F;
+pub const UFFD_API_VERSION: u64 = 0xAA;
+pub const MEMBARRIER_CMD_QUERY: i32 = 0;
+pub const MEMBARRIER_CMD_GLOBAL: i32 = 1 << 0;
+pub const MEMBARRIER_CMD_PRIVATE_EXPEDITED: i32 = 1 << 3;
+pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
+pub const MEMBARRIER_SUPPORTED_MASK: i64 = (MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as i64;
 
 // Binder Command Protocol (userspace -> kernel)
 pub const BC_TRANSACTION: u32 = 0x4040_6300;
@@ -207,6 +228,61 @@ impl BinderTransactionData {
     }
 }
 
+/// Wire layout of 64-bit `struct flat_binder_object` (24 bytes) for object & FD passing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlatBinderObject {
+    pub obj_type: u32,
+    pub flags: u32,
+    pub binder_or_handle: u64,
+    pub cookie: u64,
+}
+
+impl FlatBinderObject {
+    pub fn from_le_bytes(raw: &[u8]) -> Option<Self> {
+        if raw.len() < FLAT_BINDER_OBJECT_BYTES {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+        let u64_at = |o: usize| {
+            u64::from_le_bytes([
+                raw[o],
+                raw[o + 1],
+                raw[o + 2],
+                raw[o + 3],
+                raw[o + 4],
+                raw[o + 5],
+                raw[o + 6],
+                raw[o + 7],
+            ])
+        };
+        Some(Self {
+            obj_type: u32_at(0),
+            flags: u32_at(4),
+            binder_or_handle: u64_at(8),
+            cookie: u64_at(16),
+        })
+    }
+
+    pub fn to_le_bytes(self) -> [u8; FLAT_BINDER_OBJECT_BYTES] {
+        let mut out = [0u8; FLAT_BINDER_OBJECT_BYTES];
+        out[0..4].copy_from_slice(&self.obj_type.to_le_bytes());
+        out[4..8].copy_from_slice(&self.flags.to_le_bytes());
+        out[8..16].copy_from_slice(&self.binder_or_handle.to_le_bytes());
+        out[16..24].copy_from_slice(&self.cookie.to_le_bytes());
+        out
+    }
+}
+
+/// Retained kernel subsystem FD in flight inside a `BINDER_TYPE_FD` transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BinderTransferredFd {
+    pub payload_offset: usize,
+    pub subsys_kind: u8,
+    pub subsys_slot: u16,
+    pub subsys_generation: u64,
+    pub status_flags: u64,
+}
+
 /// Queued Binder message delivered to a recipient process (`BR_TRANSACTION` or `BR_REPLY`).
 #[derive(Clone, Debug)]
 pub struct QueuedBinderWork {
@@ -219,6 +295,8 @@ pub struct QueuedBinderWork {
     pub sender_euid: u32,
     pub reply_to_client_id: Option<u32>,
     pub payload: Vec<u8>,
+    pub offsets: Vec<u64>,
+    pub transferred_fds: Vec<BinderTransferredFd>,
 }
 
 /// Registered Binder client endpoint belonging to one Linux/Android process.
@@ -251,6 +329,7 @@ pub struct BinderServiceNode {
 pub struct BinderAuditStats {
     pub total_transactions: u64,
     pub total_replies: u64,
+    pub total_fd_transfers: u64,
     pub capability_denials: u64,
     pub active_endpoints: usize,
     pub context_managers_bound: u8,
@@ -267,6 +346,7 @@ pub struct BinderDomainBroker {
     nodes: Vec<BinderServiceNode>,
     pub total_transactions: u64,
     pub total_replies: u64,
+    pub total_fd_transfers: u64,
     pub capability_denials: u64,
 }
 
@@ -281,6 +361,7 @@ impl BinderDomainBroker {
             nodes: Vec::new(),
             total_transactions: 0,
             total_replies: 0,
+            total_fd_transfers: 0,
             capability_denials: 0,
         }
     }
@@ -428,6 +509,19 @@ impl BinderDomainBroker {
         tx: BinderTransactionData,
         payload: Vec<u8>,
     ) -> Result<(), Errno> {
+        self.dispatch_transaction_with_objects(sender_id, tx, payload, Vec::new(), Vec::new())
+    }
+
+    /// Dispatches one `BC_TRANSACTION` including translated `flat_binder_object` offsets and
+    /// cross-process transferred kernel subsystem FDs (`BINDER_TYPE_FD`).
+    pub fn dispatch_transaction_with_objects(
+        &mut self,
+        sender_id: u32,
+        tx: BinderTransactionData,
+        mut payload: Vec<u8>,
+        offsets: Vec<u64>,
+        transferred_fds: Vec<BinderTransferredFd>,
+    ) -> Result<(), Errno> {
         if payload.len() > MAX_BINDER_PAYLOAD_BYTES {
             return Err(Errno::EINVAL);
         }
@@ -438,6 +532,28 @@ impl BinderDomainBroker {
         if !sender_rights.contains(CapRights::WRITE) {
             self.capability_denials += 1;
             return Err(Errno::EPERM);
+        }
+
+        // Translate `BINDER_TYPE_BINDER` objects into `BINDER_TYPE_HANDLE` for the recipient.
+        for &off_u64 in &offsets {
+            let off = off_u64 as usize;
+            if let Some(mut obj) = payload.get(off..).and_then(FlatBinderObject::from_le_bytes)
+                && (obj.obj_type == BINDER_TYPE_BINDER || obj.obj_type == BINDER_TYPE_WEAK_BINDER)
+            {
+                let h = self.register_node(
+                    sender_id,
+                    obj.binder_or_handle,
+                    obj.cookie,
+                    CapRights::WRITE,
+                )?;
+                obj.obj_type = if obj.obj_type == BINDER_TYPE_BINDER {
+                    BINDER_TYPE_HANDLE
+                } else {
+                    BINDER_TYPE_WEAK_HANDLE
+                };
+                obj.binder_or_handle = u64::from(h);
+                payload[off..off + FLAT_BINDER_OBJECT_BYTES].copy_from_slice(&obj.to_le_bytes());
+            }
         }
 
         let handle = tx.target_handle_or_ptr as u32;
@@ -458,6 +574,7 @@ impl BinderDomainBroker {
             (node.owner_endpoint_id, node.ptr, node.cookie)
         };
 
+        let fd_count = transferred_fds.len() as u64;
         let one_way = (tx.flags & TF_ONE_WAY) != 0;
         let work = QueuedBinderWork {
             return_cmd: BR_TRANSACTION,
@@ -469,6 +586,8 @@ impl BinderDomainBroker {
             sender_euid,
             reply_to_client_id: if one_way { None } else { Some(sender_id) },
             payload,
+            offsets,
+            transferred_fds,
         };
 
         let target = self.endpoint_mut(target_ep_id).ok_or(Errno::EPIPE)?;
@@ -486,9 +605,12 @@ impl BinderDomainBroker {
                 sender_euid: 0,
                 reply_to_client_id: None,
                 payload: Vec::new(),
+                offsets: Vec::new(),
+                transferred_fds: Vec::new(),
             });
         }
         self.total_transactions = self.total_transactions.saturating_add(1);
+        self.total_fd_transfers = self.total_fd_transfers.saturating_add(fd_count);
         Ok(())
     }
 
@@ -500,6 +622,18 @@ impl BinderDomainBroker {
         tx: BinderTransactionData,
         payload: Vec<u8>,
     ) -> Result<(), Errno> {
+        self.dispatch_reply_with_objects(server_id, tx, payload, Vec::new(), Vec::new())
+    }
+
+    /// Dispatches one `BC_REPLY` including translated `flat_binder_object` offsets and FDs.
+    pub fn dispatch_reply_with_objects(
+        &mut self,
+        server_id: u32,
+        tx: BinderTransactionData,
+        payload: Vec<u8>,
+        offsets: Vec<u64>,
+        transferred_fds: Vec<BinderTransferredFd>,
+    ) -> Result<(), Errno> {
         if payload.len() > MAX_BINDER_PAYLOAD_BYTES {
             return Err(Errno::EINVAL);
         }
@@ -509,6 +643,7 @@ impl BinderDomainBroker {
             (srv.linux_pid, srv.linux_euid, cid)
         };
 
+        let fd_count = transferred_fds.len() as u64;
         let reply_work = QueuedBinderWork {
             return_cmd: BR_REPLY,
             target_ptr: 0,
@@ -519,6 +654,8 @@ impl BinderDomainBroker {
             sender_euid: server_euid,
             reply_to_client_id: None,
             payload,
+            offsets,
+            transferred_fds,
         };
 
         if let Some(client) = self.endpoint_mut(client_id) {
@@ -535,9 +672,12 @@ impl BinderDomainBroker {
                 sender_euid: 0,
                 reply_to_client_id: None,
                 payload: Vec::new(),
+                offsets: Vec::new(),
+                transferred_fds: Vec::new(),
             });
         }
         self.total_replies = self.total_replies.saturating_add(1);
+        self.total_fd_transfers = self.total_fd_transfers.saturating_add(fd_count);
         Ok(())
     }
 
@@ -723,6 +863,7 @@ pub struct AndroidKernelState {
     pub hardening: GrapheneOsHardeningPolicy,
     pub selinux_check_count: u64,
     pub ashmem_regions: Vec<AshmemRegion>,
+    pub binderfs_devices: Vec<String>,
     next_ashmem_id: u32,
 }
 
@@ -737,6 +878,11 @@ impl AndroidKernelState {
             hardening: GrapheneOsHardeningPolicy::default_pixel_grapheneos(),
             selinux_check_count: 0,
             ashmem_regions: Vec::new(),
+            binderfs_devices: vec![
+                String::from("binder"),
+                String::from("hwbinder"),
+                String::from("vndbinder"),
+            ],
             next_ashmem_id: 1,
         };
         state.seed_default_properties();
@@ -870,6 +1016,23 @@ impl AndroidKernelState {
         }
     }
 
+    /// Provisions a dynamic named binderfs device via `BINDER_CTL_ADD`.
+    pub fn add_binderfs_device(&mut self, name: &str) -> Result<(u32, u32), Errno> {
+        let trimmed = name.trim_matches('\0').trim();
+        if trimmed.is_empty() || trimmed.len() > 64 || trimmed.contains('/') {
+            return Err(Errno::EINVAL);
+        }
+        if let Some(pos) = self.binderfs_devices.iter().position(|n| n == trimmed) {
+            return Ok((240, pos as u32));
+        }
+        if self.binderfs_devices.len() >= 16 {
+            return Err(Errno::ENOSPC);
+        }
+        let minor = self.binderfs_devices.len() as u32;
+        self.binderfs_devices.push(String::from(trimmed));
+        Ok((240, minor))
+    }
+
     pub fn binder_audit_stats(&self) -> BinderAuditStats {
         let mut mgrs = 0u8;
         if self.binder.has_context_manager() {
@@ -888,6 +1051,9 @@ impl AndroidKernelState {
             total_replies: self.binder.total_replies
                 + self.hwbinder.total_replies
                 + self.vndbinder.total_replies,
+            total_fd_transfers: self.binder.total_fd_transfers
+                + self.hwbinder.total_fd_transfers
+                + self.vndbinder.total_fd_transfers,
             capability_denials: self.binder.capability_denials
                 + self.hwbinder.capability_denials
                 + self.vndbinder.capability_denials,
@@ -1063,5 +1229,86 @@ mod tests {
         assert_eq!(state.wakelocks.len(), 2);
         state.release_wakelock("SurfaceFlinger").unwrap();
         assert_eq!(state.wakelocks, vec![String::from("PowerManagerService")]);
+    }
+
+    #[test]
+    fn binder_v8_flat_object_and_fd_transfer() {
+        let mut state = AndroidKernelState::new();
+        let mgr = state
+            .binder
+            .open_endpoint(ObjectId(1), 10, 0, full_cap(1))
+            .unwrap();
+        state.binder.set_context_manager(mgr).unwrap();
+        let cli = state
+            .binder
+            .open_endpoint(ObjectId(2), 20, 1000, full_cap(2))
+            .unwrap();
+
+        let obj_binder = FlatBinderObject {
+            obj_type: BINDER_TYPE_BINDER,
+            flags: 0,
+            binder_or_handle: 0xDEAD_BEEF,
+            cookie: 0xCAFE,
+        };
+        let obj_fd = FlatBinderObject {
+            obj_type: BINDER_TYPE_FD,
+            flags: 0,
+            binder_or_handle: 7,
+            cookie: 0,
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&obj_binder.to_le_bytes());
+        payload.extend_from_slice(&obj_fd.to_le_bytes());
+        let offsets = vec![0u64, FLAT_BINDER_OBJECT_BYTES as u64];
+        let xfer = vec![BinderTransferredFd {
+            payload_offset: FLAT_BINDER_OBJECT_BYTES,
+            subsys_kind: 14,
+            subsys_slot: 3,
+            subsys_generation: 1,
+            status_flags: 2,
+        }];
+        let tx = BinderTransactionData {
+            target_handle_or_ptr: 0,
+            cookie: 0,
+            code: 5,
+            flags: 0,
+            sender_pid: 20,
+            sender_euid: 1000,
+            data_size: payload.len() as u64,
+            offsets_size: (offsets.len() * 8) as u64,
+            data_ptr: 0,
+            offsets_ptr: 0,
+        };
+        state
+            .binder
+            .dispatch_transaction_with_objects(cli, tx, payload, offsets, xfer)
+            .unwrap();
+        assert_eq!(state.binder.total_transactions, 1);
+        assert_eq!(state.binder.total_fd_transfers, 1);
+
+        let delivered = state.binder.pop_work(mgr).unwrap();
+        assert_eq!(delivered.return_cmd, BR_TRANSACTION);
+        assert_eq!(delivered.transferred_fds.len(), 1);
+        assert_eq!(delivered.offsets.len(), 2);
+        let translated =
+            FlatBinderObject::from_le_bytes(&delivered.payload[..FLAT_BINDER_OBJECT_BYTES])
+                .unwrap();
+        assert_eq!(translated.obj_type, BINDER_TYPE_HANDLE);
+        assert!(translated.binder_or_handle >= 1);
+    }
+
+    #[test]
+    fn binderfs_dynamic_device_allocation() {
+        let mut state = AndroidKernelState::new();
+        assert_eq!(state.binderfs_devices.len(), 3);
+        let (major, minor) = state.add_binderfs_device("my-custom-binder").unwrap();
+        assert_eq!(major, 240);
+        assert!(minor >= 3);
+        assert_eq!(state.binderfs_devices.len(), 4);
+        assert_eq!(
+            state.add_binderfs_device("my-custom-binder"),
+            Ok((major, minor))
+        );
+        assert_eq!(state.add_binderfs_device("../bad"), Err(Errno::EINVAL));
     }
 }
