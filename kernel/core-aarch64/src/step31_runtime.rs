@@ -1014,6 +1014,7 @@ enum SharedMmapBacking {
     MemFd { idx: usize, generation: u64 },
     Ext4 { mount_id: u32, ino: u32 },
     DrmDumb { handle: u32 },
+    Ashmem { region_id: u32 },
 }
 
 #[cfg(feature = "step29-qemu-proof")]
@@ -1472,6 +1473,13 @@ fn sync_shared_mmap_inner(range_filter: Option<(u64, u64)>, remove_matched: bool
                             &page_buf[..chunk],
                         );
                     }
+                    SharedMmapBacking::Ashmem { region_id } => {
+                        super::step45_android::write_back_ashmem_mmap(
+                            region_id,
+                            file_off,
+                            &page_buf[..chunk],
+                        );
+                    }
                 }
             }
             va = va.saturating_add(chunk as u64);
@@ -1770,6 +1778,57 @@ fn handle_file_backed_mmap(
         Ok(None) => {}
         Err(errno) => return Ok(Err(VmError::Linux(errno))),
     }
+    match super::step45_android::try_prepare_android_mmap(
+        raw_fd,
+        usize::try_from(length).unwrap_or(0),
+    ) {
+        Ok(Some(super::step45_android::AndroidMmapKind::Binder {
+            domain,
+            endpoint_id,
+        })) => {
+            let res = super::live_vm::handle_step31_dynamic_mmap(
+                address,
+                length,
+                protection,
+                flags,
+                raw_fd,
+                0,
+                kernal_linux_vm::MmapFileBacking::FileSlice {
+                    bytes: &[],
+                    file_offset: 0,
+                },
+            )?;
+            if let Ok(mapped_va) = res {
+                super::step45_android::register_binder_mmap(
+                    domain,
+                    endpoint_id,
+                    mapped_va,
+                    usize::try_from(length).unwrap_or(0),
+                );
+            }
+            return Ok(res);
+        }
+        Ok(Some(super::step45_android::AndroidMmapKind::Ashmem { region_id })) => {
+            let snap = super::step45_android::read_ashmem_snapshot(
+                region_id,
+                usize::try_from(offset).unwrap_or(0),
+                usize::try_from(length).unwrap_or(0),
+            );
+            return finish_file_backed_mmap(
+                process,
+                address,
+                length,
+                protection,
+                flags,
+                raw_fd,
+                0,
+                &snap,
+                shared.then_some((SharedMmapBacking::Ashmem { region_id }, need_write, 0)),
+            );
+        }
+        Ok(None) => {}
+        Err(errno) => return Ok(Err(VmError::Linux(errno))),
+    }
     let fd = linux_signed_int(raw_fd);
     let resolved = super::step29_runtime::with_process(process, |runtime| {
         let (initrd, root_id) = {
@@ -1950,7 +2009,9 @@ fn try_handle_mremap_inner(
                     None => return Ok(Err(VmError::Linux(Errno::EFAULT))),
                 }
             }
-            SharedMmapBacking::Ext4 { .. } | SharedMmapBacking::DrmDumb { .. } => {
+            SharedMmapBacking::Ext4 { .. }
+            | SharedMmapBacking::DrmDumb { .. }
+            | SharedMmapBacking::Ashmem { .. } => {
                 let copy_n = usize::try_from(entry.len).unwrap_or(0);
                 match copy_user_pages_to_vec(old_address, copy_n) {
                     Ok(b) => (b, entry.rev),

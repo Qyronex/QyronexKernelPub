@@ -25,10 +25,12 @@ kernal-fdt-aarch64 = { path = "../../firmware/fdt-aarch64" }
 kernal-fdt-initrd = { path = "../../firmware/fdt-initrd" }
 kernal-frame-allocator = { path = "../frame-allocator" }
 kernal-gicv3-aarch64 = { path = "../gicv3-aarch64" }
+kernal-google-pixel = { path = "../../drivers/google-pixel" }
 kernal-heap = { path = "../heap" }
 kernal-kmap-aarch64 = { path = "../kmap-aarch64" }
 kernal-linux-aarch64-abi = { path = "../../abi/linux-aarch64" }
 kernal-linux-abi = { path = "../../abi/linux" }
+kernal-linux-android = { path = "../linux-android" }
 kernal-linux-bootstrap = { path = "../linux-bootstrap" }
 kernal-linux-bootstrap-aarch64 = { path = "../linux-bootstrap-aarch64" }
 kernal-linux-clone = { path = "../linux-clone" }
@@ -103,3 +105,4 @@ step29-fs-breadth-negative-qemu-proof = ["step29-qemu-proof"]
 step30-final-qemu-proof = ["step29-qemu-proof"]
 step31-debian-qemu = ["step29-qemu-proof"]
 step31-debian-shell = ["step31-debian-qemu"]
+android-pixel = ["step31-debian-shell"]

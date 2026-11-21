@@ -1101,6 +1101,9 @@ fn probe_external_fd_readiness(process: ObjectId, raw_fd: u64) -> Result<u32, Er
     if let Some(res) = super::step43_desktop::probe_desktop_fd_readiness(process, raw_fd) {
         return res;
     }
+    if let Some(res) = super::step45_android::probe_android_fd_readiness(process, raw_fd) {
+        return res;
+    }
 
     let fd = linux_signed_int(raw_fd);
     if fd < 0 || fd >= super::step29_runtime::STEP29_RUNTIME_FDS as i32 {

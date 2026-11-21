@@ -99,6 +99,8 @@ mod step42_hardware;
 mod step43_desktop;
 #[path = "step44_conformance.rs"]
 mod step44_conformance;
+#[path = "step45_android.rs"]
+mod step45_android;
 #[path = "step_fd_util.rs"]
 mod step_fd_util;
 #[path = "step15_write.rs"]
@@ -241,6 +243,28 @@ unsafe fn run_protected(
         serial.write_str(
             "KERNAL/ARM64: BCM2837 (Raspberry Pi 3B+) drivers attached (Mailbox/GPIO54/PL011/MiniUART/QA7/SDHCI/DWC2/LAN7515-GbE/I2C/SPI/WDT)\n",
         );
+    }
+    {
+        let mut bootargs = [0u8; 256];
+        let ba_len = step42_hardware::copy_bootargs(&mut bootargs);
+        let ba_str = core::str::from_utf8(&bootargs[..ba_len]).unwrap_or("");
+        if cfg!(feature = "android-pixel") || ba_str.contains("androidboot.") {
+            let soc = if ba_str.contains("zumapro") {
+                kernal_google_pixel::PixelSocGeneration::TensorG4ZumaPro
+            } else if ba_str.contains("zuma") {
+                kernal_google_pixel::PixelSocGeneration::TensorG3Zuma
+            } else if ba_str.contains("gs201") {
+                kernal_google_pixel::PixelSocGeneration::TensorG2Gs201
+            } else if ba_str.contains("gs101") {
+                kernal_google_pixel::PixelSocGeneration::TensorG1Gs101
+            } else {
+                kernal_google_pixel::PixelSocGeneration::EmulatorVirtGki
+            };
+            step45_android::configure_pixel_soc(soc);
+            serial.write_str(
+                "KERNAL/ANDROID: Qyronex Android 15 / GrapheneOS subsystem online (Binder v8 / Ashmem / SELinux enforcing / Titan M2)\n",
+            );
+        }
     }
 
     // Map native Raspberry Pi hardware peripherals (VideoCore VI Mailbox on Pi 4B, Arasan SDHCI /
@@ -1047,6 +1071,29 @@ fn step15_lower_el_dispatch(frame: &mut ExceptionFrame, signal_frame_committed: 
         step44_conformance::try_handle_syscall,
     ) {
         return handled;
+    }
+
+    match step45_android::try_handle_syscall(request, frame) {
+        Ok(Some(result)) => {
+            frame.x[0] = result.as_u64_bits();
+            if let Some(serial) = step15_svc_trace_serial() {
+                serial.write_str("KERNAL/ARM64: Step 45 android syscall nr=");
+                serial.write_u64(request.number);
+                serial.write_str(" result=");
+                serial.write_hex_u64(frame.x[0]);
+                serial.write_str("\n");
+            }
+            return true;
+        }
+        Ok(None) => {}
+        Err(()) => {
+            if let Some(serial) = step15_svc_serial() {
+                serial.write_str("KERNAL/ARM64: Step 45 android invariant failed nr=");
+                serial.write_u64(request.number);
+                serial.write_str("\n");
+            }
+            return false;
+        }
     }
 
     match step33_mounts::try_handle_syscall(request) {

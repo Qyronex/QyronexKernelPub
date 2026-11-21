@@ -150,11 +150,19 @@ pub unsafe fn load_and_publish<const SCHED_THREADS: usize, const WAKES: usize>(
                 b"TERM=vt100",
                 b"PS1=debian13# ",
             ];
-            let init_envp: [&[u8]; 3] = [
-                b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                b"HOME=/root",
-                b"TERM=vt100",
-            ];
+            let init_envp: [&[u8]; 3] = if cfg!(feature = "android-pixel") {
+                [
+                    b"PATH=/system/bin:/system/xbin:/vendor/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    b"HOME=/data/local/tmp",
+                    b"TERM=vt100",
+                ]
+            } else {
+                [
+                    b"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                    b"HOME=/root",
+                    b"TERM=vt100",
+                ]
+            };
             let argv0: &[u8] = b"/bin/dash";
             let random = entropy::take_at_random().map_err(Error::Entropy)?;
             let mut start = LinuxProcessStart::new(argv0, random);

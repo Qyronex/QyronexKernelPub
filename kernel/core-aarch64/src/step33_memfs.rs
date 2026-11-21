@@ -367,6 +367,11 @@ impl MemFs {
             (b"ptmx", 5, 2, 0o666),
             (b"ttyAMA0", 204, 64, 0o620),
             (b"kmsg", 1, 11, 0o644),
+            (b"binder", 10, 60, 0o666),
+            (b"hwbinder", 10, 61, 0o666),
+            (b"vndbinder", 10, 62, 0o666),
+            (b"ashmem", 10, 63, 0o666),
+            (b"pmsg0", 10, 64, 0o222),
         ] {
             let rdev = makedev(maj, min);
             let _ = self.seed_node(
@@ -427,6 +432,50 @@ impl MemFs {
                 b"card0",
                 MemNodeKind::ChrDev(rdev),
                 S_IFCHR | 0o660,
+                rdev,
+                b"",
+                now,
+            );
+        }
+        if let Some(dma_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"dma_heap",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            let rdev = makedev(252, 0);
+            let _ = self.seed_node(
+                mount_id,
+                dma_ino,
+                b"system",
+                MemNodeKind::ChrDev(rdev),
+                S_IFCHR | 0o666,
+                rdev,
+                b"",
+                now,
+            );
+        }
+        if let Some(log_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"log",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            let rdev = makedev(10, 64);
+            let _ = self.seed_node(
+                mount_id,
+                log_ino,
+                b"main",
+                MemNodeKind::ChrDev(rdev),
+                S_IFCHR | 0o666,
                 rdev,
                 b"",
                 now,

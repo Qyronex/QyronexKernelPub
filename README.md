@@ -47,9 +47,10 @@ Linux compatibility targets the **userspace ABI**. Linux kernel modules are not 
 | **x86_64 SMP, PCIe & Internet Stack** | [x86_64, PCIe & Internet](docs/assets/qyronex_x86_pcie_internet_stack.png) | [x86_64, PCIe & Network (DE)](docs/de/X86_PCIE_UND_NETZWERK.md) |
 | **Raspberry Pi 3B+ / 4 / 5 SoC Stack** | [RPi Hardware Stack](docs/assets/qyronex_rpi_hardware_stack.png) | [Hardware & Drivers (DE)](docs/de/HARDWARE_UND_TREIBER.md) |
 | **Wayland (`labwc`) & XFCE 4.20 Desktop** | [Desktop Graphics Stack](docs/assets/qyronex_desktop_wayland_stack.png) | [Desktop & Graphics (DE)](docs/de/DESKTOP_UND_GRAFIK.md) |
+| **Android 15 / GrapheneOS Pixel Edition** | [Android 15 Emulator UI](docs/assets/qyronex_android_grapheneos_emulator.png) | [Android / Pixel / GrapheneOS Guide](docs/ANDROID_PIXEL_GRAPHENEOS.md) |
 | **Installable ISO & MBR SD-Card Layout** | [RPi Boot & ISO Layout](docs/assets/qyronex_rpi_boot_iso_layout.png) | [Boot Protocol](docs/BOOT_PROTOCOL.md) · [DE](docs/de/BOOT_PROTOKOLL.md) |
 
-## Build & Raspberry Pi ISO
+## Build & ISOs (Raspberry Pi, x86_64 UEFI, Android 15 / GrapheneOS Pixel)
 
 The workspace currently pins Rust **1.98.0**.
 
@@ -59,10 +60,13 @@ rustup target add --toolchain 1.98.0 aarch64-unknown-none-softfloat x86_64-unkno
 cargo xtask arm-build
 ```
 
-Build the installable Raspberry Pi ISO (`dist/qyronex-rpi-installer.iso`) and flashable SD-card image (`dist/qyronex-rpi-sdcard.img`):
+Build the release ISOs:
 
 ```bash
-bash tools/build-rpi-iso.sh
+bash tools/build-rpi-iso.sh        # dist/qyronex-rpi-installer.iso + qyronex-rpi-sdcard.img
+bash tools/build-x86-iso.sh        # dist/qyronex-x86_64-uefi.iso
+bash tools/build-android-iso.sh    # dist/qyronex-android-pixel-grapheneos.iso + qyronex-pixel-boot.img
+bash tools/android/start-android-emulator.sh --vnc   # Launch Android 15 / GrapheneOS Emulator
 ```
 
 ## Run in QEMU

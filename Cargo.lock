@@ -220,10 +220,12 @@ dependencies = [
  "kernal-fdt-initrd",
  "kernal-frame-allocator",
  "kernal-gicv3-aarch64",
+ "kernal-google-pixel",
  "kernal-heap",
  "kernal-kmap-aarch64",
  "kernal-linux-aarch64-abi",
  "kernal-linux-abi",
+ "kernal-linux-android",
  "kernal-linux-bootstrap",
  "kernal-linux-bootstrap-aarch64",
  "kernal-linux-cgroup",
@@ -364,6 +366,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernal-google-pixel"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-iommu",
+ "kernal-linux-abi",
+]
+
+[[package]]
 name = "kernal-handoff"
 version = "0.1.0"
 
@@ -465,6 +476,14 @@ dependencies = [
 [[package]]
 name = "kernal-linux-abi"
 version = "0.1.0"
+
+[[package]]
+name = "kernal-linux-android"
+version = "0.1.0"
+dependencies = [
+ "kernal-capability",
+ "kernal-linux-abi",
+]
 
 [[package]]
 name = "kernal-linux-bootstrap"
