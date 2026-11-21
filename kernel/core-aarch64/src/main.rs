@@ -25,6 +25,7 @@ use kernal_scheduler::ThreadId;
 use kernal_scheduler_cpu::CpuSchedulerCell;
 use kernal_thread_context::KernelStack;
 
+mod rpi_native;
 #[cfg(feature = "qemu-proof")]
 mod step15_qemu;
 
@@ -404,6 +405,18 @@ pub extern "C" fn kernal_aarch64_main(dtb_physical: u64) -> ! {
     }
 
     let Some(gic_physical) = platform.gic else {
+        if platform.gic_v2.is_some() || platform.bcm_intc.is_some() {
+            rpi_native::boot_raspberry_pi_native(
+                |s| serial.write_str(s),
+                |v| serial.write_u64(v),
+                |v| serial.write_hex_u64(v),
+                aarch64_exception_handler,
+                &platform,
+                &blob,
+                platform.gic_v2,
+                platform.bcm_intc,
+            );
+        }
         fatal_with_serial(&serial, "KERNAL/ARM64: GICv3 node missing\n");
     };
     serial.write_str("KERNAL/ARM64: GICD=");
@@ -1141,6 +1154,11 @@ extern "C" fn aarch64_exception_handler(frame: &mut ExceptionFrame) {
         fatal_silent();
     }
 
+    if rpi_native::active_irq_mode() != rpi_native::IRQ_MODE_GICV3 {
+        rpi_native::handle_native_rpi_irq();
+        return;
+    }
+
     // SAFETY: IRQ delivery is enabled only after this PE publishes and installs its static CpuLocal.
     let local = unsafe { kernal_percpu_aarch64::current() };
     local.enter_irq();
@@ -1336,21 +1354,25 @@ fn psci_from_platform<const N: usize>(platform: &PlatformInfo<N>) -> Option<Psci
 /// This function is only valid for the QEMU `virt` bare-metal ELF proof contract where RAM starts
 /// at 0x4000_0000 and the generated DTB occupies the beginning of that RAM.
 unsafe fn qemu_dtb(physical: u64) -> Option<Blob<'static>> {
-    if physical != QEMU_VIRT_RAM_BASE {
+    let addr = if physical == 0 {
+        QEMU_VIRT_RAM_BASE
+    } else {
+        physical
+    };
+    if (addr & 3) != 0 {
         return None;
     }
-    let magic = unsafe { read_be_u32_volatile(physical) }?;
+    let magic = unsafe { read_be_u32_volatile(addr) }?;
     if magic != FDT_MAGIC {
         return None;
     }
-    let total_size = unsafe { read_be_u32_volatile(physical.checked_add(4)?) }? as usize;
+    let total_size = unsafe { read_be_u32_volatile(addr.checked_add(4)?) }? as usize;
     if !(FDT_HEADER_BYTES..=MAX_QEMU_DTB_BYTES).contains(&total_size) {
         return None;
     }
-    // SAFETY: QEMU guarantees the DTB begins in guest RAM. The header-provided length is capped to
-    // a small range inside that RAM before constructing the slice, and Blob::parse performs all
-    // internal offset/range validation before exposing data.
-    let bytes = unsafe { from_raw_parts(physical as *const u8, total_size) };
+    // SAFETY: Bootloader/QEMU guarantees the DTB resides in mapped memory. The header-provided
+    // length is capped before constructing the slice, and Blob::parse performs full bounds checks.
+    let bytes = unsafe { from_raw_parts(addr as *const u8, total_size) };
     Blob::parse(bytes).ok()
 }
 

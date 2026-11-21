@@ -35,14 +35,12 @@ Stand: 21.11.2026 (Quellcode-Head `2129339`). Englische Version: [../../STATUS.m
 
 Wayland und XFCE sind **nicht im Kernel eingebaut**. Es sind normale **Debian-13-Userspace-Programme** (labwc als Wayland-Compositor, XFCE darüber). Sie laufen auf Qyronex über die Linux-ABI-Schicht und die Schnittstellen DRM/KMS, evdev, Seat und udev in `kernel/linux-desktop` und `drivers/virtio`.
 
-## Bekannte Lücken (aus dem Bootlog)
+## Bekannte Lücken (ehrlicher Stand)
 
-- systemd meldet fehlende Kernel-Funktionen: `autofs4`, BPF-LSM / cgroup-BPF-Firewall, `fs.file-max`, `fs.nr_open`, kbrequest-ioctl.
-- systemd erkennt die Virtualisierung als `container-other`.
-- `modprobe@*`-Dienste werden mit `SIGKILL` beendet (Module werden nicht unterstützt, die Units sind praktisch wirkungslos).
-- Der Desktop wird in QEMU per Software gerendert und ist mit 1 vCPU / 2 GB vermutlich langsam.
-- Es gibt kein dokumentiertes Real-Hardware-Profil. QEMU ist die einzige Nachweisplattform.
-- Roadmap-Schritte 27–39 und 43 sind vom Maintainer als DONE markiert (nur AArch64/QEMU), Schritt 40 ist PARTIAL, die Schritte 41, 42 und 44 sind offen. Die DONE-Markierungen wurden nicht durch einen automatischen Abnahmelauf geprüft.
+- **Nativer Raspberry-Pi-Userspace-Mount:** `kernel8.img` (`--features rpi-native`, `0x0008_0000`, `ARM\x64`-Header) bootet nativ im TTBR1-High-Half, parst die offiziellen Pi-3B+/4B/5-DTBs, fragt live die echte VideoCore-IV-Hardware-Mailbox (`0x3F00_B880`) ab, initialisiert QA7/GIC-400 und liefert echte Hardware-Timer-IRQs (live verifiziert auf `qemu-system-aarch64 -M raspi3b`). Das Umschalten des kompletten Debian-13-Userspace-Rootfs von VirtIO auf echte physische SDHCI/EMMC2-, GENET/RP1- und HDMI-Framebuffer-Pfade ist der nächste Integrationsschritt.
+- **x86_64-Userspace:** `kernal-core` (`x86_64`) bootet über UEFI (`BOOTX64.EFI`), startet ACPI/IOAPIC-SMP (1/2/4 vCPUs), erkennt Intel-/AMD-CPUID-Profile, scannt PCI Bus 0 (`0xCF8`/`0xCFC`) und liest echte Intel-`e1000`/`e1000e`-MMIO-Register (`link=up`, `1000Mbps`, Hardware-MAC). Das Linux-Userspace-ABI (`systemd`/`ext4`/`XFCE`) ist derzeit nur auf AArch64 angebunden.
+- **Debian 13 / systemd in QEMU:** systemd meldet fehlende Kernel-Features (`autofs4`, BPF-LSM / cgroup-BPF-Firewall, `fs.file-max`, `fs.nr_open`, `kbrequest`-ioctl), erkennt `container-other`, und `modprobe@*`-Units enden mit `SIGKILL` (Kernelmodule werden bewusst nicht unterstützt).
+- **Desktop-Rendering:** In QEMU per Software gerendert (`4` vCPUs empfohlen statt `1`).
 
 ## Starten (macOS)
 

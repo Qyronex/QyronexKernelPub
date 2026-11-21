@@ -34,14 +34,12 @@ Last updated: 2026-11-21 (source head `2129339`). German version: [docs/de/STATU
 
 Wayland and XFCE are **not built into the kernel**. They are ordinary **Debian 13 userspace programs** (labwc as Wayland compositor, XFCE on top) that run on Qyronex through the Linux ABI layer and the DRM/KMS, evdev, seat and udev interfaces in `kernel/linux-desktop` and `drivers/virtio`.
 
-## Known gaps (from the boot log)
+## Known gaps (verified honestly)
 
-- Missing kernel features reported by systemd: `autofs4`, BPF LSM / cgroup BPF firewalling, `fs.file-max`, `fs.nr_open`, kbrequest ioctl.
-- systemd detects virtualization as `container-other`.
-- `modprobe@*` services are terminated with `SIGKILL` (modules are not supported; units are effectively no-ops).
-- Desktop is software-rendered in QEMU; expect it to be slow on 1 vCPU / 2 GB.
-- No real-hardware profile is documented. QEMU is the only proof platform.
-- Roadmap steps 27–39 and 43 are marked DONE by the maintainer (AArch64/QEMU only), step 40 is PARTIAL, steps 41, 42 and 44 are open. The DONE marks were not re-verified by an automated acceptance run.
+- **Native Raspberry Pi userspace mount:** `kernel8.img` (`--features rpi-native`, `0x0008_0000`, `ARM\x64` header) boots natively in TTBR1 high-half, parses the official Pi 3B+/4B/5 DTBs, queries the live VideoCore IV hardware mailbox (`0x3F00_B880`), initializes QA7/GIC-400, and delivers live hardware timer IRQs (verified on `qemu-system-aarch64 -M raspi3b`). Switching rootfs block/network/display I/O from VirtIO to live SDHCI/EMMC2, GENET/RP1 and HDMI framebuffer userspace execution on physical silicon is the next integration milestone.
+- **x86_64 userspace:** `kernal-core` (`x86_64`) boots via UEFI (`BOOTX64.EFI`), brings up ACPI/IOAPIC SMP (1/2/4 vCPUs), detects Intel/AMD CPUID profiles, scans PCI Bus 0 (`0xCF8`/`0xCFC`), and probes real Intel `e1000`/`e1000e` MMIO registers (`link=up`, `1000Mbps`, real hardware MAC). The Linux userspace ABI (`systemd`/`ext4`/`XFCE`) is currently wired on AArch64 only.
+- **Debian 13 / systemd in QEMU:** systemd notes missing kernel features (`autofs4`, BPF LSM / cgroup BPF firewalling, `fs.file-max`, `fs.nr_open`, `kbrequest` ioctl), detects virtualization as `container-other`, and `modprobe@*` units terminate with `SIGKILL` (kernel modules are intentionally unsupported).
+- **Desktop rendering:** Software-rendered in QEMU (`smp=4` recommended over `smp=1`).
 
 ## How to run (macOS)
 

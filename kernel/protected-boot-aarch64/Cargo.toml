@@ -42,6 +42,7 @@ kernal-vm = { path = "../vm", optional = true }
 
 [features]
 default = []
+rpi-native = []
 step7-qemu-proof = [
     "dep:kernal-address-space-aarch64",
     "dep:kernal-memory",

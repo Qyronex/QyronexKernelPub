@@ -1100,7 +1100,9 @@ pub(super) fn close_range_for_process(
 }
 
 fn parse_vda_partition_number(path: &[u8]) -> Option<u8> {
-    let suffix = path.strip_prefix(b"/dev/vda")?;
+    let suffix = path
+        .strip_prefix(b"/dev/vda")
+        .or_else(|| path.strip_prefix(b"/dev/mmcblk0p"))?;
     if suffix.is_empty() || suffix.len() > 2 {
         return None;
     }
@@ -1125,7 +1127,7 @@ fn match_hw_path(state: &Step42State, path: &[u8]) -> Option<HwNodeKind> {
         b"/dev/rtc0" => Some(HwNodeKind::DevRtc0),
         b"/dev/watchdog" => Some(HwNodeKind::DevWatchdog),
         b"/dev/hwrng" => Some(HwNodeKind::DevHwRng),
-        b"/dev/vda" => Some(HwNodeKind::DevVda),
+        b"/dev/vda" | b"/dev/mmcblk0" => Some(HwNodeKind::DevVda),
         b"/sys/class/rtc/rtc0/name" => Some(HwNodeKind::SysRtcName),
         b"/sys/class/rtc/rtc0/since_epoch" => Some(HwNodeKind::SysRtcSinceEpoch),
         b"/sys/class/thermal/thermal_zone0/temp" => Some(HwNodeKind::SysThermalTemp),

@@ -57,12 +57,16 @@ fn sanitize(path: &Path, remove_module_declarations: bool) -> String {
     );
 
     // QEMU's direct bare-metal ELF path used by this project does not guarantee a DTB pointer in
-    // x0. The already-proven ARM entry explicitly used the documented QEMU virt RAM base where the
-    // generated DTB is placed. Preserve that contract in the protected replacement entry as well.
-    let generated = generated.replace(
-        "    mov x0, x20\n    bl kernal_aarch64_protected_boot",
-        "    mov x0, #1\n    lsl x0, x0, #30\n    bl kernal_aarch64_protected_boot",
-    );
+    // x0. Preserve that contract on non-rpi-native builds; native Raspberry Pi builds receive the
+    // real hardware DTB pointer in x0 from the firmware/bootloader.
+    let generated = if env::var_os("CARGO_FEATURE_RPI_NATIVE").is_none() {
+        generated.replace(
+            "    mov x0, x20\n    bl kernal_aarch64_protected_boot",
+            "    mov x0, #1\n    lsl x0, x0, #30\n    bl kernal_aarch64_protected_boot",
+        )
+    } else {
+        generated
+    };
 
     // The published allocation count is part of the transition evidence, not diagnostic baggage.
     // Reject an impossible zero-table high state before trusting SCTLR/PC/SP observations.
@@ -210,6 +214,7 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={source}");
     }
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_RPI_NATIVE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STEP12_QEMU_PROOF");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STEP14_QEMU_PROOF");
     println!("cargo:rerun-if-env-changed=RUSTC");

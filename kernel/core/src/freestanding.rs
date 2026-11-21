@@ -351,7 +351,14 @@ pub extern "C" fn _start(boot_info: *const BootInfoV1) -> ! {
     serial_write_decimal(cpu_profile.family_model.display_family() as u64);
     serial_write(" model=");
     serial_write_decimal(cpu_profile.family_model.display_model() as u64);
-    serial_write(" pcie_io=0xCF8/0xCFC net=e1000e/virtio-net/igc ready\r\n");
+    serial_write(" virt=");
+    serial_write(if cpu_profile.supports_hardware_virtualization() {
+        "vmx/svm"
+    } else {
+        "none"
+    });
+    serial_write("\r\n");
+    scan_pci_and_probe_nics(&kmap);
     serial_write("KERNAL/CORE: privileged CR3/SMP/scheduler/IRQ runtime source path complete\r\n");
 
     #[cfg(feature = "qemu-exit")]
@@ -467,7 +474,7 @@ fn start_application_processors(
     local_apic: &mut HardwareLocalApic<'_>,
     frames: &mut ExtentAllocator<RUNTIME_EXTENTS>,
     kmap: &KmapController,
-    features: kernal_arch_x86_64::CpuFeatures,
+    _features: kernal_arch_x86_64::CpuFeatures,
     frequency: kernal_tsc_x86_64::TscFrequency,
 ) -> usize {
     if cpus.len() <= 1 { return 0; }
@@ -508,7 +515,7 @@ fn start_application_processors(
             bootstrap_physical: info.ap_trampoline.phys_addr,
             root_table_physical: root,
             stack_pointer: layout.kernel_stack.sysv_entry_rsp,
-            kernel_entry: _ap_start as usize as u64,
+            kernel_entry: _ap_start as *const () as usize as u64,
             cpu_index: descriptor.index.0,
         };
         let vector = match parameters.sipi_vector() {
@@ -1042,6 +1049,189 @@ fn serial_write_decimal(mut value: u64) {
     }
 }
 
+fn serial_write_hex_nibble(nibble: u8) {
+    let ch = if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + (nibble - 10)
+    };
+    while unsafe { inb(COM1 + 5) } & 0x20 == 0 {}
+    unsafe { outb(COM1, ch) };
+}
+
+fn serial_write_hex_u8(value: u8) {
+    serial_write_hex_nibble((value >> 4) & 0x0F);
+    serial_write_hex_nibble(value & 0x0F);
+}
+
+fn serial_write_hex_u16(value: u16) {
+    serial_write_hex_u8((value >> 8) as u8);
+    serial_write_hex_u8(value as u8);
+}
+
+fn pci_config_read32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    let Ok(addr) = kernal_pci::legacy_io_config_address(bus, device, function, offset) else {
+        return 0xFFFF_FFFF;
+    };
+    // SAFETY: standard x86 PCI Configuration Mechanism #1 I/O ports 0xCF8/0xCFC.
+    unsafe {
+        outl(kernal_pci::X86_PCI_CONFIG_ADDRESS_PORT, addr);
+        inl(kernal_pci::X86_PCI_CONFIG_DATA_PORT)
+    }
+}
+
+fn pci_config_write32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let Ok(addr) = kernal_pci::legacy_io_config_address(bus, device, function, offset) else {
+        return;
+    };
+    // SAFETY: standard x86 PCI Configuration Mechanism #1 I/O ports 0xCF8/0xCFC.
+    unsafe {
+        outl(kernal_pci::X86_PCI_CONFIG_ADDRESS_PORT, addr);
+        outl(kernal_pci::X86_PCI_CONFIG_DATA_PORT, value);
+    }
+}
+
+fn probe_intel_e1000_mmio(kmap: &KmapController, bar0_phys: u64) {
+    if bar0_phys == 0 || (bar0_phys & (PAGE_SIZE - 1)) != 0 {
+        return;
+    }
+    let status = if let Ok(mapping) = kmap.map(MappingRequest {
+        physical_address: bar0_phys,
+        writable: true,
+        cache: CachePolicy::Uncached,
+    }) {
+        // SAFETY: UC mapping of e1000/e1000e BAR0 page 0; STATUS register is at offset 0x08.
+        unsafe {
+            let p = mapping.as_ptr::<u8>();
+            if p.is_null() {
+                0
+            } else {
+                read_volatile(p.add(0x08).cast::<u32>())
+            }
+        }
+    } else {
+        0
+    };
+    let link_up = (status & (1 << 1)) != 0;
+    let speed_mbps: u64 = match (status >> 6) & 0b11 {
+        0 => 10,
+        1 => 100,
+        _ => 1000,
+    };
+
+    // RAL0 / RAH0 live at BAR0 + 0x5400 (page +5, offset 0x400).
+    let mac = if let Ok(mac_map) = kmap.map(MappingRequest {
+        physical_address: bar0_phys + 0x5000,
+        writable: false,
+        cache: CachePolicy::Uncached,
+    }) {
+        // SAFETY: UC mapping of BAR0 + 0x5000; RAL0 at +0x400, RAH0 at +0x404.
+        unsafe {
+            let p = mac_map.as_ptr::<u8>();
+            if p.is_null() {
+                None
+            } else {
+                let ral = read_volatile(p.add(0x400).cast::<u32>());
+                let rah = read_volatile(p.add(0x404).cast::<u32>());
+                Some([
+                    (ral & 0xFF) as u8,
+                    ((ral >> 8) & 0xFF) as u8,
+                    ((ral >> 16) & 0xFF) as u8,
+                    ((ral >> 24) & 0xFF) as u8,
+                    (rah & 0xFF) as u8,
+                    ((rah >> 8) & 0xFF) as u8,
+                ])
+            }
+        }
+    } else {
+        None
+    };
+
+    serial_write("KERNAL/NET: Intel e1000/e1000e MMIO link=");
+    serial_write(if link_up { "up" } else { "down" });
+    serial_write(" speed=");
+    serial_write_decimal(speed_mbps);
+    serial_write("Mbps");
+    if let Some(m) = mac {
+        serial_write(" mac=");
+        for (i, b) in m.iter().enumerate() {
+            if i != 0 {
+                serial_write(":");
+            }
+            serial_write_hex_u8(*b);
+        }
+    }
+    serial_write("\r\n");
+}
+
+fn scan_pci_and_probe_nics(kmap: &KmapController) {
+    let mut devices_found = 0u64;
+    let mut nics_found = 0u64;
+
+    for device in 0u8..32u8 {
+        let id = pci_config_read32(0, device, 0, 0x00);
+        let vendor = (id & 0xFFFF) as u16;
+        if vendor == 0xFFFF || vendor == 0x0000 {
+            continue;
+        }
+        let dev_id = ((id >> 16) & 0xFFFF) as u16;
+        let class_reg = pci_config_read32(0, device, 0, 0x08);
+        let class = ((class_reg >> 24) & 0xFF) as u8;
+        let subclass = ((class_reg >> 16) & 0xFF) as u8;
+        devices_found += 1;
+
+        if class == kernal_pci::CLASS_NETWORK_CONTROLLER && subclass == kernal_pci::SUBCLASS_ETHERNET
+        {
+            nics_found += 1;
+            // Enable Memory Space & Bus Mastering for DMA/MMIO NIC access.
+            let cmd = pci_config_read32(0, device, 0, 0x04);
+            let new_cmd = cmd
+                | u32::from(kernal_pci::COMMAND_MEMORY_SPACE | kernal_pci::COMMAND_BUS_MASTER);
+            pci_config_write32(0, device, 0, 0x04, new_cmd);
+
+            let bar0_low = pci_config_read32(0, device, 0, 0x10);
+            let is_mmio = (bar0_low & 1) == 0;
+            let bar0_phys = if is_mmio {
+                let is_64 = ((bar0_low >> 1) & 0b11) == 0b10;
+                let high = if is_64 {
+                    u64::from(pci_config_read32(0, device, 0, 0x14)) << 32
+                } else {
+                    0
+                };
+                high | u64::from(bar0_low & !0x0F)
+            } else {
+                0
+            };
+
+            serial_write("KERNAL/PCI: NIC 00:");
+            serial_write_hex_u8(device);
+            serial_write(".0 id=");
+            serial_write_hex_u16(vendor);
+            serial_write(":");
+            serial_write_hex_u16(dev_id);
+            serial_write("\r\n");
+
+            if vendor == kernal_pci::VENDOR_INTEL
+                && matches!(
+                    dev_id,
+                    kernal_pci::DEVICE_INTEL_E1000
+                        | kernal_pci::DEVICE_INTEL_E1000E
+                        | kernal_pci::DEVICE_INTEL_I210
+                        | kernal_pci::DEVICE_INTEL_I225_V
+                )
+            {
+                probe_intel_e1000_mmio(kmap, bar0_phys);
+            }
+        }
+    }
+
+    serial_write("KERNAL/PCI: bus0 scan complete devices=");
+    serial_write_decimal(devices_found);
+    serial_write(" nics=");
+    serial_write_decimal(nics_found);
+    serial_write("\r\n");
+}
+
 fn halt_forever() -> ! {
     loop { unsafe { asm!("cli; hlt", options(nomem, nostack)) }; }
 }
@@ -1057,11 +1247,18 @@ unsafe fn outb(port: u16, value: u8) {
     }
 }
 
-#[cfg(feature = "qemu-exit")]
 unsafe fn outl(port: u16, value: u32) {
     unsafe {
         asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags));
     }
+}
+
+unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags));
+    }
+    value
 }
 
 unsafe fn inb(port: u16) -> u8 {

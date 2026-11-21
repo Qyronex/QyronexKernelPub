@@ -1,21 +1,29 @@
-# x86_64 virtual memory layout (initial M1 contract)
+# Virtual Memory Layout, Capabilities & IOMMU/DMA Isolation
 
-Kernal starts x86_64 in the canonical upper half and keeps user virtual addresses in the lower half. The layout is intentionally sparse so that later KASLR, direct-map, per-CPU and MMIO windows can be introduced without ABI churn.
+Last updated: 2026-11-21
 
-| Region | Initial base | Policy |
-| --- | ---: | --- |
-| user space | `0x0000000000000000` | ring 3, NX unless explicitly executable |
-| kernel image | `0xffffffff80200000` | separate ELF PT_LOAD segments |
-| kernel text | linker-defined | R-X, never writable |
-| kernel rodata | linker-defined | R--, NX |
-| kernel data/bss | linker-defined | RW-, NX |
+Qyronex Kernal enforces strict separation between userspace, kernel space, and device DMA across both **AArch64** and **x86_64**.
 
-## Hard invariants
+![Memory Layout, Capability Model and IOMMU Isolation](assets/qyronex_memory_capability_iommu.png)
 
-1. No kernel page may be writable and executable at the same time.
-2. Page zero stays unmapped once kernel-owned tables are installed.
-3. Kernel stacks receive at least one unmapped guard page.
-4. User mappings always carry the user/supervisor bit and cannot alias writable kernel text.
-5. MMIO mappings are NX and use device-appropriate cache attributes.
+## 1. Address-Space Separation
 
-This is an M1 contract, not a promise that the final address layout will remain numerically identical.
+| Architecture | Userspace | Kernel High-Half | Hardware Protections |
+|---|---|---|---|
+| **AArch64 (QEMU `virt` / RPi)** | `TTBR0_EL1` (`0x0000_0000_...`) | `TTBR1_EL1` (`0xffff_ffff_8020_0000` / `0xffff_ffff_8008_0000`) | `PAN`, `W^X`, Null-Page Guard, Guarded Kernel Stacks |
+| **x86_64 (Intel & AMD)** | Lower canonical half (`Ring 3`) | `0xffff_ffff_8020_0000` (`CR3`, separate `PT_LOAD`) | `NX`, `SMEP`, `SMAP`, Null-Page Guard, IST Guard Stacks |
+
+## 2. Hard Invariants
+
+1. **W^X:** No kernel or user mapping may be writable and executable simultaneously.
+2. **Null-Page Guard:** Page `0` stays unmapped once kernel page tables are active (even on Raspberry Pi hardware where firmware places DTBs in low RAM, DTBs are copied into `.bss` prior to enabling MMU).
+3. **Guarded Kernel & Clone Stacks:** Every bootstrap, secondary, worker, and clone stack is preceded by an unmapped guard page.
+4. **Explicit Usercopy:** All kernel accesses to user memory go through bounded, direction-checked usercopy paths.
+5. **Non-Executable Device MMIO:** All MMIO apertures (`Device-nGnRnE` on AArch64, `Uncached` on x86_64) are mapped `NX`.
+
+## 3. Capability Authority & IOMMU/DMA Enforcement
+
+- **Capabilities (`kernal-capability`):** Kernel objects and hardware operations require explicit `Capability { object: ObjectId, rights: CapRights }` handles plus generation validation (`fail-closed` with `EACCES`/`EPERM`).
+- **IOMMU / DMA (`kernal-iommu`):** Drivers (`VirtIO`, `PCIe`, `Raspberry Pi 3B+/4/5`) validate every DMA transfer against `DmaMapping` windows and `DmaPerms` via `verify_dma_window`.
+
+See also the German documentation [docs/de/SPEICHERLAYOUT.md](de/SPEICHERLAYOUT.md).

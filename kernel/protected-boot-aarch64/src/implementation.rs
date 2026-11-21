@@ -188,6 +188,39 @@ static PE_FINALIZED: [AtomicBool; MAX_PROOF_PES] =
     [const { AtomicBool::new(false) }; MAX_PROOF_PES];
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+const COPIED_DTB_CAPACITY: usize = 128 * 1024;
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+#[repr(align(4096))]
+struct CopiedDtbStorage(UnsafeCell<[u8; COPIED_DTB_CAPACITY]>);
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+unsafe impl Sync for CopiedDtbStorage {}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+static COPIED_BOOT_DTB: CopiedDtbStorage =
+    CopiedDtbStorage(UnsafeCell::new([0u8; COPIED_DTB_CAPACITY]));
+
+#[cfg(all(target_arch = "aarch64", target_os = "none", feature = "rpi-native"))]
+core::arch::global_asm!(
+    r#"
+    .section .text._arm64_image_header, "ax"
+    .global _arm64_image_header
+_arm64_image_header:
+    b kernal_aarch64_protected_start
+    .word 0
+    .quad 0x00080000
+    .quad 0x05000000
+    .quad 0x0000000a
+    .quad 0
+    .quad 0
+    .quad 0
+    .word 0x644d5241
+    .word 0
+"#
+);
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
 core::arch::global_asm!(
     r#"
     .section .text._protected_start, "ax"
@@ -196,6 +229,11 @@ core::arch::global_asm!(
 kernal_aarch64_protected_start:
     msr daifset, #0xf
     mov x20, x0
+
+    // Park secondary cores if bootloader enters all 4 cores at once (e.g. QEMU raspi3b).
+    mrs x1, MPIDR_EL1
+    and x1, x1, #0xff
+    cbnz x1, 9f
 
     adrp x2, __bss_start
     add  x2, x2, :lo12:__bss_start
@@ -211,11 +249,33 @@ kernal_aarch64_protected_start:
     add  x2, x2, :lo12:__boot_stack_top
 
     mrs x1, CurrentEL
+    cmp x1, #0xc
+    b.eq 5f
     cmp x1, #0x8
     b.eq 3f
     cmp x1, #0x4
     b.eq 4f
     b 9f
+
+5:
+    // Drop from EL3 to non-secure EL1h with AArch64 execution and timers enabled.
+    mov x3, #0x431
+    msr SCR_EL3, x3
+    msr SCTLR_EL2, xzr
+    mov x3, #1
+    lsl x3, x3, #31
+    msr HCR_EL2, x3
+    mrs x3, CNTHCTL_EL2
+    orr x3, x3, #3
+    msr CNTHCTL_EL2, x3
+    msr CNTVOFF_EL2, xzr
+    msr SP_EL1, x2
+    adr x3, 4f
+    msr ELR_EL3, x3
+    mov x3, #0x3c5
+    msr SPSR_EL3, x3
+    isb
+    eret
 
 3:
     mov x3, #1
@@ -331,7 +391,12 @@ unsafe extern "C" {
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernal_aarch64_protected_boot(dtb_physical: u64) -> ! {
-    let (blob, dtb_bytes) = unsafe { qemu_dtb(dtb_physical) }.unwrap_or_else(fatal_silent);
+    let dtb_addr = if dtb_physical == 0 {
+        QEMU_VIRT_RAM_BASE
+    } else {
+        dtb_physical
+    };
+    let (blob, dtb_bytes) = unsafe { qemu_dtb(dtb_addr) }.unwrap_or_else(fatal_silent);
     let platform = parse_platform::<256>(&blob).unwrap_or_else(|_| fatal_silent());
     let serial_region = platform.pl011.unwrap_or_else(fatal_silent);
     // SAFETY: validated DTB MMIO with translation still disabled.
@@ -341,23 +406,59 @@ pub extern "C" fn kernal_aarch64_protected_boot(dtb_physical: u64) -> ! {
     if kernal_arch_aarch64::current_exception_level() != 1 {
         fatal(&serial, "KERNAL/ARM64: protected bootstrap did not reach EL1\n");
     }
-    let gic = platform
-        .gic
-        .unwrap_or_else(|| fatal(&serial, "KERNAL/ARM64: protected bootstrap requires GICv3\n"));
-    let (expected_pes, mpidrs) = discover_mpidrs(&platform)
+    let (mmio1, mmio2, is_gicv3) = if let Some(gic) = platform.gic {
+        (gic.distributor, gic.redistributor, true)
+    } else if let Some(gic2) = platform.gic_v2 {
+        (gic2.distributor, gic2.cpu_interface, false)
+    } else if let Some(bcm) = platform.bcm_intc {
+        let armctrl = bcm.armctrl.unwrap_or(MmioRegion {
+            base: 0x3F00_B200,
+            size: 0x200,
+        });
+        let qa7 = bcm.qa7_local.unwrap_or(MmioRegion {
+            base: 0x4000_0000,
+            size: 0x100,
+        });
+        (armctrl, qa7, false)
+    } else {
+        fatal(
+            &serial,
+            "KERNAL/ARM64: protected bootstrap requires GICv3, GICv2, or BCM INTC\n",
+        )
+    };
+    let (discovered_pes, mpidrs) = discover_mpidrs(&platform)
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected CPU topology rejected\n"));
+    let expected_pes = if is_gicv3 { discovered_pes } else { 1 };
     let layout = linker_layout()
         .and_then(BootstrapLayout::validate)
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected linker layout rejected\n"));
+    // If DTB is not at QEMU virt RAM base (e.g. Raspberry Pi places DTB at 0x100 in page 0 or
+    // 0x0260_0000), copy it into linker-owned `.bss` before enabling MMU so page 0 stays unmapped.
+    let handoff_dtb_arg = if dtb_addr != QEMU_VIRT_RAM_BASE {
+        if dtb_bytes > COPIED_DTB_CAPACITY {
+            fatal(&serial, "KERNAL/ARM64: hardware DTB exceeds 128 KiB buffer\n");
+        }
+        // SAFETY: MMU is still disabled, BSP is sole writer, bounds validated above.
+        unsafe {
+            let dst = (*COPIED_BOOT_DTB.0.get()).as_mut_ptr();
+            core::ptr::copy_nonoverlapping(dtb_addr as *const u8, dst, dtb_bytes);
+        }
+        let copied_phys = COPIED_BOOT_DTB.0.get() as u64;
+        layout
+            .high_alias(copied_phys)
+            .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: copied DTB high alias failed\n"))
+    } else {
+        dtb_addr
+    };
     // SAFETY: MMU is still disabled, secondary PEs have not started, and `.rodata` has not yet been
     // write-protected; rebasing R_AARCH64_RELATIVE entries now makes all `.rodata` pointers valid in
     // the TTBR1 high-alias execution regime after TTBR0 is retired.
     unsafe { relocate_rodata_high_aliases(&layout) }
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected high relocation failed\n"));
-    let physical_mmio = [serial_region, gic.distributor, gic.redistributor];
+    let physical_mmio = [serial_region, mmio1, mmio2];
     let aliases = plan_mmio_aliases(layout, &physical_mmio)
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected MMIO alias plan failed\n"));
-    let prepared = unsafe { prepare_tables(layout, &physical_mmio, dtb_physical, dtb_bytes) }
+    let prepared = unsafe { prepare_tables(layout, &physical_mmio, dtb_addr, dtb_bytes) }
         .unwrap_or_else(|_| fatal(&serial, "KERNAL/ARM64: protected page-table construction failed\n"));
 
     TRANSITION
@@ -405,7 +506,7 @@ pub extern "C" fn kernal_aarch64_protected_boot(dtb_physical: u64) -> ! {
 
     // SAFETY: page tables contain dual mappings for code/stack and the continuation never returns.
     unsafe {
-        activate_el1_transition_and_branch(config, high_stack, high_entry, dtb_physical, 0)
+        activate_el1_transition_and_branch(config, high_stack, high_entry, handoff_dtb_arg, 0)
     }
 }
 
@@ -707,8 +808,13 @@ fn map_dtb_identity<B: Backend>(
     dtb_physical: u64,
     dtb_bytes: usize,
 ) -> Result<(), ()> {
-    if dtb_physical != QEMU_VIRT_RAM_BASE || dtb_bytes < FDT_HEADER_BYTES {
+    if dtb_bytes < FDT_HEADER_BYTES {
         return Err(());
+    }
+    // Non-QEMU-virt hardware DTBs (Raspberry Pi 3B+/4/5) were already copied into linker-owned
+    // `.bss` (`COPIED_BOOT_DTB`), which is mapped in TTBR1; never map page 0.
+    if dtb_physical != QEMU_VIRT_RAM_BASE {
+        return Ok(());
     }
     let raw_end = dtb_physical.checked_add(dtb_bytes as u64).ok_or(())?;
     let end = raw_end.checked_add(PAGE_SIZE - 1).ok_or(())? & !(PAGE_SIZE - 1);
@@ -899,7 +1005,7 @@ fn current_sp() -> u64 {
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 unsafe fn qemu_dtb(physical: u64) -> Option<(Blob<'static>, usize)> {
-    if physical != QEMU_VIRT_RAM_BASE {
+    if physical == 0 || (physical & 3) != 0 {
         return None;
     }
     let magic = unsafe { read_be_u32_volatile(physical) }?;
@@ -910,7 +1016,7 @@ unsafe fn qemu_dtb(physical: u64) -> Option<(Blob<'static>, usize)> {
     if !(FDT_HEADER_BYTES..=MAX_QEMU_DTB_BYTES).contains(&total_size) {
         return None;
     }
-    // SAFETY: QEMU supplies the DTB in RAM; size is bounded before constructing the slice.
+    // SAFETY: Bootloader/QEMU supplies the DTB in RAM; size is bounded before constructing the slice.
     let bytes = unsafe { from_raw_parts(physical as *const u8, total_size) };
     Some((Blob::parse(bytes).ok()?, total_size))
 }

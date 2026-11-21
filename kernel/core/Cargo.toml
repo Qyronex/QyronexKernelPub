@@ -30,6 +30,7 @@ kernal-kmap = { path = "../kmap" }
 kernal-kmap-x86-64 = { path = "../kmap-x86_64" }
 kernal-page-table = { path = "../page-table" }
 kernal-paging = { path = "../paging" }
+kernal-pci = { path = "../../drivers/pci" }
 kernal-percpu = { path = "../percpu" }
 kernal-percpu-layout-x86-64 = { path = "../percpu-layout-x86_64" }
 kernal-percpu-x86-64 = { path = "../percpu-x86_64" }

@@ -188,6 +188,7 @@ dependencies = [
  "kernal-kmap-x86-64",
  "kernal-page-table",
  "kernal-paging",
+ "kernal-pci",
  "kernal-percpu",
  "kernal-percpu-layout-x86-64",
  "kernal-percpu-x86-64",

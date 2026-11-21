@@ -90,6 +90,7 @@ kernal-vm = { path = "../vm" }
 
 [features]
 default = []
+rpi-native = ["kernal-protected-boot-aarch64/rpi-native"]
 qemu-proof = ["kernal-protected-boot-aarch64/step14-qemu-proof"]
 step15-qemu-proof = ["qemu-proof"]
 step28-qemu-proof = ["step15-qemu-proof"]

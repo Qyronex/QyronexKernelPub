@@ -46,6 +46,27 @@ pub struct GicV3Info {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GicV2Info {
+    pub distributor: MmioRegion,
+    pub cpu_interface: MmioRegion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BcmIntcInfo {
+    pub armctrl: Option<MmioRegion>,
+    pub qa7_local: Option<MmioRegion>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PlatformSocKind {
+    #[default]
+    GenericVirt,
+    Rpi3BPlusBcm2837,
+    Rpi4Bcm2711,
+    Rpi5Bcm2712,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerInterrupts {
     pub secure_physical: u32,
     pub nonsecure_physical: u32,
@@ -72,6 +93,9 @@ pub struct PlatformInfo<const N: usize> {
     cpu_count: usize,
     pub psci: Option<PsciConduit>,
     pub gic: Option<GicV3Info>,
+    pub gic_v2: Option<GicV2Info>,
+    pub bcm_intc: Option<BcmIntcInfo>,
+    pub soc_kind: PlatformSocKind,
     pub timer_interrupts: Option<TimerInterrupts>,
     pub pl011: Option<MmioRegion>,
 }
@@ -83,6 +107,9 @@ impl<const N: usize> PlatformInfo<N> {
             cpu_count: 0,
             psci: None,
             gic: None,
+            gic_v2: None,
+            bcm_intc: None,
+            soc_kind: PlatformSocKind::GenericVirt,
             timer_interrupts: None,
             pl011: None,
         }
@@ -391,6 +418,7 @@ struct NodeScratch {
     bcm2712_pcie_compatible: bool,
     rp1_southbridge_compatible: bool,
     rp1_eth_gem_compatible: bool,
+    gicv2_compatible: bool,
     chosen_node: bool,
     psci_method: Option<PsciConduit>,
     reg: [u32; MAX_PROPERTY_CELLS],
@@ -438,6 +466,7 @@ impl NodeScratch {
         bcm2712_pcie_compatible: false,
         rp1_southbridge_compatible: false,
         rp1_eth_gem_compatible: false,
+        gicv2_compatible: false,
         chosen_node: false,
         psci_method: None,
         reg: [0; MAX_PROPERTY_CELLS],
@@ -470,14 +499,48 @@ impl NodeScratch {
         }
         let (chunks, remainder) = value.as_chunks::<4>();
         debug_assert!(remainder.is_empty());
-        let count = chunks.len();
-        if count > destination.len() {
-            return Err(Error::MalformedProperty);
-        }
-        for (slot, chunk) in destination.iter_mut().zip(chunks) {
+        let count = chunks.len().min(destination.len());
+        for (slot, chunk) in destination.iter_mut().zip(chunks.iter().take(count)) {
             *slot = u32::from_be_bytes(*chunk);
         }
         Ok(count as u8)
+    }
+}
+
+pub const fn translate_soc_bus_region(soc: PlatformSocKind, region: MmioRegion) -> MmioRegion {
+    match soc {
+        PlatformSocKind::Rpi3BPlusBcm2837 => translate_bcm2837_bus_region(region),
+        PlatformSocKind::Rpi4Bcm2711 => {
+            if region.base >= 0x7E00_0000 && region.base < 0x7F80_0000 {
+                MmioRegion {
+                    base: region.base - 0x7E00_0000 + 0xFE00_0000,
+                    size: region.size,
+                }
+            } else if region.base >= 0x7C00_0000 && region.base < 0x7E00_0000 {
+                MmioRegion {
+                    base: region.base - 0x7C00_0000 + 0xFC00_0000,
+                    size: region.size,
+                }
+            } else if region.base >= 0x4000_0000 && region.base < 0x4008_0000 {
+                MmioRegion {
+                    base: region.base - 0x4000_0000 + 0xFF80_0000,
+                    size: region.size,
+                }
+            } else {
+                region
+            }
+        }
+        PlatformSocKind::Rpi5Bcm2712 => {
+            if region.base >= 0x7C00_0000 && region.base < 0x8000_0000 {
+                MmioRegion {
+                    base: region.base - 0x7C00_0000 + 0x10_7C00_0000,
+                    size: region.size,
+                }
+            } else {
+                region
+            }
+        }
+        PlatformSocKind::GenericVirt => region,
     }
 }
 
@@ -488,6 +551,24 @@ pub fn parse_platform<const N: usize>(blob: &Blob<'_>) -> Result<PlatformInfo<N>
         |_name, _value| Ok(()),
         |node| finalize_node(node, &mut platform),
     )?;
+    // Re-translate VideoCore bus addresses once the root node's `compatible` has finalized `soc_kind`.
+    if let Some(pl011) = platform.pl011 {
+        platform.pl011 = Some(translate_soc_bus_region(platform.soc_kind, pl011));
+    }
+    if let Some(mut bcm) = platform.bcm_intc {
+        if let Some(armctrl) = bcm.armctrl {
+            bcm.armctrl = Some(translate_soc_bus_region(platform.soc_kind, armctrl));
+        }
+        if let Some(qa7) = bcm.qa7_local {
+            bcm.qa7_local = Some(translate_soc_bus_region(platform.soc_kind, qa7));
+        }
+        platform.bcm_intc = Some(bcm);
+    }
+    if let Some(mut gic2) = platform.gic_v2 {
+        gic2.distributor = translate_soc_bus_region(platform.soc_kind, gic2.distributor);
+        gic2.cpu_interface = translate_soc_bus_region(platform.soc_kind, gic2.cpu_interface);
+        platform.gic_v2 = Some(gic2);
+    }
     Ok(platform)
 }
 
@@ -545,7 +626,10 @@ fn walk_fdt(
                             || compatible_contains(value, "arm,psci-0.2")
                             || compatible_contains(value, "arm,psci-1.0");
                         node.gicv3_compatible = compatible_contains(value, "arm,gic-v3");
-                        node.timer_compatible = compatible_contains(value, "arm,armv8-timer");
+                        node.gicv2_compatible = compatible_contains(value, "arm,gic-400")
+                            || compatible_contains(value, "arm,cortex-a15-gic");
+                        node.timer_compatible = compatible_contains(value, "arm,armv8-timer")
+                            || compatible_contains(value, "arm,armv7-timer");
                         node.pl011_compatible = compatible_contains(value, "arm,pl011")
                             || compatible_contains(value, "brcm,bcm2835-pl011");
                         node.pl031_compatible = compatible_contains(value, "arm,pl031");
@@ -884,6 +968,14 @@ fn finalize_node<const N: usize>(
         })?;
     }
 
+    if node.bcm2837_board_compatible {
+        platform.soc_kind = PlatformSocKind::Rpi3BPlusBcm2837;
+    } else if node.bcm2711_board_compatible {
+        platform.soc_kind = PlatformSocKind::Rpi4Bcm2711;
+    } else if node.bcm2712_board_compatible {
+        platform.soc_kind = PlatformSocKind::Rpi5Bcm2712;
+    }
+
     if node.psci_compatible
         && let Some(method) = node.psci_method
     {
@@ -913,19 +1005,71 @@ fn finalize_node<const N: usize>(
         });
     }
 
-    if node.timer_compatible {
-        if node.interrupts_len < 12 {
-            return Err(Error::MalformedProperty);
+    if node.gicv2_compatible {
+        let tuple_cells = node.parent_address_cells as usize + node.parent_size_cells as usize;
+        if tuple_cells > 0 && (node.reg_len as usize) >= tuple_cells * 2 {
+            let distributor = decode_reg_tuple(
+                &node.reg,
+                0,
+                node.parent_address_cells,
+                node.parent_size_cells,
+            )?;
+            let cpu_interface = decode_reg_tuple(
+                &node.reg,
+                tuple_cells,
+                node.parent_address_cells,
+                node.parent_size_cells,
+            )?;
+            platform.gic_v2 = Some(GicV2Info {
+                distributor,
+                cpu_interface,
+            });
         }
-        platform.timer_interrupts = Some(TimerInterrupts {
-            secure_physical: decode_gic_interrupt(&node.interrupts[0..3])?,
-            nonsecure_physical: decode_gic_interrupt(&node.interrupts[3..6])?,
-            virtual_timer: decode_gic_interrupt(&node.interrupts[6..9])?,
-            hypervisor: decode_gic_interrupt(&node.interrupts[9..12])?,
-        });
     }
 
-    if node.pl011_compatible && node.reg_len != 0 {
+    if (node.bcm_armctrl_ic_compatible || node.bcm_qa7_intc_compatible) && node.reg_len != 0 {
+        let region = decode_reg_tuple(
+            &node.reg,
+            0,
+            node.parent_address_cells,
+            node.parent_size_cells,
+        )?;
+        let mut bcm = platform.bcm_intc.unwrap_or(BcmIntcInfo {
+            armctrl: None,
+            qa7_local: None,
+        });
+        if node.bcm_armctrl_ic_compatible {
+            bcm.armctrl = Some(region);
+        }
+        if node.bcm_qa7_intc_compatible {
+            bcm.qa7_local = Some(region);
+        }
+        platform.bcm_intc = Some(bcm);
+    }
+
+    if node.timer_compatible {
+        if node.interrupts_len >= 12 {
+            platform.timer_interrupts = Some(TimerInterrupts {
+                secure_physical: decode_gic_interrupt(&node.interrupts[0..3])?,
+                nonsecure_physical: decode_gic_interrupt(&node.interrupts[3..6])?,
+                virtual_timer: decode_gic_interrupt(&node.interrupts[6..9])?,
+                hypervisor: decode_gic_interrupt(&node.interrupts[9..12])?,
+            });
+        } else if node.interrupts_len >= 8 {
+            // Raspberry Pi 3 / BCM2836 QA7 local interrupt controller uses 2-cell interrupts:
+            // (local_irq_index, trigger_flags) -> CNTPS=0, CNTPNS=1, CNTHP=2, CNTV=3
+            platform.timer_interrupts = Some(TimerInterrupts {
+                secure_physical: node.interrupts[0],
+                nonsecure_physical: node.interrupts[2],
+                hypervisor: node.interrupts[4],
+                virtual_timer: node.interrupts[6],
+            });
+        } else {
+            return Err(Error::MalformedProperty);
+        }
+    }
+
+    if node.pl011_compatible && node.reg_len != 0 && platform.pl011.is_none() {
         platform.pl011 = Some(decode_reg_tuple(
             &node.reg,
             0,
@@ -1464,5 +1608,55 @@ mod tests {
             parse_device_inventory::<4>(&Blob::parse(&overlapping).unwrap()),
             Err(Error::OverlappingRegion)
         );
+    }
+
+    #[test]
+    fn parses_real_official_raspberry_pi_3_4_5_dtbs_when_present() {
+        let base = std::path::Path::new("../../dist/rpi-firmware");
+        if !base.exists() {
+            return;
+        }
+        for (file, expected_soc) in [
+            (
+                "bcm2710-rpi-3-b-plus.dtb",
+                PlatformSocKind::Rpi3BPlusBcm2837,
+            ),
+            ("bcm2711-rpi-4-b.dtb", PlatformSocKind::Rpi4Bcm2711),
+            ("bcm2712-rpi-5-b.dtb", PlatformSocKind::Rpi5Bcm2712),
+        ] {
+            let bytes = std::fs::read(base.join(file)).expect("read dtb");
+            let blob = Blob::parse(&bytes).expect("parse fdt blob");
+            let platform = parse_platform::<16>(&blob)
+                .unwrap_or_else(|e| panic!("parse_platform failed on {file}: {e:?}"));
+            assert_eq!(platform.soc_kind, expected_soc, "{file} soc_kind");
+            assert_eq!(platform.cpus().len(), 4, "{file} cpus");
+            assert!(platform.timer_interrupts.is_some(), "{file} timer");
+            let inv = parse_device_inventory::<16>(&blob)
+                .unwrap_or_else(|e| panic!("parse_device_inventory failed on {file}: {e:?}"));
+            match expected_soc {
+                PlatformSocKind::Rpi3BPlusBcm2837 => {
+                    assert_eq!(platform.pl011.unwrap().base, 0x3F20_1000);
+                    let bcm = platform.bcm_intc.expect("bcm_intc");
+                    assert_eq!(bcm.armctrl.unwrap().base, 0x3F00_B200);
+                    assert_eq!(bcm.qa7_local.unwrap().base, 0x4000_0000);
+                    assert!(inv.bcm2837.is_populated(), "{file} inv.bcm2837");
+                }
+                PlatformSocKind::Rpi4Bcm2711 => {
+                    assert_eq!(platform.pl011.unwrap().base, 0xFE20_1000);
+                    let gic2 = platform.gic_v2.expect("gic_v2");
+                    assert_eq!(gic2.distributor.base, 0xFF84_1000);
+                    assert_eq!(gic2.cpu_interface.base, 0xFF84_2000);
+                    assert!(inv.bcm2711.is_populated(), "{file} inv.bcm2711");
+                }
+                PlatformSocKind::Rpi5Bcm2712 => {
+                    assert_eq!(platform.pl011.unwrap().base, 0x10_7D00_1000);
+                    let gic2 = platform.gic_v2.expect("gic_v2");
+                    assert_eq!(gic2.distributor.base, 0x10_7FFF_9000);
+                    assert_eq!(gic2.cpu_interface.base, 0x10_7FFF_A000);
+                    assert!(inv.bcm2712.is_populated(), "{file} inv.bcm2712");
+                }
+                PlatformSocKind::GenericVirt => unreachable!(),
+            }
+        }
     }
 }
