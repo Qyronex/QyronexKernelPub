@@ -177,6 +177,24 @@ pub fn discover_qemu_initrd(
     kernel_start: u64,
     kernel_end: u64,
 ) -> Result<CoreValidatedInitrd, Error> {
+    discover_initrd_in_ram(
+        blob,
+        dtb_start,
+        kernel_start,
+        kernel_end,
+        kernal_qemu_initrd_aarch64::QEMU_VIRT_RAM_BASE,
+        kernal_qemu_initrd_aarch64::QEMU_VIRT_RAM_BYTES,
+    )
+}
+
+pub fn discover_initrd_in_ram(
+    blob: &Blob<'_>,
+    dtb_start: u64,
+    kernel_start: u64,
+    kernel_end: u64,
+    ram_base: u64,
+    ram_bytes: u64,
+) -> Result<CoreValidatedInitrd, Error> {
     let range = parse_initrd(blob)?.ok_or(Error::MissingInitrd)?;
     let overlap = validate_non_overlapping_initrd(
         range,
@@ -185,7 +203,7 @@ pub fn discover_qemu_initrd(
         kernel_start,
         kernel_end,
     )?;
-    let qemu = ValidatedInitrd::from_fdt(range)?;
+    let qemu = ValidatedInitrd::from_fdt_in_ram(range, ram_base, ram_bytes)?;
 
     let overlap_len = usize::try_from(overlap.len()).map_err(|_| Error::ProofMismatch)?;
     if overlap.start() != qemu.physical_start() || overlap_len != qemu.len() {

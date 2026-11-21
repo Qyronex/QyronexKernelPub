@@ -1285,3 +1285,23 @@ pub(super) fn write_phys_page_bytes(phys_page: u64, offset: usize, bytes: &[u8])
     };
     res.map_err(|_| ())?.map_err(|_| ())?
 }
+
+/// Reads up to one 4 KiB page from a caller-owned physical frame through KMap.
+#[allow(dead_code)]
+pub(super) fn read_phys_page_bytes(
+    phys_page: u64,
+    offset: usize,
+    out: &mut [u8],
+) -> Result<(), ()> {
+    // SAFETY: lower-EL synchronous SVC owns this PE's IRQ-masked window and caller owns `phys_page`.
+    let res = unsafe {
+        RuntimeTablePool::with_live(|page_tables| {
+            kmap::with_kmap(|reader| {
+                reader
+                    .read_frame_bytes(page_tables, phys_page, offset, out)
+                    .map_err(|_| ())
+            })
+        })
+    };
+    res.map_err(|_| ())?.map_err(|_| ())?
+}

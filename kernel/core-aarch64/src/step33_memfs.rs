@@ -56,6 +56,9 @@ pub(super) const fn dev_path_for_rdev(rdev: u64) -> Option<&'static [u8]> {
         x if x == makedev(1, 11) => Some(b"/dev/kmsg"),
         x if x == makedev(254, 0) => Some(b"/dev/vda"),
         x if x == makedev(254, 1) => Some(b"/dev/vda1"),
+        x if x == makedev(179, 0) => Some(b"/dev/mmcblk0"),
+        x if x == makedev(179, 1) => Some(b"/dev/mmcblk0p1"),
+        x if x == makedev(179, 2) => Some(b"/dev/mmcblk0p2"),
         x if x == makedev(226, 0) => Some(b"/dev/dri/card0"),
         x if x == makedev(29, 0) => Some(b"/dev/fb0"),
         x if x == makedev(13, 64) => Some(b"/dev/input/event0"),
@@ -377,8 +380,14 @@ impl MemFs {
                 now,
             );
         }
-        for (name, min) in [(&b"vda"[..], 0u32), (b"vda1", 1)] {
-            let rdev = makedev(254, min);
+        for (name, maj, min) in [
+            (&b"vda"[..], 254u32, 0u32),
+            (b"vda1", 254, 1),
+            (b"mmcblk0", 179, 0),
+            (b"mmcblk0p1", 179, 1),
+            (b"mmcblk0p2", 179, 2),
+        ] {
+            let rdev = makedev(maj, min);
             let _ = self.seed_node(
                 mount_id,
                 root_ino,

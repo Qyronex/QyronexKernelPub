@@ -1632,9 +1632,6 @@ pub fn handle_netlink_route_request_with_cfg(
     nlmsg_pid: u32,
     cfg: &NetInterfaceConfig,
 ) -> Result<usize, Errno> {
-    if !cfg.has_eth0 {
-        return handle_netlink_route_request(req, out);
-    }
     if req.len() < 16 {
         return Err(Errno::EINVAL);
     }
@@ -1642,6 +1639,8 @@ pub fn handle_netlink_route_request_with_cfg(
     let nlmsg_type = u16::from_le_bytes([req[4], req[5]]);
     let nlmsg_flags = u16::from_le_bytes([req[6], req[7]]);
     let nlmsg_seq = u32::from_le_bytes([req[8], req[9], req[10], req[11]]);
+    let req_pid = u32::from_le_bytes([req[12], req[13], req[14], req[15]]);
+    let reply_pid = if nlmsg_pid != 0 { nlmsg_pid } else { req_pid };
     if nlmsg_len < 16 || nlmsg_len > req.len() {
         return Err(Errno::EINVAL);
     }
@@ -1669,37 +1668,39 @@ pub fn handle_netlink_route_request_with_cfg(
                 RTM_NEWLINK,
                 NLM_F_MULTI,
                 nlmsg_seq,
-                nlmsg_pid,
+                reply_pid,
             );
 
-            // 2. eth0 (ifindex=2, ARPHRD_ETHER=1)
-            let eth_start = pos;
-            if pos + 32 > out.len() {
-                return Err(Errno::ENOBUFS);
+            // 2. eth0 (ifindex=2, ARPHRD_ETHER=1) when present
+            if cfg.has_eth0 {
+                let eth_start = pos;
+                if pos + 32 > out.len() {
+                    return Err(Errno::ENOBUFS);
+                }
+                let flags: u32 = if cfg.link_up {
+                    0x0001_1043
+                } else {
+                    0x0000_1002
+                };
+                out[pos + 16..pos + 20].copy_from_slice(&[0, 0, 1, 0]);
+                out[pos + 20..pos + 24].copy_from_slice(&2i32.to_le_bytes());
+                out[pos + 24..pos + 28].copy_from_slice(&flags.to_le_bytes());
+                out[pos + 28..pos + 32].copy_from_slice(&0u32.to_le_bytes());
+                pos += 32;
+                pos = write_rta(out, pos, 3, b"eth0\0")?; // IFLA_IFNAME
+                pos = write_rta(out, pos, 4, &cfg.mtu.to_le_bytes())?; // IFLA_MTU
+                pos = write_rta(out, pos, 1, &cfg.mac)?; // IFLA_ADDRESS
+                write_nlmsghdr(
+                    &mut out[eth_start..eth_start + 16],
+                    (pos - eth_start) as u32,
+                    RTM_NEWLINK,
+                    NLM_F_MULTI,
+                    nlmsg_seq,
+                    reply_pid,
+                );
             }
-            let flags: u32 = if cfg.link_up {
-                0x0001_1043
-            } else {
-                0x0000_1002
-            };
-            out[pos + 16..pos + 20].copy_from_slice(&[0, 0, 1, 0]);
-            out[pos + 20..pos + 24].copy_from_slice(&2i32.to_le_bytes());
-            out[pos + 24..pos + 28].copy_from_slice(&flags.to_le_bytes());
-            out[pos + 28..pos + 32].copy_from_slice(&0u32.to_le_bytes());
-            pos += 32;
-            pos = write_rta(out, pos, 3, b"eth0\0")?; // IFLA_IFNAME
-            pos = write_rta(out, pos, 4, &cfg.mtu.to_le_bytes())?; // IFLA_MTU
-            pos = write_rta(out, pos, 1, &cfg.mac)?; // IFLA_ADDRESS
-            write_nlmsghdr(
-                &mut out[eth_start..eth_start + 16],
-                (pos - eth_start) as u32,
-                RTM_NEWLINK,
-                NLM_F_MULTI,
-                nlmsg_seq,
-                nlmsg_pid,
-            );
 
-            write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+            write_nlmsg_done(out, pos, nlmsg_seq, reply_pid)
         }
         RTM_GETADDR => {
             let mut pos = 0usize;
@@ -1724,11 +1725,11 @@ pub fn handle_netlink_route_request_with_cfg(
                     RTM_NEWADDR,
                     NLM_F_MULTI,
                     nlmsg_seq,
-                    nlmsg_pid,
+                    reply_pid,
                 );
 
                 // Configured IPv4 address on eth0
-                if cfg.ip != [0, 0, 0, 0] {
+                if cfg.has_eth0 && cfg.ip != [0, 0, 0, 0] {
                     let eth_start = pos;
                     if pos + 24 > out.len() {
                         return Err(Errno::ENOBUFS);
@@ -1755,15 +1756,18 @@ pub fn handle_netlink_route_request_with_cfg(
                         RTM_NEWADDR,
                         NLM_F_MULTI,
                         nlmsg_seq,
-                        nlmsg_pid,
+                        reply_pid,
                     );
                 }
             }
-            write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+            write_nlmsg_done(out, pos, nlmsg_seq, reply_pid)
         }
         RTM_GETROUTE => {
             let mut pos = 0usize;
-            if (req_family == 0 || req_family == AF_INET as u8) && cfg.ip != [0, 0, 0, 0] {
+            if cfg.has_eth0
+                && (req_family == 0 || req_family == AF_INET as u8)
+                && cfg.ip != [0, 0, 0, 0]
+            {
                 let net_ip = [
                     cfg.ip[0] & cfg.netmask[0],
                     cfg.ip[1] & cfg.netmask[1],
@@ -1796,7 +1800,7 @@ pub fn handle_netlink_route_request_with_cfg(
                     RTM_NEWROUTE,
                     NLM_F_MULTI,
                     nlmsg_seq,
-                    nlmsg_pid,
+                    reply_pid,
                 );
 
                 // Default route via gateway
@@ -1825,15 +1829,15 @@ pub fn handle_netlink_route_request_with_cfg(
                         RTM_NEWROUTE,
                         NLM_F_MULTI,
                         nlmsg_seq,
-                        nlmsg_pid,
+                        reply_pid,
                     );
                 }
             }
-            write_nlmsg_done(out, pos, nlmsg_seq, nlmsg_pid)
+            write_nlmsg_done(out, pos, nlmsg_seq, reply_pid)
         }
         RTM_NEWLINK | RTM_DELLINK | RTM_SETLINK | RTM_NEWADDR | RTM_DELADDR | RTM_NEWROUTE
         | RTM_DELROUTE | NLMSG_NOOP => {
-            write_nlmsg_ack_if_requested(req, out, nlmsg_flags, nlmsg_seq, nlmsg_pid)
+            write_nlmsg_ack_if_requested(req, out, nlmsg_flags, nlmsg_seq, reply_pid)
         }
         _ => Err(Errno::EOPNOTSUPP),
     }

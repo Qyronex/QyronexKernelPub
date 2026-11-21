@@ -22,6 +22,7 @@ kernal-cpio = { path = "../cpio" }
 kernal-exceptions-aarch64 = { path = "../exceptions-aarch64" }
 kernal-fdt = { path = "../../firmware/fdt" }
 kernal-fdt-aarch64 = { path = "../../firmware/fdt-aarch64" }
+kernal-fdt-initrd = { path = "../../firmware/fdt-initrd" }
 kernal-frame-allocator = { path = "../frame-allocator" }
 kernal-gicv3-aarch64 = { path = "../gicv3-aarch64" }
 kernal-heap = { path = "../heap" }

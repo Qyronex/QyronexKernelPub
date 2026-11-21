@@ -503,7 +503,9 @@ fn initialize_staging<const SEGMENTS: usize>(
         kernal_usercopy_aarch64::copy_to_user(address, &page).map_err(|_| Error::Usercopy)?;
     }
 
-    if kernal_usercopy_aarch64::pan_enabled() != Ok(true) {
+    if kernal_usercopy_aarch64::pan_supported()
+        && kernal_usercopy_aarch64::pan_enabled() != Ok(true)
+    {
         return Err(Error::Usercopy);
     }
     Ok(())
@@ -806,7 +808,9 @@ fn initialize_dynamic_staging<const SEGMENTS: usize>(
         kernal_usercopy_aarch64::copy_to_user(address, &page).map_err(|_| Error::Usercopy)?;
     }
 
-    if kernal_usercopy_aarch64::pan_enabled() != Ok(true) {
+    if kernal_usercopy_aarch64::pan_supported()
+        && kernal_usercopy_aarch64::pan_enabled() != Ok(true)
+    {
         return Err(Error::Usercopy);
     }
     Ok(())

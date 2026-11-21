@@ -217,6 +217,7 @@ dependencies = [
  "kernal-exceptions-aarch64",
  "kernal-fdt",
  "kernal-fdt-aarch64",
+ "kernal-fdt-initrd",
  "kernal-frame-allocator",
  "kernal-gicv3-aarch64",
  "kernal-heap",

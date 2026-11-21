@@ -14,7 +14,8 @@ use kernal_linux_abi::{
 use kernal_linux_bootstrap_aarch64::time::{ClockGettimeError, clock_gettime};
 use kernal_protected_boot_aarch64::{
     RuntimeTablePool, Step15ProofCallback, install_step15_proof_callback,
-    map_qemu_initrd_high_alias, map_qemu_virtio_mmio_high_aliases, runtime_ttbr1_root,
+    map_hardware_mmio_high_alias, map_qemu_initrd_high_alias, map_qemu_virtio_mmio_high_aliases,
+    runtime_ttbr1_root,
 };
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_scheduler_smp::GlobalThreadId;
@@ -110,6 +111,13 @@ const STEP15_FUTEX_WAIT_PRIVATE: u64 = 128;
 static STEP15_SVC_UART_BASE: AtomicU64 = AtomicU64::new(0);
 static STEP15_SVC_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static STEP30_POST_FORK_RESCHEDULE_TRACE_PENDING: AtomicBool = AtomicBool::new(false);
+static RPI_SDHCI_PHYS: AtomicU64 = AtomicU64::new(0);
+static RPI_DEFERRED_MBOX_PHYS: AtomicU64 = AtomicU64::new(0);
+static RPI_FB_PHYS: AtomicU64 = AtomicU64::new(0);
+static RPI_FB_SIZE: AtomicU64 = AtomicU64::new(0);
+static RPI_FB_W: AtomicU64 = AtomicU64::new(0);
+static RPI_FB_H: AtomicU64 = AtomicU64::new(0);
+static RPI_FB_PITCH: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn map_usercopy_errno(err: kernal_usercopy::Error) -> kernal_linux_abi::Errno {
     match err {
@@ -149,6 +157,58 @@ pub(super) fn install(serial: &Pl011) {
     serial.write_str("KERNAL/ARM64: Step 15 Core callback installed\n");
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn install_rpi(
+    serial: &Pl011,
+    blob: &kernal_fdt::Blob<'_>,
+    board_rev: u32,
+    arm_ram_bytes: u64,
+    sdhci_phys: u64,
+    deferred_mbox_phys: u64,
+    fb_info: Option<super::rpi_native::RpiFbBootInfo>,
+) {
+    if !cfg!(feature = "step15-qemu-proof") {
+        return;
+    }
+
+    let dtb_mem = entropy::extract_memory_bytes(blob, 0);
+    let effective_ram = match dtb_mem {
+        Some(dtb_bytes) if arm_ram_bytes == 0 || dtb_bytes < arm_ram_bytes => dtb_bytes,
+        _ => arm_ram_bytes,
+    };
+    memory::publish_hardware_ram_window(0, effective_ram);
+    serial.write_str("KERNAL/RPI: hardware RAM window base=0x0 size_mib=");
+    serial.write_u64(memory::effective_ram_bytes() / (1024 * 1024));
+    serial.write_str("\n");
+
+    let counter = kernal_arch_aarch64::read_virtual_counter();
+    entropy::publish_rpi_hardware_at_random(blob, board_rev, effective_ram as u32, counter)
+        .unwrap_or_else(|_| {
+            super::fatal_with_serial(serial, "KERNAL/RPI: hardware entropy seed failed\n")
+        });
+    serial.write_str("KERNAL/RPI: hardware entropy seed captured\n");
+
+    RPI_SDHCI_PHYS.store(sdhci_phys, Ordering::Release);
+    RPI_DEFERRED_MBOX_PHYS.store(deferred_mbox_phys, Ordering::Release);
+    if let Some(fb) = fb_info {
+        RPI_FB_PHYS.store(fb.phys_addr, Ordering::Release);
+        RPI_FB_SIZE.store(u64::from(fb.size), Ordering::Release);
+        RPI_FB_W.store(u64::from(fb.width), Ordering::Release);
+        RPI_FB_H.store(u64::from(fb.height), Ordering::Release);
+        RPI_FB_PITCH.store(u64::from(fb.pitch), Ordering::Release);
+    }
+
+    let context = core::ptr::from_ref(serial).cast_mut().cast::<()>();
+    let callback = Step15ProofCallback::new(context, run_protected);
+    unsafe { install_step15_proof_callback(callback) }.unwrap_or_else(|_| {
+        super::fatal_with_serial(
+            serial,
+            "KERNAL/RPI: protected Core callback install failed\n",
+        )
+    });
+    serial.write_str("KERNAL/RPI: protected Core callback installed\n");
+}
+
 unsafe fn run_protected(
     context: *mut (),
     mut backend: NonNull<RuntimeTablePool>,
@@ -181,6 +241,112 @@ unsafe fn run_protected(
         serial.write_str(
             "KERNAL/ARM64: BCM2837 (Raspberry Pi 3B+) drivers attached (Mailbox/GPIO54/PL011/MiniUART/QA7/SDHCI/DWC2/LAN7515-GbE/I2C/SPI/WDT)\n",
         );
+    }
+
+    // Map native Raspberry Pi hardware peripherals (VideoCore VI Mailbox on Pi 4B, Arasan SDHCI /
+    // BCM2711 EMMC2 / BCM2712 SDIO0, and VideoCore HDMI linear framebuffer) immediately after the
+    // VirtIO-MMIO TTBR1 cursor before sealing the page-table floor and mounting rootfs.
+    let mut hw_cursor = virtio_map.virtual_page_end();
+    let deferred_mbox_phys = RPI_DEFERRED_MBOX_PHYS.load(Ordering::Acquire);
+    let mut fb_phys = RPI_FB_PHYS.load(Ordering::Acquire);
+    let mut fb_size = RPI_FB_SIZE.load(Ordering::Acquire);
+    let mut fb_w = RPI_FB_W.load(Ordering::Acquire) as u32;
+    let mut fb_h = RPI_FB_H.load(Ordering::Acquire) as u32;
+    let mut fb_pitch = RPI_FB_PITCH.load(Ordering::Acquire) as u32;
+
+    if deferred_mbox_phys != 0 && fb_phys == 0 {
+        // SAFETY: BSP-exclusive monotonic TTBR1 cursor in protected callback.
+        if let Ok((mbox_virt, next_cursor)) = unsafe {
+            map_hardware_mmio_high_alias(
+                backend.as_mut(),
+                hw_cursor,
+                MmioRegion {
+                    base: deferred_mbox_phys,
+                    size: 0x80,
+                },
+                kernal_page_table_aarch64::MemoryType::DeviceNgnre,
+            )
+        } {
+            hw_cursor = next_cursor;
+            // SAFETY: `mbox_virt.base` is a freshly mapped VideoCore VI mailbox aperture.
+            if let Some(fb) = unsafe {
+                super::rpi_native::allocate_videocore_hdmi_framebuffer(mbox_virt.base, 1280, 800)
+            } {
+                fb_phys = fb.phys_addr;
+                fb_size = u64::from(fb.size);
+                fb_w = fb.width;
+                fb_h = fb.height;
+                fb_pitch = fb.pitch;
+                if fb_phys < memory::effective_ram_bytes() && fb_phys >= 128 * 1024 * 1024 {
+                    memory::publish_hardware_ram_window(0, fb_phys & !4095u64);
+                }
+            }
+        }
+    }
+
+    let sdhci_phys = RPI_SDHCI_PHYS.load(Ordering::Acquire);
+    if sdhci_phys != 0 {
+        // SAFETY: BSP-exclusive monotonic TTBR1 cursor for native Raspberry Pi SDHCI/EMMC2 MMIO.
+        if let Ok((sdhci_virt, next_cursor)) = unsafe {
+            map_hardware_mmio_high_alias(
+                backend.as_mut(),
+                hw_cursor,
+                MmioRegion {
+                    base: sdhci_phys,
+                    size: 0x1000,
+                },
+                kernal_page_table_aarch64::MemoryType::DeviceNgnre,
+            )
+        } {
+            hw_cursor = next_cursor;
+            // SAFETY: `sdhci_virt.base` is permanently mapped `DeviceNgnre` RW/NX in TTBR1.
+            match unsafe { step42_hardware::attach_rpi_sdhci_mmio(sdhci_virt.base) } {
+                Ok((sectors, parts)) => {
+                    serial.write_str("KERNAL/RPI: SDHCI MMIO attached sectors=");
+                    serial.write_u64(sectors);
+                    serial.write_str(" partitions=");
+                    serial.write_u64(parts as u64);
+                    serial.write_str("\n");
+                }
+                Err(_) => {
+                    serial.write_str("KERNAL/RPI: SDHCI MMIO no SD card detected\n");
+                }
+            }
+        }
+    }
+
+    if fb_phys != 0 && fb_size != 0 && fb_w != 0 && fb_h != 0 {
+        // SAFETY: BSP-exclusive monotonic TTBR1 cursor for VideoCore linear HDMI framebuffer.
+        if let Ok((fb_virt, next_cursor)) = unsafe {
+            map_hardware_mmio_high_alias(
+                backend.as_mut(),
+                hw_cursor,
+                MmioRegion {
+                    base: fb_phys,
+                    size: fb_size,
+                },
+                kernal_page_table_aarch64::MemoryType::DeviceNgnre,
+            )
+        } {
+            let _ = next_cursor;
+            // SAFETY: `[fb_virt.base, fb_virt.base + fb_size)` is permanently mapped RW/NX.
+            unsafe {
+                step42_hardware::attach_rpi_framebuffer(
+                    fb_virt.base,
+                    fb_size as usize,
+                    fb_w,
+                    fb_h,
+                    fb_pitch,
+                );
+            }
+            serial.write_str("KERNAL/RPI: HDMI linear framebuffer mapped virt=");
+            serial.write_hex_u64(fb_virt.base);
+            serial.write_str(" ");
+            serial.write_u64(u64::from(fb_w));
+            serial.write_str("x");
+            serial.write_u64(u64::from(fb_h));
+            serial.write_str("x32\n");
+        }
     }
 
     // Publish physical exclusions before the first safe byte borrow. This records the protected QEMU
@@ -354,12 +520,15 @@ pub(super) fn remote_wake_with_reschedule(
         .ok_or(kernal_scheduler_cpu::Error::WrongOwner)?
         .load(Ordering::Acquire);
     let affinity = kernal_arch_aarch64::CpuAffinity::from_mpidr(mpidr);
-    // SAFETY: the target generation belongs to the already-published target scheduler/PE. A failure
-    // to notify after mailbox publication is an internal delivery invariant, never a userspace errno.
-    unsafe {
-        kernal_gicv3_aarch64::send_sgi1(kernal_gicv3_aarch64::RESCHEDULE_SGI_DEFAULT, affinity)
+    if super::rpi_native::active_irq_mode() == super::rpi_native::IRQ_MODE_GICV3 {
+        // SAFETY: the target generation belongs to the already-published target scheduler/PE. A failure
+        // to notify after mailbox publication is an internal delivery invariant, never a userspace errno.
+        unsafe {
+            kernal_gicv3_aarch64::send_sgi1(kernal_gicv3_aarch64::RESCHEDULE_SGI_DEFAULT, affinity)
+        }
+        .map_err(|_| kernal_scheduler_cpu::Error::Invariant)?;
     }
-    .map_err(|_| kernal_scheduler_cpu::Error::Invariant)
+    Ok(())
 }
 
 fn wake_wait_exit_batch(

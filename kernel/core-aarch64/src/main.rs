@@ -26,6 +26,7 @@ use kernal_scheduler_cpu::CpuSchedulerCell;
 use kernal_thread_context::KernelStack;
 
 mod rpi_native;
+mod rpi_sdhci_mmio;
 #[cfg(feature = "qemu-proof")]
 mod step15_qemu;
 
@@ -407,9 +408,7 @@ pub extern "C" fn kernal_aarch64_main(dtb_physical: u64) -> ! {
     let Some(gic_physical) = platform.gic else {
         if platform.gic_v2.is_some() || platform.bcm_intc.is_some() {
             rpi_native::boot_raspberry_pi_native(
-                |s| serial.write_str(s),
-                |v| serial.write_u64(v),
-                |v| serial.write_hex_u64(v),
+                &serial,
                 aarch64_exception_handler,
                 &platform,
                 &blob,
@@ -1124,12 +1123,14 @@ fn service_step30_job_control_safe_point() {
     match step15_qemu::service_step30_job_control_completions(index) {
         Ok(false) => {}
         Ok(true) => {
-            let target = CpuAffinity::from_mpidr(CPU_MPIDRS[index].load(Ordering::Acquire));
-            // SAFETY: the completed scheduler ACK remains durable in this PE's mailbox while the
-            // RuntimeCell is busy. A self-SGI schedules a later exact-owner retry without reapplying
-            // the already-completed RunQueue transition.
-            unsafe { kernal_gicv3_aarch64::send_sgi1(RESCHEDULE_SGI_DEFAULT, target) }
-                .unwrap_or_else(|_| fatal_silent());
+            if rpi_native::active_irq_mode() == rpi_native::IRQ_MODE_GICV3 {
+                let target = CpuAffinity::from_mpidr(CPU_MPIDRS[index].load(Ordering::Acquire));
+                // SAFETY: the completed scheduler ACK remains durable in this PE's mailbox while the
+                // RuntimeCell is busy. A self-SGI schedules a later exact-owner retry without reapplying
+                // the already-completed RunQueue transition.
+                unsafe { kernal_gicv3_aarch64::send_sgi1(RESCHEDULE_SGI_DEFAULT, target) }
+                    .unwrap_or_else(|_| fatal_silent());
+            }
         }
         Err(()) => fatal_silent(),
     }
@@ -1155,7 +1156,26 @@ extern "C" fn aarch64_exception_handler(frame: &mut ExceptionFrame) {
     }
 
     if rpi_native::active_irq_mode() != rpi_native::IRQ_MODE_GICV3 {
-        rpi_native::handle_native_rpi_irq();
+        if RUNTIME_SCHEDULER_TICK_ACTIVE[0].load(Ordering::Acquire) {
+            // SAFETY: BSP CpuLocal was installed before enabling runtime scheduler tick.
+            let local = unsafe { kernal_percpu_aarch64::current() };
+            local.enter_irq();
+            rpi_native::handle_native_rpi_irq();
+            if local.exit_irq().is_err() {
+                fatal_silent();
+            }
+            #[cfg(feature = "qemu-proof")]
+            service_step30_job_control_safe_point();
+            service_reschedule_safe_point(local);
+            #[cfg(feature = "qemu-proof")]
+            if frame.source() == kernal_exceptions_aarch64::ExceptionSource::LowerElAarch64
+                && step15_qemu::deliver_step30_signal_on_return(frame).is_err()
+            {
+                fatal_silent();
+            }
+        } else {
+            rpi_native::handle_native_rpi_irq();
+        }
         return;
     }
 

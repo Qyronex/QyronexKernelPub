@@ -21,7 +21,14 @@ pub fn qemu_runtime_reserved_low_range() -> Option<PageRange> {
             return None;
         }
         let state = crate::BOOT_STATE.get()?;
-        return reserved_low_range(true, crate::QEMU_VIRT_RAM_BASE, state.layout.bss.end);
+        let ram_base = crate::active_ram_base();
+        if ram_base == 0 {
+            if state.layout.bss.end == 0 || state.layout.bss.end & (PAGE_SIZE - 1) != 0 {
+                return None;
+            }
+            return Some(PageRange::new(0, state.layout.bss.end));
+        }
+        return reserved_low_range(true, ram_base, state.layout.bss.end);
     }
 
     #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]

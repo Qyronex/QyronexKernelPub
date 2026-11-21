@@ -172,10 +172,12 @@ pub(crate) fn run_if_installed(serial: &crate::Serial, mut backend: NonNull<Runt
         ),
     };
 
-    // Step 15 uses the production PAN/usercopy boundary. Establish the default before Core receives
-    // the callback; the outer runtime repeats this idempotent check before releasing secondary PEs.
-    if kernal_usercopy_aarch64::enable_pan_default().is_err()
-        || kernal_usercopy_aarch64::pan_enabled() != Ok(true)
+    // Step 15 uses the production PAN/usercopy boundary on ARMv8.1+ PEs (QEMU virt, Pi 5).
+    // On ARMv8.0-A silicon without FEAT_PAN (Raspberry Pi 3B+ Cortex-A53, Pi 4B Cortex-A72),
+    // usercopy runs cleanly with TTBR0 fault-site isolation.
+    if kernal_usercopy_aarch64::pan_supported()
+        && (kernal_usercopy_aarch64::enable_pan_default().is_err()
+            || kernal_usercopy_aarch64::pan_enabled() != Ok(true))
     {
         let _ = STEP15_CALLBACK.finish(false);
         crate::fatal(

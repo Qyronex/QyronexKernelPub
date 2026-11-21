@@ -44,6 +44,14 @@ impl ValidatedInitrd {
         validate_qemu_bounds(range.start(), range.end())
     }
 
+    pub fn from_fdt_in_ram(
+        range: InitrdRange,
+        ram_base: u64,
+        ram_bytes: u64,
+    ) -> Result<Self, Error> {
+        validate_bounds_in_ram(ram_base, ram_bytes, range.start(), range.end())
+    }
+
     pub const fn physical_start(self) -> u64 {
         self.physical_start
     }
@@ -67,6 +75,15 @@ impl ValidatedInitrd {
 }
 
 pub fn validate_qemu_bounds(start: u64, end: u64) -> Result<ValidatedInitrd, Error> {
+    validate_bounds_in_ram(QEMU_VIRT_RAM_BASE, QEMU_VIRT_RAM_BYTES, start, end)
+}
+
+pub fn validate_bounds_in_ram(
+    ram_base: u64,
+    ram_bytes: u64,
+    start: u64,
+    end: u64,
+) -> Result<ValidatedInitrd, Error> {
     if start >= end {
         return Err(Error::Empty);
     }
@@ -75,10 +92,10 @@ pub fn validate_qemu_bounds(start: u64, end: u64) -> Result<ValidatedInitrd, Err
         return Err(Error::TooLarge);
     }
 
-    let ram_end = QEMU_VIRT_RAM_BASE
-        .checked_add(QEMU_VIRT_RAM_BYTES)
+    let ram_end = ram_base
+        .checked_add(ram_bytes)
         .ok_or(Error::AddressOverflow)?;
-    if start < QEMU_VIRT_RAM_BASE || end > ram_end {
+    if start < ram_base || end > ram_end {
         return Err(Error::OutsideQemuRam);
     }
 

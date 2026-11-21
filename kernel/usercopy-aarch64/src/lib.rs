@@ -244,7 +244,7 @@ pub fn load_atomic_u32_from_user(user_source: u64) -> Result<u32, AtomicU32LoadE
             })
             .map_err(AtomicU32LoadError::Usercopy)?
         };
-        if !pan_enabled().map_err(AtomicU32LoadError::Usercopy)? {
+        if pan_supported() && !pan_enabled().map_err(AtomicU32LoadError::Usercopy)? {
             return Err(AtomicU32LoadError::Usercopy(Error::PanStateLeak));
         }
         if faulted != 0 {
@@ -297,7 +297,7 @@ pub fn compare_exchange_atomic_u32_in_user(
             })
             .map_err(AtomicU32CompareExchangeError::Usercopy)?
         };
-        if !pan_enabled().map_err(AtomicU32CompareExchangeError::Usercopy)? {
+        if pan_supported() && !pan_enabled().map_err(AtomicU32CompareExchangeError::Usercopy)? {
             return Err(AtomicU32CompareExchangeError::Usercopy(Error::PanStateLeak));
         }
         match status {
@@ -345,7 +345,7 @@ pub fn copy_from_user(destination: &mut [u8], user_source: u64) -> Result<(), Er
                 )
             })?
         };
-        if !pan_enabled()? {
+        if pan_supported() && !pan_enabled()? {
             return Err(Error::PanStateLeak);
         }
         if faulted != 0 {
@@ -391,7 +391,7 @@ pub fn copy_to_user_progress(
                 kernal_copy_to_user_aarch64(range.start() as *mut u8, source.as_ptr(), range.len())
             })?
         };
-        if !pan_enabled()? {
+        if pan_supported() && !pan_enabled()? {
             return Err(Error::PanStateLeak);
         }
         let remaining = usize::try_from(remaining).map_err(|_| Error::Fault)?;
@@ -432,7 +432,9 @@ fn progress_from_remaining(
 
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 fn initialize_current_pe() -> Result<(), Error> {
-    enable_pan_default()?;
+    if pan_supported() {
+        enable_pan_default()?;
+    }
     ensure_fault_handler_installed()
 }
 
@@ -559,8 +561,10 @@ extern "C" fn usercopy_current_el_handler(frame: &mut ExceptionFrame) -> bool {
 
     // The fault happened at an explicitly registered user-access site. Protect the Rust exception
     // path immediately, and make ERET preserve PAN=1 while returning to the assembly fixup label.
-    unsafe { asm!(".inst 0xd500419f", "isb", options(nostack, preserves_flags)) };
-    frame.spsr_el1 |= PSTATE_PAN_BIT;
+    if pan_supported() {
+        unsafe { asm!(".inst 0xd500419f", "isb", options(nostack, preserves_flags)) };
+        frame.spsr_el1 |= PSTATE_PAN_BIT;
+    }
     frame.elr_el1 = fixup;
     true
 }
@@ -579,10 +583,9 @@ fn symbol_address(symbol: *const u8) -> u64 {
 /// helper's recovery label.
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 unsafe fn with_user_access_window<R>(operation: impl FnOnce() -> R) -> Result<R, Error> {
-    if !pan_supported() {
-        return Err(Error::PanUnavailable);
-    }
-    if !pan_enabled()? || !kernal_page_table_aarch64::pan_exception_entry_is_enabled() {
+    let has_pan = pan_supported();
+    if has_pan && (!pan_enabled()? || !kernal_page_table_aarch64::pan_exception_entry_is_enabled())
+    {
         return Err(Error::PanStateLeak);
     }
 
@@ -597,17 +600,20 @@ unsafe fn with_user_access_window<R>(operation: impl FnOnce() -> R) -> Result<R,
         )
     };
 
-    // SAFETY: this is the one intentional Step-10 privileged user-access window.
-    // 0xd500409f == SET_PSTATE_PAN(0).
-    unsafe { asm!(".inst 0xd500409f", "isb", options(nostack, preserves_flags)) };
+    if has_pan {
+        // SAFETY: this is the one intentional Step-10 privileged user-access window.
+        // 0xd500409f == SET_PSTATE_PAN(0).
+        unsafe { asm!(".inst 0xd500409f", "isb", options(nostack, preserves_flags)) };
+    }
 
     let result = operation();
 
     // Restore default denial before any asynchronous exception or scheduler path can run again.
+    if has_pan {
+        unsafe { asm!(".inst 0xd500419f", "isb", options(nostack, preserves_flags)) };
+    }
     unsafe {
         asm!(
-            ".inst 0xd500419f",
-            "isb",
             "msr DAIF, {saved}",
             "isb",
             saved = in(reg) saved_daif,

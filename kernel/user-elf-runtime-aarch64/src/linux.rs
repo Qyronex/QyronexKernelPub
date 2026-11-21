@@ -618,7 +618,9 @@ fn initialize_linux_stack<const SEGMENTS: usize>(
             .ok_or(Error::AddressOverflow)?;
         kernal_usercopy_aarch64::copy_to_user(address, &page).map_err(|_| Error::Usercopy)?;
     }
-    if kernal_usercopy_aarch64::pan_enabled() != Ok(true) {
+    if kernal_usercopy_aarch64::pan_supported()
+        && kernal_usercopy_aarch64::pan_enabled() != Ok(true)
+    {
         return Err(Error::Usercopy);
     }
     Ok(())

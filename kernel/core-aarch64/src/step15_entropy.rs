@@ -424,7 +424,7 @@ fn read_be_cells(bytes: &[u8]) -> Option<u64> {
 
 /// Extracts usable physical RAM size starting at `expected_base` from DTB `/memory`.
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-fn extract_memory_bytes(blob: &Blob<'_>, expected_base: u64) -> Option<u64> {
+pub(super) fn extract_memory_bytes(blob: &Blob<'_>, expected_base: u64) -> Option<u64> {
     let mut depth = 0usize;
     let mut addr_cells: usize = 2;
     let mut size_cells: usize = 1;
@@ -508,6 +508,43 @@ pub unsafe fn publish_qemu_at_random() -> Result<(), Error> {
         super::memory::publish_dtb_ram_bytes(ram_bytes);
     }
     let seed = extract_at_random(&blob)?;
+    QEMU_AT_RANDOM.publish(seed)?;
+    QEMU_GETRANDOM.publish(seed)
+}
+
+/// Seeds `AT_RANDOM` and the kernel ChaCha20 CSPRNG on native Raspberry Pi hardware.
+///
+/// Prefers `/chosen/rng-seed` from the firmware DTB when present, and falls back cleanly to a
+/// ChaCha20-mixed seed combining VideoCore hardware revision, ARM memory size, and the hardware
+/// virtual counter when booting with static official Raspberry Pi DTBs.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub fn publish_rpi_hardware_at_random(
+    blob: &Blob<'_>,
+    board_rev: u32,
+    arm_ram_bytes: u32,
+    counter: u64,
+) -> Result<(), Error> {
+    let seed = match extract_at_random(blob) {
+        Ok(dtb_seed) => dtb_seed,
+        Err(_) => {
+            let mut key = [0u8; QEMU_RNG_SEED_BYTES];
+            key[0..4].copy_from_slice(&board_rev.to_le_bytes());
+            key[4..8].copy_from_slice(&arm_ram_bytes.to_le_bytes());
+            key[8..16].copy_from_slice(&counter.to_le_bytes());
+            key[16..24].copy_from_slice(&kernal_arch_aarch64::read_mpidr_el1().to_le_bytes());
+            key[24..32].copy_from_slice(b"QYRN-RPI");
+            let block = chacha20_block(&key, 1, [0x5250_4933, 0x3435_4857, 0x5345_4544]);
+            let mut mixed = [0u8; QEMU_RNG_SEED_BYTES];
+            mixed.copy_from_slice(&block[..QEMU_RNG_SEED_BYTES]);
+            if mixed[..AT_RANDOM_BYTES] == [0u8; AT_RANDOM_BYTES] {
+                mixed[0] = 0x5a;
+            }
+            if mixed[AT_RANDOM_BYTES..QEMU_RNG_SEED_BYTES] == [0u8; AT_RANDOM_BYTES] {
+                mixed[AT_RANDOM_BYTES] = 0xa5;
+            }
+            mixed
+        }
+    };
     QEMU_AT_RANDOM.publish(seed)?;
     QEMU_GETRANDOM.publish(seed)
 }

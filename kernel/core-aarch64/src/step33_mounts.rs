@@ -377,7 +377,7 @@ impl Step33MountState {
         let mut req_ro = false;
         for token in bootargs[..len].split(|&b| b == b' ' || b == b'\t' || b == b'\n') {
             if let Some(val) = token.strip_prefix(b"root=") {
-                if val.starts_with(b"/dev/vda") {
+                if val.starts_with(b"/dev/vda") || val.starts_with(b"/dev/mmcblk0") {
                     root_dev = Some(val);
                 }
             } else if token == b"ro" {
@@ -2295,7 +2295,8 @@ fn handle_mount(
             let wants_ext4 = !is_prop_only
                 && (matches!(fstype_slice, Some(b"ext4" | b"ext3" | b"ext2"))
                     || ((fstype_slice.is_none() || fstype_slice == Some(b""))
-                        && source_slice.starts_with(b"/dev/vda")));
+                        && (source_slice.starts_with(b"/dev/vda")
+                            || source_slice.starts_with(b"/dev/mmcblk0"))));
             let mut ext4_slot_id = 0u32;
             if wants_ext4 {
                 if !is_init_ns {

@@ -35,7 +35,9 @@ pub use runtime_metadata::runtime_ttbr1_root;
 #[cfg_attr(test, allow(dead_code))]
 mod runtime_initrd;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-pub use runtime_initrd::{ProtectedInitrd, ProtectedInitrdError, map_qemu_initrd_high_alias};
+pub use runtime_initrd::{
+    ProtectedInitrd, ProtectedInitrdError, map_hardware_mmio_high_alias, map_qemu_initrd_high_alias,
+};
 
 mod runtime_virtio;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]

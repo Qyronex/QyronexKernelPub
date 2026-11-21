@@ -8,7 +8,9 @@ use kernal_frame_allocator::{ExtentAllocator, FrameRange, PAGE_SIZE as FRAME_PAG
 use kernal_memory::ReservationSet;
 use kernal_qemu_initrd_aarch64::{QEMU_VIRT_RAM_BASE, QEMU_VIRT_RAM_BYTES};
 
+const MIN_DYNAMIC_RAM_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DYNAMIC_RAM_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+static DTB_DETECTED_RAM_BASE: AtomicU64 = AtomicU64::new(QEMU_VIRT_RAM_BASE);
 static DTB_DETECTED_RAM_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// Records the validated QEMU `virt` RAM span reported by the DTB `/memory` node.
@@ -20,15 +22,38 @@ pub(super) fn publish_dtb_ram_bytes(bytes: u64) {
     if bytes >= QEMU_VIRT_RAM_BYTES && bytes.is_multiple_of(FRAME_PAGE_SIZE) {
         let clamped = bytes.min(MAX_DYNAMIC_RAM_BYTES);
         let _ = QEMU_VIRT_RAM_BASE.checked_add(clamped).map(|_| {
+            DTB_DETECTED_RAM_BASE.store(QEMU_VIRT_RAM_BASE, Ordering::Release);
             DTB_DETECTED_RAM_BYTES.store(clamped, Ordering::Release);
         });
     }
 }
 
-/// Returns the active QEMU physical RAM size in bytes (DTB-detected or 512 MiB baseline).
+/// Records an arbitrary physical RAM window for native hardware boards (e.g. Raspberry Pi RAM at
+/// `0x0000_0000` with VideoCore-reported ARM memory size).
+#[cfg_attr(
+    not(all(target_arch = "aarch64", target_os = "none")),
+    allow(dead_code)
+)]
+pub(super) fn publish_hardware_ram_window(ram_base: u64, bytes: u64) {
+    let aligned_bytes = bytes & !(FRAME_PAGE_SIZE - 1);
+    if ram_base & (FRAME_PAGE_SIZE - 1) == 0 && aligned_bytes >= MIN_DYNAMIC_RAM_BYTES {
+        let clamped = aligned_bytes.min(MAX_DYNAMIC_RAM_BYTES);
+        if ram_base.checked_add(clamped).is_some() {
+            DTB_DETECTED_RAM_BASE.store(ram_base, Ordering::Release);
+            DTB_DETECTED_RAM_BYTES.store(clamped, Ordering::Release);
+        }
+    }
+}
+
+/// Returns the active physical RAM base (`0x4000_0000` on QEMU `virt`, `0x0000_0000` on RPi).
+pub(super) fn effective_ram_base() -> u64 {
+    DTB_DETECTED_RAM_BASE.load(Ordering::Acquire)
+}
+
+/// Returns the active physical RAM size in bytes (hardware/DTB-detected or 512 MiB baseline).
 pub(super) fn effective_ram_bytes() -> u64 {
     let detected = DTB_DETECTED_RAM_BYTES.load(Ordering::Acquire);
-    if detected >= QEMU_VIRT_RAM_BYTES && detected.is_multiple_of(FRAME_PAGE_SIZE) {
+    if detected >= MIN_DYNAMIC_RAM_BYTES && detected.is_multiple_of(FRAME_PAGE_SIZE) {
         detected
     } else {
         QEMU_VIRT_RAM_BYTES
@@ -271,25 +296,26 @@ fn build_reservations(
 fn build_live_frame_pool(
     reservations: ReservationSet<STEP15_RESERVED_RANGES>,
 ) -> Result<Step15FramePool, Error> {
+    let ram_base = effective_ram_base();
     let ram_bytes = effective_ram_bytes();
-    if QEMU_VIRT_RAM_BASE & (FRAME_PAGE_SIZE - 1) != 0
+    if ram_base & (FRAME_PAGE_SIZE - 1) != 0
         || ram_bytes == 0
         || !ram_bytes.is_multiple_of(FRAME_PAGE_SIZE)
     {
         return Err(Error::InvalidRamContract);
     }
-    let ram_end = QEMU_VIRT_RAM_BASE
+    let ram_end = ram_base
         .checked_add(ram_bytes)
         .ok_or(Error::InvalidRamContract)?;
     let ram_pages = ram_bytes / FRAME_PAGE_SIZE;
 
     let mut allocator = Step15FrameAllocator::new();
     allocator
-        .free(FrameRange::new(QEMU_VIRT_RAM_BASE, ram_pages).map_err(Error::FrameAllocator)?)
+        .free(FrameRange::new(ram_base, ram_pages).map_err(Error::FrameAllocator)?)
         .map_err(Error::FrameAllocator)?;
 
     for reserved in reservations.ranges().iter().copied() {
-        if reserved.start < QEMU_VIRT_RAM_BASE
+        if reserved.start < ram_base
             || reserved.end > ram_end
             || reserved.start >= reserved.end
             || reserved.start & (FRAME_PAGE_SIZE - 1) != 0

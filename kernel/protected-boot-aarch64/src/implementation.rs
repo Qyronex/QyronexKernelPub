@@ -201,6 +201,35 @@ unsafe impl Sync for CopiedDtbStorage {}
 static COPIED_BOOT_DTB: CopiedDtbStorage =
     CopiedDtbStorage(UnsafeCell::new([0u8; COPIED_DTB_CAPACITY]));
 
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+static COPIED_DTB_LEN: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+static COPIED_DTB_ORIG_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Returns the active physical RAM base (`0x0000_0000` on Raspberry Pi, `0x4000_0000` on QEMU virt).
+pub fn active_ram_base() -> u64 {
+    #[cfg(all(target_arch = "aarch64", target_os = "none"))]
+    {
+        if is_active() && boot_state().layout.kernel_phys_base < QEMU_VIRT_RAM_BASE {
+            return 0;
+        }
+    }
+    0x4000_0000
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub(crate) fn copied_dtb_bytes() -> Option<(&'static [u8], u64)> {
+    let len = COPIED_DTB_LEN.load(Ordering::Acquire);
+    if len < FDT_HEADER_BYTES || len > COPIED_DTB_CAPACITY {
+        return None;
+    }
+    let orig = COPIED_DTB_ORIG_PHYS.load(Ordering::Acquire);
+    // SAFETY: `COPIED_BOOT_DTB` was written once by BSP before enabling MMU and is immutable thereafter.
+    let slice = unsafe { &(&*COPIED_BOOT_DTB.0.get())[..len] };
+    Some((slice, orig))
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "none", feature = "rpi-native"))]
 core::arch::global_asm!(
     r#"
@@ -210,7 +239,7 @@ _arm64_image_header:
     b kernal_aarch64_protected_start
     .word 0
     .quad 0x00080000
-    .quad 0x05000000
+    .quad 0x06000000
     .quad 0x0000000a
     .quad 0
     .quad 0
@@ -443,6 +472,8 @@ pub extern "C" fn kernal_aarch64_protected_boot(dtb_physical: u64) -> ! {
             let dst = (*COPIED_BOOT_DTB.0.get()).as_mut_ptr();
             core::ptr::copy_nonoverlapping(dtb_addr as *const u8, dst, dtb_bytes);
         }
+        COPIED_DTB_ORIG_PHYS.store(dtb_addr, Ordering::Release);
+        COPIED_DTB_LEN.store(dtb_bytes, Ordering::Release);
         let copied_phys = COPIED_BOOT_DTB.0.get() as u64;
         layout
             .high_alias(copied_phys)
@@ -908,7 +939,7 @@ unsafe fn relocate_rodata_high_aliases(layout: &BootstrapLayout) -> Result<(), (
             return Err(());
         }
         let target = u64::try_from(r_addend).map_err(|_| ())?;
-        if target < layout.kernel_phys_base || target >= layout.bss.end {
+        if target < layout.kernel_phys_base || target > layout.bss.end {
             return Err(());
         }
         let high = layout.high_alias(target).map_err(|_| ())?;

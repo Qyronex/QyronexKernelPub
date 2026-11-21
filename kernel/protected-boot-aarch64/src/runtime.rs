@@ -176,21 +176,23 @@ pub fn enter_runtime_protected_regime() {
             let mut backend = unsafe { super::claim_runtime_table_pool() }.unwrap_or_else(|_| {
                 super::fatal(&serial, "KERNAL/ARM64: runtime table-pool claim failed\n")
             });
-            super::step7_qemu::run(&serial, &mut backend);
-            #[cfg(feature = "step8-qemu-proof")]
-            {
-                super::step8_qemu::prepare(&serial, &mut backend);
-                super::step8_qemu::run(&serial);
-                #[cfg(feature = "step9-qemu-proof")]
+            if crate::active_ram_base() == crate::QEMU_VIRT_RAM_BASE {
+                super::step7_qemu::run(&serial, &mut backend);
+                #[cfg(feature = "step8-qemu-proof")]
                 {
-                    super::step9_qemu::prepare(&serial, &mut backend);
-                    super::step9_qemu::run(&serial);
-                    #[cfg(feature = "step10-qemu-proof")]
+                    super::step8_qemu::prepare(&serial, &mut backend);
+                    super::step8_qemu::run(&serial);
+                    #[cfg(feature = "step9-qemu-proof")]
                     {
-                        super::step10_qemu::run(&serial, &mut backend);
-                        #[cfg(feature = "step11-qemu-proof")]
+                        super::step9_qemu::prepare(&serial, &mut backend);
+                        super::step9_qemu::run(&serial);
+                        #[cfg(feature = "step10-qemu-proof")]
                         {
-                            super::step11_qemu::run(&serial, &mut backend);
+                            super::step10_qemu::run(&serial, &mut backend);
+                            #[cfg(feature = "step11-qemu-proof")]
+                            {
+                                super::step11_qemu::run(&serial, &mut backend);
+                            }
                         }
                     }
                 }
@@ -206,12 +208,19 @@ pub fn enter_runtime_protected_regime() {
             }
         }
 
-        // PAN is a production EL1 invariant, not a QEMU-only proof side effect. Establish it while
-        // the BSP is still IRQ-masked and before the final runtime-release publication.
-        if kernal_usercopy_aarch64::enable_pan_default().is_err()
-            || kernal_usercopy_aarch64::pan_enabled() != Ok(true)
-        {
-            super::fatal(&serial, "KERNAL/ARM64: PAN default-on setup failed\n");
+        // PAN is a production EL1 invariant on ARMv8.1+ PEs (QEMU virt, Raspberry Pi 5). On
+        // ARMv8.0-A silicon without FEAT_PAN (Raspberry Pi 3B+ Cortex-A53, Pi 4B Cortex-A72),
+        // fall back cleanly to TTBR0 fault-safe usercopy without emitting ARMv8.1 PAN instructions.
+        if kernal_usercopy_aarch64::pan_supported() {
+            if kernal_usercopy_aarch64::enable_pan_default().is_err()
+                || kernal_usercopy_aarch64::pan_enabled() != Ok(true)
+            {
+                super::fatal(&serial, "KERNAL/ARM64: PAN default-on setup failed\n");
+            }
+        } else {
+            serial.write_str(
+                "KERNAL/ARM64: ARMv8.0-A PE (no FEAT_PAN); using TTBR0 fault-safe usercopy\n",
+            );
         }
 
         // Keep secondary PEs at their IRQ-masked rendezvous until every BSP-only address-space proof
@@ -255,8 +264,9 @@ pub fn wait_for_runtime_protected_regime() {
             if super::PE_FINALIZED[index].load(Ordering::Acquire)
                 && RUNTIME_PROTECTED.load(Ordering::Acquire)
             {
-                if kernal_usercopy_aarch64::enable_pan_default().is_err()
-                    || kernal_usercopy_aarch64::pan_enabled() != Ok(true)
+                if kernal_usercopy_aarch64::pan_supported()
+                    && (kernal_usercopy_aarch64::enable_pan_default().is_err()
+                        || kernal_usercopy_aarch64::pan_enabled() != Ok(true))
                 {
                     super::fatal_silent();
                 }

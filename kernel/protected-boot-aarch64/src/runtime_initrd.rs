@@ -100,7 +100,9 @@ use core::{ptr::read_volatile, slice::from_raw_parts};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_arch_aarch64::TranslationAccess;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-use kernal_core_initrd_aarch64::{CoreValidatedInitrd, discover_qemu_initrd};
+use kernal_core_initrd_aarch64::{
+    CoreValidatedInitrd, discover_initrd_in_ram, discover_qemu_initrd,
+};
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
 use kernal_fdt::Blob;
 #[cfg(all(target_arch = "aarch64", target_os = "none"))]
@@ -311,6 +313,10 @@ pub(crate) fn with_mapped_qemu_dtb<R>(
     alias_base: u64,
     operation: impl FnOnce(&Blob<'_>) -> Result<R, ProtectedInitrdError>,
 ) -> Result<R, ProtectedInitrdError> {
+    if let Some((copied, _orig_phys)) = crate::copied_dtb_bytes() {
+        let blob = Blob::parse(copied).map_err(ProtectedInitrdError::Dtb)?;
+        return operation(&blob);
+    }
     let state = crate::boot_state();
     let header_span = PageSpan::from_data(crate::QEMU_VIRT_RAM_BASE, PAGE_SIZE)
         .map_err(|_| ProtectedInitrdError::AliasPlan)?;
@@ -408,13 +414,26 @@ pub unsafe fn map_qemu_initrd_high_alias(
     let alias_base = alias_base_after_mmio(state.layout, &state.mmio_aliases)
         .map_err(|_| ProtectedInitrdError::AliasPlan)?;
     let proof = with_mapped_qemu_dtb(backend, alias_base, |blob| {
-        discover_qemu_initrd(
-            blob,
-            crate::QEMU_VIRT_RAM_BASE,
-            state.layout.text.start,
-            state.layout.bss.end,
-        )
-        .map_err(ProtectedInitrdError::Provenance)
+        if let Some((_, orig_dtb_phys)) = crate::copied_dtb_bytes() {
+            let ram_base = crate::active_ram_base();
+            discover_initrd_in_ram(
+                blob,
+                orig_dtb_phys,
+                state.layout.text.start,
+                state.layout.bss.end,
+                ram_base,
+                4 * 1024 * 1024 * 1024,
+            )
+            .map_err(ProtectedInitrdError::Provenance)
+        } else {
+            discover_qemu_initrd(
+                blob,
+                crate::QEMU_VIRT_RAM_BASE,
+                state.layout.text.start,
+                state.layout.bss.end,
+            )
+            .map_err(ProtectedInitrdError::Provenance)
+        }
     })?;
 
     let payload_len = u64::try_from(proof.len()).map_err(|_| ProtectedInitrdError::AliasPlan)?;
@@ -499,6 +518,55 @@ pub unsafe fn map_qemu_initrd_high_alias(
         return Err(error);
     }
     Ok(protected)
+}
+
+/// Permanently maps one hardware MMIO or framebuffer region into TTBR1 starting at `virtual_cursor`.
+/// Returns `(mapped_virtual_region, next_page_aligned_virtual_cursor)`.
+///
+/// # Safety
+/// Must run during the single-owner protected BSP callback window while secondary PEs are quiesced.
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub unsafe fn map_hardware_mmio_high_alias(
+    backend: &mut crate::runtime_table::RuntimeTablePool,
+    virtual_cursor: u64,
+    physical: MmioRegion,
+    memory_type: MemoryType,
+) -> Result<(MmioRegion, u64), ProtectedInitrdError> {
+    if !crate::runtime::runtime_table_pool_claim_ready() {
+        return Err(ProtectedInitrdError::RuntimeNotReady);
+    }
+    if (virtual_cursor & (PAGE_SIZE - 1)) != 0 || (virtual_cursor >> 48) != 0xffff {
+        return Err(ProtectedInitrdError::AliasPlan);
+    }
+    let state = crate::boot_state();
+    let span = PageSpan::from_data(physical.base, physical.size)
+        .map_err(|_| ProtectedInitrdError::AliasPlan)?;
+    let map_res = {
+        let mut mapper = Mapper::new(backend, state.root_table)?;
+        map_pages_with_type(
+            &mut mapper,
+            virtual_cursor,
+            span,
+            MapFlags::WRITE,
+            memory_type,
+        )
+    };
+    // SAFETY: caller owns exclusive BSP page-table mutation window.
+    unsafe { invalidate_after_table_mutation() };
+    map_res?;
+    let virt_base = virtual_cursor
+        .checked_add(span.offset)
+        .ok_or(ProtectedInitrdError::AliasPlan)?;
+    let next_cursor = virtual_cursor
+        .checked_add(span.len())
+        .ok_or(ProtectedInitrdError::AliasPlan)?;
+    Ok((
+        MmioRegion {
+            base: virt_base,
+            size: physical.size,
+        },
+        next_cursor,
+    ))
 }
 
 #[cfg(test)]

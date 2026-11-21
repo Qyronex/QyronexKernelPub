@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
 
+use super::super::rpi_sdhci_mmio::RpiSdhciMmioBlock;
 use super::step_fd_util::{
     DirectProcessRefs, S_IFBLK_MODE, S_IFCHR_MODE, S_IFREG_MODE, SUBSYS_HW, StatMeta,
     copy_from_user, copy_to_user, current_process_object, encode_result, lookup_aliased_subsystem,
@@ -193,6 +194,41 @@ fn with_hw_gpu<R>(f: impl FnOnce(&mut Option<HwGpuSlot>) -> R) -> Result<R, ()> 
     Ok(res)
 }
 
+#[derive(Clone, Copy)]
+struct RpiLinearFb {
+    virt_base: u64,
+    size: usize,
+    width: u32,
+    height: u32,
+    pitch: u32,
+}
+
+struct HwRpiFbCell {
+    state: AtomicU8,
+    value: UnsafeCell<Option<RpiLinearFb>>,
+}
+// SAFETY: serialized via atomic state `0 -> 1 -> 0`.
+unsafe impl Sync for HwRpiFbCell {}
+static HW_RPI_FB_CELL: HwRpiFbCell = HwRpiFbCell {
+    state: AtomicU8::new(0),
+    value: UnsafeCell::new(None),
+};
+
+fn with_rpi_fb<R>(f: impl FnOnce(&mut Option<RpiLinearFb>) -> R) -> Result<R, ()> {
+    if HW_RPI_FB_CELL
+        .state
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return Err(());
+    }
+    // SAFETY: state `1` grants exclusive mutable access to `HW_RPI_FB_CELL`.
+    let slot = unsafe { &mut *HW_RPI_FB_CELL.value.get() };
+    let res = f(slot);
+    HW_RPI_FB_CELL.state.store(0, Ordering::Release);
+    Ok(res)
+}
+
 pub(super) const MAX_HW_INPUT_DEVS: usize = 4;
 
 struct HwInputDmasCell(UnsafeCell<[VirtioInputDmaBlock; MAX_HW_INPUT_DEVS]>);
@@ -364,6 +400,7 @@ struct Step42State {
     entropy: HardwareEntropyPool,
     virtio_blk: Option<VirtioBlkDevice<16, 16>>,
     hw_blk: Option<VirtioBlkMmio<VolatileMmioBus>>,
+    hw_sdhci: Option<RpiSdhciMmioBlock>,
     partitions: PartitionTable,
     bootargs: [u8; 256],
     bootargs_len: usize,
@@ -391,6 +428,7 @@ impl Step42State {
             entropy: HardwareEntropyPool::new(),
             virtio_blk: None,
             hw_blk: None,
+            hw_sdhci: None,
             partitions: PartitionTable::EMPTY,
             bootargs: [0; 256],
             bootargs_len: 0,
@@ -437,6 +475,9 @@ impl Step42State {
             let mut adapter = HwBlkAdapter(hw);
             return f(&mut adapter, &partitions);
         }
+        if let Some(ref mut sdhci) = self.hw_sdhci {
+            return f(sdhci, &partitions);
+        }
         if let Some(ref mut mock) = self.virtio_blk {
             let mut adapter = MockBlkAdapter(mock);
             return f(&mut adapter, &partitions);
@@ -447,6 +488,8 @@ impl Step42State {
     fn block_window(&self, part_num: u8) -> Option<(u64, u64, bool)> {
         let (total_sectors, ro) = if let Some(ref hw) = self.hw_blk {
             (hw.capacity_sectors(), hw.read_only())
+        } else if let Some(ref sdhci) = self.hw_sdhci {
+            (sdhci.capacity_sectors(), false)
         } else if let Some(ref mock) = self.virtio_blk {
             (mock.sector_count() as u64, mock.read_only())
         } else {
@@ -635,16 +678,123 @@ pub(super) fn has_hardware_net() -> bool {
     with_hw_net(|slot| slot.is_some()).unwrap_or(false)
 }
 
-/// Returns whether a real VirtIO-MMIO GPU device (`virtio-gpu`) is initialized.
+/// Attaches a live Raspberry Pi Arasan SDHCI / BCM2711 EMMC2 MMIO block device and parses its
+/// MBR/GPT partition table (`/dev/mmcblk0`, `/dev/mmcblk0p1`, `/dev/mmcblk0p2`, ...).
+///
+/// # Safety
+/// `virt_base` must be a permanently TTBR1-mapped `DeviceNgnre` SDHCI MMIO aperture.
 #[allow(dead_code)]
-pub(super) fn has_hardware_gpu() -> bool {
-    with_hw_gpu(|slot| slot.is_some()).unwrap_or(false)
+pub(super) unsafe fn attach_rpi_sdhci_mmio(virt_base: u64) -> Result<(u64, usize), Errno> {
+    // SAFETY: delegated caller contract guarantees mapped SDHCI aperture.
+    let mut sdhci = unsafe { RpiSdhciMmioBlock::initialize(virt_base)? };
+    let partitions = parse_partitions(&mut sdhci).unwrap_or(PartitionTable::EMPTY);
+    let sectors = sdhci.capacity_sectors();
+    let part_count = partitions.count;
+    with_step42_state(|state| {
+        state.ensure_initialized();
+        state.hw_sdhci = Some(sdhci);
+        state.partitions = partitions;
+    })
+    .map_err(|_| Errno::EIO)?;
+    Ok((sectors, part_count))
 }
 
-/// Returns the probed active scanout dimensions `(width, height)` for the hardware `virtio-gpu`.
+/// Attaches the live VideoCore Mailbox HDMI linear framebuffer mapped in TTBR1 and paints a dark
+/// slate boot backdrop so HDMI monitors confirm live scanout immediately.
+///
+/// # Safety
+/// `[virt_base, virt_base + size)` must be a permanently TTBR1-mapped RW/NX MMIO framebuffer.
+#[allow(dead_code)]
+pub(super) unsafe fn attach_rpi_framebuffer(
+    virt_base: u64,
+    size: usize,
+    width: u32,
+    height: u32,
+    pitch: u32,
+) {
+    if virt_base == 0 || size == 0 || width == 0 || height == 0 || pitch < width.saturating_mul(4) {
+        return;
+    }
+    let fb = RpiLinearFb {
+        virt_base,
+        size,
+        width,
+        height,
+        pitch,
+    };
+    // Paint a crisp dark-slate Qyronex boot surface (`0x0010_1824`) with a 4px cyan top accent bar.
+    let stride_u32 = (pitch as usize) / 4;
+    let max_u32 = size / 4;
+    for y in 0..(height as usize) {
+        let color: u32 = if y < 4 { 0x0000_D4FF } else { 0x0010_1824 };
+        let row_start = y.saturating_mul(stride_u32);
+        if row_start.saturating_add(width as usize) > max_u32 {
+            break;
+        }
+        for x in 0..(width as usize) {
+            // SAFETY: bounded within `[virt_base, virt_base + size)`.
+            unsafe {
+                core::ptr::write_volatile((virt_base as *mut u32).add(row_start + x), color);
+            }
+        }
+    }
+    let _ = with_rpi_fb(|slot| *slot = Some(fb));
+}
+
+/// Returns whether a native Raspberry Pi VideoCore HDMI linear framebuffer is attached.
+#[allow(dead_code)]
+pub(super) fn has_rpi_framebuffer() -> bool {
+    with_rpi_fb(|slot| slot.is_some()).unwrap_or(false)
+}
+
+/// Copies one horizontal scanline span of 32-bpp BGRA/XRGB pixels into the attached Raspberry Pi
+/// linear HDMI framebuffer at `(dst_x, dst_y)`.
+#[allow(dead_code)]
+pub(super) fn write_rpi_framebuffer_span(dst_x: u32, dst_y: u32, pixels: &[u8]) {
+    if pixels.is_empty() {
+        return;
+    }
+    let _ = with_rpi_fb(|slot| {
+        let Some(fb) = *slot else {
+            return;
+        };
+        if dst_y >= fb.height || dst_x >= fb.width {
+            return;
+        }
+        let max_row_bytes = (fb.width - dst_x) as usize * 4;
+        let copy_bytes = pixels.len().min(max_row_bytes);
+        let dst_off = (dst_y as usize)
+            .saturating_mul(fb.pitch as usize)
+            .saturating_add((dst_x as usize).saturating_mul(4));
+        if dst_off.saturating_add(copy_bytes) > fb.size {
+            return;
+        }
+        let dst_ptr = (fb.virt_base as *mut u8).wrapping_add(dst_off);
+        // SAFETY: `dst_off + copy_bytes <= fb.size` inside permanently mapped linear framebuffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(pixels.as_ptr(), dst_ptr, copy_bytes);
+        }
+    });
+}
+
+/// Returns whether a real VirtIO-MMIO GPU (`virtio-gpu`) or native Raspberry Pi HDMI framebuffer
+/// is initialized.
+#[allow(dead_code)]
+pub(super) fn has_hardware_gpu() -> bool {
+    with_hw_gpu(|slot| slot.is_some()).unwrap_or(false) || has_rpi_framebuffer()
+}
+
+/// Returns the probed active scanout dimensions `(width, height)` for the hardware GPU or RPi HDMI
+/// framebuffer.
 #[allow(dead_code)]
 pub(super) fn hardware_gpu_dimensions() -> Option<(u32, u32)> {
-    with_hw_gpu(|slot| slot.as_ref().map(|g| (g.scanout_w, g.scanout_h)))
+    if let Some(dims) = with_hw_gpu(|slot| slot.as_ref().map(|g| (g.scanout_w, g.scanout_h)))
+        .ok()
+        .flatten()
+    {
+        return Some(dims);
+    }
+    with_rpi_fb(|slot| slot.as_ref().map(|fb| (fb.width, fb.height)))
         .ok()
         .flatten()
 }

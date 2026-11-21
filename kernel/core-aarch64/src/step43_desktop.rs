@@ -1108,12 +1108,15 @@ fn present_dumb_to_gpu(
     let Some(backing) = backing else {
         return Ok(());
     };
-    if !backing.gpu_attached {
-        return Ok(());
-    }
     let rw = w.min(backing.width.saturating_sub(x));
     let rh = h.min(backing.height.saturating_sub(y));
     if rw == 0 || rh == 0 {
+        return Ok(());
+    }
+    if !backing.gpu_attached {
+        if super::step42_hardware::has_rpi_framebuffer() {
+            blit_backing_to_rpi_fb(backing, x, y, rw, rh);
+        }
         return Ok(());
     }
     let rect = VirtioGpuRect::new(x, y, rw, rh);
@@ -1129,6 +1132,40 @@ fn present_dumb_to_gpu(
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_errno()),
         Err(e) => Err(e),
+    }
+}
+
+fn blit_backing_to_rpi_fb(backing: DumbBacking, x: u32, y: u32, rw: u32, rh: u32) {
+    let max_bytes = backing.pages.saturating_mul(4096);
+    let src_stride = u64::from(backing.width).saturating_mul(4);
+    let row_bytes = (rw as usize).saturating_mul(4);
+    let mut page_buf = [0u8; 4096];
+    for dy in 0..rh {
+        let cur_y = y.saturating_add(dy);
+        let row_off = u64::from(cur_y)
+            .saturating_mul(src_stride)
+            .saturating_add(u64::from(x).saturating_mul(4));
+        if row_off.saturating_add(row_bytes as u64) > max_bytes {
+            break;
+        }
+        let mut copied = 0usize;
+        while copied < row_bytes {
+            let cur_off = row_off.saturating_add(copied as u64);
+            let page_off = (cur_off & 4095) as usize;
+            let phys_page = backing.phys_base.saturating_add(cur_off & !4095);
+            let chunk = (row_bytes - copied).min(4096 - page_off);
+            if super::live_vm::read_phys_page_bytes(phys_page, page_off, &mut page_buf[..chunk])
+                .is_ok()
+            {
+                let dst_x = x.saturating_add((copied / 4) as u32);
+                super::step42_hardware::write_rpi_framebuffer_span(
+                    dst_x,
+                    cur_y,
+                    &page_buf[..chunk],
+                );
+            }
+            copied += chunk;
+        }
     }
 }
 

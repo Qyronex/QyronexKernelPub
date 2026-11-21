@@ -10,7 +10,7 @@ STAGING_DIR="$OUT_DIR/iso-staging"
 SDCARD_IMG="$OUT_DIR/qyronex-rpi-sdcard.img"
 ISO_FILE="$OUT_DIR/qyronex-rpi-installer.iso"
 
-mkdir -p "$OUT_DIR" "$FW_DIR" "$STAGING_DIR/boot"
+mkdir -p "$OUT_DIR" "$FW_DIR/overlays" "$STAGING_DIR/boot/overlays"
 
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   echo "Docker laeuft nicht. Bitte zuerst Docker Desktop starten." >&2
@@ -28,6 +28,7 @@ FW_FILES=(
   bcm2710-rpi-3-b-plus.dtb
   bcm2711-rpi-4-b.dtb
   bcm2712-rpi-5-b.dtb
+  overlays/disable-bt.dtbo
 )
 for f in "${FW_FILES[@]}"; do
   if [ ! -s "$FW_DIR/$f" ]; then
@@ -66,17 +67,24 @@ docker run --rm \
     objcopy -O binary "$KERNEL_ELF" /out/iso-staging/boot/kernel8.img
     cp /out/iso-staging/boot/kernel8.img /out/iso-staging/boot/kernel_2712.img
     cp "$INITRAMFS" /out/iso-staging/boot/initramfs8
-    cp /out/rpi-firmware/* /out/iso-staging/boot/
+    cp -r /out/rpi-firmware/* /out/iso-staging/boot/
 
     # 2) Raspberry Pi Boot-Konfiguration (3B+, 4B, 5)
+    # WICHTIG: DTB @ 0x07000000 (112 MiB) & initramfs8 @ 0x08000000 (128 MiB) liegen sicher
+    # oberhalb des Kernel-.bss-Segments (~86 MiB), damit echte RPi-Firmware sie nicht ueberlappt.
     cat > /out/iso-staging/boot/config.txt << "CFG"
 # Qyronex OS Hybrid-Kernel Boot Configuration (Raspberry Pi 3B+ / 4B / 5)
 arm_64bit=1
 enable_uart=1
 uart_2ndstage=1
+dtoverlay=disable-bt
 disable_overscan=1
 hdmi_force_hotplug=1
-initramfs initramfs8 followkernel
+framebuffer_width=1280
+framebuffer_height=800
+framebuffer_depth=32
+device_tree_address=0x07000000
+initramfs initramfs8 0x08000000
 
 [pi3]
 kernel=kernel8.img
@@ -92,18 +100,26 @@ kernel=kernel_2712.img
 CFG
 
     cat > /out/iso-staging/boot/cmdline.txt << "CMD"
-console=serial0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 rw rootwait init=/sbin/init udev.children_max=2 systemd.unit=multi-user.target
+console=ttyAMA0,115200 console=tty1 root=/dev/mmcblk0p2 rootfstype=ext4 rw rootwait init=/sbin/init udev.children_max=2 systemd.unit=multi-user.target
 CMD
 
-    # 3) FAT32 Boot-Partition (128 MiB) mit offizieller RPi-Firmware, DTBs & Kernel befuellen
+    # 3) FAT32 Boot-Partition (128 MiB) mit offizieller RPi-Firmware, DTBs, Overlays & Kernel
     BOOT_IMG="/tmp/qyronex-boot.fat32"
     rm -f "$BOOT_IMG"
     truncate -s 128M "$BOOT_IMG"
     mkfs.vfat -F 32 -n QYRONEXBOOT "$BOOT_IMG" >/dev/null
-    mcopy -i "$BOOT_IMG" /out/iso-staging/boot/* ::/
+    mcopy -s -i "$BOOT_IMG" /out/iso-staging/boot/* ::/
 
-    # 4) Komplettes MBR-partitioniertes SD-Karten-Image zusammenbauen
-    python3 - "$BOOT_IMG" "$ROOTFS_EXT4" "/out/qyronex-rpi-sdcard.img" << "PY"
+    # 4) Temporaere RootFS-Kopie fuer Raspberry Pi anpassen (/etc/fstab -> /dev/mmcblk0p2)
+    RPI_ROOTFS="/tmp/qyronex-rpi-rootfs.ext4"
+    cp --sparse=always "$ROOTFS_EXT4" "$RPI_ROOTFS"
+    printf "/dev/mmcblk0p2 / ext4 rw,errors=remount-ro 0 1\n" > /tmp/rpi-fstab
+    debugfs -w -R "rm /etc/fstab" "$RPI_ROOTFS" >/dev/null 2>&1 || true
+    debugfs -w -R "write /tmp/rpi-fstab /etc/fstab" "$RPI_ROOTFS" >/dev/null
+    rm -f /tmp/rpi-fstab
+
+    # 5) Komplettes MBR-partitioniertes SD-Karten-Image zusammenbauen
+    python3 - "$BOOT_IMG" "$RPI_ROOTFS" "/out/qyronex-rpi-sdcard.img" << "PY"
 import os, struct, sys
 
 boot_path, root_path, out_path = sys.argv[1:4]
@@ -151,7 +167,7 @@ with open(out_path, "wb") as out:
 
 print(f"SD-Image erstellt: {out_path} ({TOTAL_BYTES // (1024*1024)} MiB)")
 PY
-    rm -f "$BOOT_IMG"
+    rm -f "$BOOT_IMG" "$RPI_ROOTFS"
   '
 
 echo "[3/5] Erstelle Installer-Skript und Anleitung in der ISO ..."
