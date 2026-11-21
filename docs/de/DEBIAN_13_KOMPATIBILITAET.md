@@ -1,61 +1,38 @@
-# Debian-13-Kompatibilität
+# Linux-Userspace-ABI, VFS & Debian-13-Kompatibilität
 
-Qyronex Kernal verfolgt das Ziel, einen **unveränderten, klar eingegrenzten Debian-13-Userspace** auf der eigenen Kernelarchitektur auszuführen. Dabei soll die Linux-Userspace-ABI kompatibel genug werden, ohne die interne Linux-Kernelarchitektur zu kopieren.
+Stand: 21.11.2026
 
-## Grundsatz
+Qyronex Kernal führt ein **unverändertes Debian 13 (trixie/arm64) Userspace** auf seiner eigenen Rust-Kernelarchitektur aus — ohne Linux-Kernelcode zu kopieren und ohne Linux-Kernelmodule (`.ko`) zu unterstützen.
 
-Kompatibilität wird an beobachtbarem Verhalten gemessen:
+![Linux Userspace ABI, Process Lifecycle and VFS](../assets/qyronex_linux_abi_and_vfs.png)
 
-- Rückgabewerte und `errno`;
-- Signale und Prozessende;
-- Datei- und Metadatenverhalten;
-- Socket-/Netzwerkverhalten;
-- stdout/stderr-Ausgaben, soweit deterministisch vergleichbar;
-- erforderliche Syscalls, Ioctls, Pfade und Geräteinterfaces.
+---
 
-Nicht unterstützt bedeutet **explizites Scheitern**, typischerweise `ENOSYS` oder einen anderen korrekten Fehler. Ein Platzhalter, der Erfolg meldet, obwohl die Semantik fehlt, ist nicht zulässig.
+## 1. Architektur der Linux-ABI-Schicht
 
-## Gepinnte Referenz
+- **Syscall-Trap (`SVC #0` auf AArch64):** Alle Aufrufe von `glibc`, `systemd`, `udev`, `dbus`, `labwc`, `XFCE` und `NetSurf` laufen über den `kernal-linux-abi`-Dispatcher.
+- **Prozess-, Thread- & Event-Subsysteme:**
+  - `clone` / `fork` / `vfork` / `execve` / `wait4` / `exit_group` inklusive Job-Control und Signalzustellung (`sigaction`, `rt_sigreturn`, `signalfd`).
+  - Moderne Deskriptor-APIs: `futex`, `epoll`, `eventfd`, `timerfd`, `memfd_create`, `pipe2`, `pidfd`, sowie `cgroups v2` und `UID`/`GID`-Credentials.
+- **Fail-Closed-Vertrag:** Nicht implementierte Syscalls oder Ioctls liefern sauber `ENOSYS` / `ENOTTY` zurück, statt stillen Erfolg vorzutäuschen.
 
-Das Projekt verwendet für den ARM64-Referenzpfad ein festgelegtes Debian-13/Trixie-Cloud-Image und gepinnte Snapshot-Quellen. Images selbst werden nicht im Git-Repository gespeichert.
+---
 
-Vor Verwendung werden Größe und kryptographische Prüfsummen kontrolliert. Unversionierte `/latest/`-Quellen sind für den beweisorientierten Referenzpfad nicht zulässig.
+## 2. Virtuelles Dateisystem (VFS) & Gerätepfade
 
-## Entwicklungsreihenfolge
+Der VFS-Router (`kernal-linux-vfs` + `step33_ext4_vfs` + `step42_hardware`) vereint:
 
-Die Kompatibilität wird abhängigkeitsorientiert aufgebaut:
+- **`initramfs` (CPIO)** als frühes Root-Dateisystem beim Boot;
+- **`memfs` / `tmpfs`** für `/run`, `/tmp` und flüchtige IPC-Sockets;
+- **`ext4` auf GPT/MBR-Partitionen** über `virtio-blk` (QEMU) bzw. `SDHCI`/`EMMC2` (Raspberry Pi);
+- **`/proc` & `/sys` Telemetrie:** Prozessstatus, Mounts, CPU-Online-Masken sowie Hardware-Treiberknoten (`/sys/bus/platform/drivers/bcm2837/*`, `bcm2711/*`, `bcm2712/*`, `/sys/bus/pci/drivers/pcie_nic/status`);
+- **`/dev/*` Geräteknoten:** `/dev/vda*`, `/dev/rtc0`, `/dev/watchdog`, `/dev/hwrng`, `/dev/pts/*`, `/dev/dri/card0`, `/dev/input/event*`.
 
-1. statische und minimale Linux-Programme;
-2. Prozess-/Thread-/Signal-/Futex-Grundlagen;
-3. dynamischer Loader und glibc;
-4. TTY/PTY;
-5. persistentes Root-Dateisystem;
-6. Netzwerk;
-7. Event- und moderne Descriptor-APIs;
-8. Namespaces/cgroups/Sicherheitscontracts;
-9. `systemd` als unverändertes PID 1;
-10. udev;
-11. `dpkg` und `apt`;
-12. reproduzierbarer Debian-Server-Proof.
+---
 
-## Keine Prozessnamen-Sonderfälle
+## 3. Verifizierter Debian-13-Meilenstein
 
-Eine fehlende Linux-Semantik darf nicht dadurch kaschiert werden, dass der Kernel erkennt, ob ein bestimmtes Programm wie `systemd`, `apt` oder `dbus` läuft. Korrekturen gehören in die gemeinsame Linux-Kompatibilitätsschicht.
+- `systemd 257` bootet als `PID 1` bis `multi-user.target` und startet `udevd`, `journald`, `dbus` und `qyronex-desktop.service`.
+- Vollständige Desktop-Session mit `labwc` (Wayland), `XFCE 4.20`, `xfce4-terminal`, `NetSurf` Webbrowser und `qyronex-filemanager`.
 
-## Sicherheitsgrenze
-
-Kompatibilität darf folgende Invarianten nicht aushebeln:
-
-- W^X;
-- Nullseiten-Schutz;
-- Guard Pages;
-- Capability-Autorität;
-- Usercopy/PAN-Grenzen;
-- DMA-/IOMMU-Isolation;
-- Lifecycle- und Ownership-Regeln.
-
-## Aussagegrenze
-
-Erst wenn die jeweiligen Abnahmekriterien reproduzierbar erfüllt sind, darf eine konkrete Kompatibilitätsaussage gemacht werden. Das Projekt unterscheidet bewusst zwischen „implementiert“, „unverifiziert“, „teilweise“, „explizit nicht unterstützt“ und „nachgewiesen“.
-
-Siehe [`../../DEBIAN_13_COMPATIBILITY_ROADMAP.md`](../../DEBIAN_13_COMPATIBILITY_ROADMAP.md).
+Siehe auch [`../../DEBIAN_13_COMPATIBILITY_ROADMAP.md`](../../DEBIAN_13_COMPATIBILITY_ROADMAP.md).

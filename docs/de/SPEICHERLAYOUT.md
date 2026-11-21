@@ -1,34 +1,50 @@
-# Virtuelles Speicherlayout und Speicherinvarianten
+# Virtuelles Speicherlayout, Capabilities & IOMMU/DMA-Isolation
 
-Qyronex Kernal trennt User- und Kerneladressräume strikt und behandelt Speicherschutz nicht als nachträgliche Härtung, sondern als Architekturvertrag.
+Stand: 21.11.2026
 
-## Grundmodell
+Qyronex Kernal trennt User- und Kerneladressräume sowie Geräte-DMA strikt und behandelt Speicherschutz nicht als nachträgliche Härtung, sondern als unveränderlichen Architekturvertrag.
 
-Für x86_64 liegt der Userspace im unteren kanonischen Adressbereich, während das Kernelimage in der oberen Hälfte liegt. Für AArch64 gelten architekturspezifische Seitentabellen- und EL0/EL1-Regeln; die übergeordneten Sicherheitsinvarianten bleiben jedoch gleich.
+![Memory Layout, Capability Model and IOMMU Isolation](../assets/qyronex_memory_capability_iommu.png)
 
-## Harte Invarianten
+---
 
-1. **W^X:** Kernelcode darf nicht gleichzeitig schreibbar und ausführbar abgebildet sein.
-2. **Nullseite:** Seite 0 bleibt nach Installation kernel-eigener Tabellen ungemappt.
-3. **Guard Pages:** Kernel- und sensible Thread-Stacks erhalten ungemappte Schutzbereiche.
-4. **Userspace-Markierung:** User-Mappings müssen als Userzugriff gekennzeichnet sein und dürfen keinen schreibbaren Alias auf Kerneltext erzeugen.
-5. **MMIO:** Gerätespeicher wird nicht ausführbar gemappt und verwendet geeignete Cacheattribute.
-6. **Expliziter Usercopy:** Der Kernel greift nicht beliebig auf Userspace-Pointer zu; Kopierpfade müssen Grenzen und Zugriffsrichtung prüfen.
+## 1. Virtuelle Adressraum-Trennung (`TTBR0`/`TTBR1` & `CR3`)
 
-## Beispiel des frühen x86_64-Vertrags
+- **AArch64:**
+  - `TTBR0_EL1` bildet den **EL0-Userspace** (`0x0000_0000_0000_0000` bis `0x0000_FFFF_FFFF_FFFF`) ab.
+  - `TTBR1_EL1` bildet den **EL1-Kernelraum** (`0xFFFF_0000_0000_0000` aufwärts) ab.
+  - Hardware-**PAN** (*Privileged Access Never*) verhindert, dass Kernelcode versehentlich direkt auf Userspace-Seiten zugreift; jeder Zugriff muss explizit über die kontrollierten `usercopy`-Pfade laufen.
+- **x86_64:**
+  - Der Userspace liegt im unteren kanonischen Adressraum (`Ring 3`, standardmäßig `NX` auf Daten/Stack).
+  - Das Kernelimage läuft im **High-Half** (`0xFFFF_FFFF_8020_0000` / UEFI-Handoff-Layout) mit getrennten `PT_LOAD`-Segmenten (`R-X` Text, `R--` Rodata, `RW-` Data/BSS).
+  - **SMEP** & **SMAP** sowie `NX` (`IA32_EFER.NXE`) werden beim Start erzwungen.
 
-| Bereich | Frühe Basis | Richtlinie |
-| --- | ---: | --- |
-| Userspace | `0x0000000000000000` | Ring 3, standardmäßig NX |
-| Kernelimage | `0xffffffff80200000` | getrennte ELF-`PT_LOAD`-Segmente |
-| Kerneltext | linkerdefiniert | R-X |
-| Kernel-Rodata | linkerdefiniert | R--, NX |
-| Kernel-Daten/BSS | linkerdefiniert | RW-, NX |
+---
 
-Die Zahlenwerte sind ein Entwicklungsvertrag und keine Garantie, dass spätere Layouts identisch bleiben. KASLR, Direct Maps, per-CPU-Bereiche oder MMIO-Fenster können das konkrete Layout verändern, ohne die Sicherheitsinvarianten aufzugeben.
+## 2. Harte Speicherinvarianten
 
-## Vergleich mit klassischem Linux
+1. **W^X (*Write XOR Execute*):** Keine Seite darf gleichzeitig schreibbar und ausführbar sein.
+2. **Nullseiten-Schutz:** Seite `0` bleibt nach Installation der Kernel-Seitentabellen dauerhaft ungemappt (`Null-Pointer Guard`).
+3. **Guard Pages:** Kernel-Stacks, Exception-Stacks (IST) und Thread-Stacks besitzen ungemappte Schutzseiten gegen Stack-Überläufe.
+4. **Expliziter Usercopy:** Jeder Copy-In/Copy-Out prüft Adressbereich, Ausrichtung, Kanonizität und Zugriffsrichtung.
+5. **MMIO-Isolation:** Gerätespeicher (`Device-nGnRnE` auf AArch64 bzw. `UC` auf x86_64) wird niemals ausführbar gemappt.
 
-Linux besitzt eine sehr umfassende virtuelle Speicherverwaltung mit Demand Paging, Page Cache, NUMA-Policy, Huge Pages, Reclaim, Swap und vielen Spezialpfaden. Qyronex Kernal ist funktional deutlich weniger reif, legt aber von Beginn an Wert darauf, W^X, Nullseiten-Schutz, Guard Pages und explizite Ownership als feste Bedingungen zu behandeln.
+---
 
-Siehe auch [`../MEMORY_LAYOUT.md`](../MEMORY_LAYOUT.md).
+## 3. Capability-Autoritätsmodell (`kernal-capability`)
+
+Anstelle impliziter globaler Root-Autorität innerhalb des Kernels erfordert jede Objekt- und Geräteoperation ein gültiges Capability-Handle:
+
+- `Capability { object: ObjectId, rights: CapRights }` (`READ`, `WRITE`, `CONTROL`, `MAP`).
+- **Generation-Tokens:** Abgelaufene oder zurückgezogene Handles (`StaleGeneration`) sowie fehlende Rechte schlagen **fail-closed** mit `EACCES` / `EPERM` fehl.
+
+---
+
+## 4. IOMMU & DMA-Mediation (`kernal-iommu`)
+
+Kein Gerätetreiber (weder `VirtIO`, noch `PCIe`-NICs oder Raspberry-Pi-Controller `LAN7515` / `GENET v5` / `RP1 GEM` / `SDHCI`) darf beliebige physische RAM-Adressen per DMA ansprechen:
+
+- Jeder DMA-Transfer wird über `verify_dma_window(dma, iova, len, DmaPerms)` gegen eine explizite `DmaMapping`-Region validiert (`DmaPerms::READ`, `WRITE`, `READ_WRITE`).
+- Überschreitungen oder fehlende Permissions führen sofort zu `DmaViolation` / `EACCES`.
+
+Siehe auch die englische Fassung [`../MEMORY_LAYOUT.md`](../MEMORY_LAYOUT.md).

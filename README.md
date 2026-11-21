@@ -8,7 +8,7 @@ The project explores a small privileged core, explicit capability-based authorit
 
 > **Development status:** active research and development. Kernal is not production-ready and must not yet be used as a production security boundary.
 
-![Qyronex Kernal architecture](docs/assets/Architecture_comparison_diagram_…_38c24449_2K.jpg)
+![Qyronex Hybrid Driver Architecture](docs/assets/qyronex_hybrid_driver_architecture.png)
 
 ## Core goals
 
@@ -37,13 +37,17 @@ Linux compatibility targets the **userspace ABI**. Linux kernel modules are not 
 
 ![Qyronex Hybrid Driver Architecture](docs/assets/qyronex_hybrid_driver_architecture.png)
 
-## Raspberry Pi & x86_64 Architecture Diagrams
+## System Architecture & Diagrams
 
-| System View | Diagram |
-|---|---|
-| **Cross-Arch Hybrid Driver Layer** | [Hybrid Driver Architecture](docs/assets/qyronex_hybrid_driver_architecture.png) |
-| **Raspberry Pi 3B+ / 4 / 5 SoC & PCIe Stack** | [RPi Hardware Stack](docs/assets/qyronex_rpi_hardware_stack.png) |
-| **Installable ISO & MBR SD-Card Layout** | [RPi Boot & ISO Layout](docs/assets/qyronex_rpi_boot_iso_layout.png) |
+| System Layer | Diagram | Documentation |
+|---|---|---|
+| **Cross-Arch Hybrid Driver Layer** | [Hybrid Driver Architecture](docs/assets/qyronex_hybrid_driver_architecture.png) | [Hardware & Drivers (DE)](docs/de/HARDWARE_UND_TREIBER.md) |
+| **Memory Layout, Capabilities & IOMMU** | [Memory, Capability & IOMMU](docs/assets/qyronex_memory_capability_iommu.png) | [Memory Layout](docs/MEMORY_LAYOUT.md) · [DE](docs/de/SPEICHERLAYOUT.md) |
+| **Linux Userspace ABI & VFS** | [Linux ABI & VFS](docs/assets/qyronex_linux_abi_and_vfs.png) | [Debian 13 Compatibility (DE)](docs/de/DEBIAN_13_KOMPATIBILITAET.md) |
+| **x86_64 SMP, PCIe & Internet Stack** | [x86_64, PCIe & Internet](docs/assets/qyronex_x86_pcie_internet_stack.png) | [x86_64, PCIe & Network (DE)](docs/de/X86_PCIE_UND_NETZWERK.md) |
+| **Raspberry Pi 3B+ / 4 / 5 SoC Stack** | [RPi Hardware Stack](docs/assets/qyronex_rpi_hardware_stack.png) | [Hardware & Drivers (DE)](docs/de/HARDWARE_UND_TREIBER.md) |
+| **Wayland (`labwc`) & XFCE 4.20 Desktop** | [Desktop Graphics Stack](docs/assets/qyronex_desktop_wayland_stack.png) | [Desktop & Graphics (DE)](docs/de/DESKTOP_UND_GRAFIK.md) |
+| **Installable ISO & MBR SD-Card Layout** | [RPi Boot & ISO Layout](docs/assets/qyronex_rpi_boot_iso_layout.png) | [Boot Protocol](docs/BOOT_PROTOCOL.md) · [DE](docs/de/BOOT_PROTOKOLL.md) |
 
 ## Build & Raspberry Pi ISO
 

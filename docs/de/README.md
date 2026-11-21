@@ -8,13 +8,15 @@ Diese Sammlung ergänzt die englische technische Dokumentation des Projekts. Sie
 
 - [`../../README_DE.md`](../../README_DE.md) – Projektübersicht, Build und Verifikation
 - [`STATUS.md`](STATUS.md) – aktueller Stand (Debian 13, systemd, labwc + XFCE, x86_64, RPi 3B+/4/5, ISO), bekannte Lücken, Starten
-- [`HARDWARE_UND_TREIBER.md`](HARDWARE_UND_TREIBER.md) – Hybrid-Treiberschicht (x86_64 Intel/AMD, PCIe, RPi 3B+/4/5) & ISO-Aufbau mit Systemgrafiken
+- [`HARDWARE_UND_TREIBER.md`](HARDWARE_UND_TREIBER.md) – Hybrid-Treiberschicht (x86_64, RPi 3B+/4/5) & ISO-Aufbau mit Systemgrafiken
+- [`X86_PCIE_UND_NETZWERK.md`](X86_PCIE_UND_NETZWERK.md) – x86_64 (Intel & AMD), PCIe-Bus & Internet-Netzwerk-Stack
+- [`DESKTOP_UND_GRAFIK.md`](DESKTOP_UND_GRAFIK.md) – Wayland (`labwc`), XFCE 4.20, NetSurf, DRM/KMS & `evdev`
 - [`DISSERTATION_QYRONEX_KERNAL.md`](DISSERTATION_QYRONEX_KERNAL.md) – ausführliche wissenschaftliche Projektarbeit mit Linux-Vergleich
-- [`BOOT_PROTOKOLL.md`](BOOT_PROTOKOLL.md) – Boot-Handoff und Speicherbesitz
-- [`SPEICHERLAYOUT.md`](SPEICHERLAYOUT.md) – virtuelles Speicherlayout und harte Invarianten
+- [`BOOT_PROTOKOLL.md`](BOOT_PROTOKOLL.md) – Boot-Handoff (UEFI, FDT, Raspberry Pi) und Speicherbesitz
+- [`SPEICHERLAYOUT.md`](SPEICHERLAYOUT.md) – virtuelles Speicherlayout, Capabilities, IOMMU & harte Invarianten
 - [`ROADMAP.md`](ROADMAP.md) – Entwicklungsphasen und Debian-Kompatibilitätsziel
 - [`SICHERE_SPEICHERARCHITEKTUR.md`](SICHERE_SPEICHERARCHITEKTUR.md) – Capability-basierte sichere Persistenz
-- [`DEBIAN_13_KOMPATIBILITAET.md`](DEBIAN_13_KOMPATIBILITAET.md) – Strategie für unveränderten Debian-13-Userspace
+- [`DEBIAN_13_KOMPATIBILITAET.md`](DEBIAN_13_KOMPATIBILITAET.md) – Linux-Userspace-ABI, VFS & Debian-13-Kompatibilität
 - [`DEBIAN_13_ORAKEL.md`](DEBIAN_13_ORAKEL.md) – Referenzmessung und Vergleich gegen Debian/Linux
 
 ## Verhältnis zur englischen Dokumentation
