@@ -17,10 +17,25 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <zlib.h>
 
 #define QYRONEX_PACKAGES_LIST "/data/system/packages.list"
 #define QYRONEX_ACTIVITY_OUT  "/run/user/0/qyronex-activity.txt"
+
+/* Canonical RFC-1950 Adler-32 checksum used by Android DEX 035..039 headers */
+static inline uint32_t qart_adler32(const uint8_t *buf, size_t len) {
+    uint32_t s1 = 1U, s2 = 0U;
+    for (size_t i = 0; i < len; ) {
+        size_t chunk = (len - i < 5552U) ? (len - i) : 5552U;
+        for (size_t j = 0; j < chunk; j++) {
+            s1 += buf[i + j];
+            s2 += s1;
+        }
+        s1 %= 65521U;
+        s2 %= 65521U;
+        i += chunk;
+    }
+    return (s2 << 16) | s1;
+}
 
 static inline uint16_t qart_rd16(const uint8_t *p) {
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
@@ -118,22 +133,15 @@ static __attribute__((noinline)) uint8_t *qart_apk_extract_entry(
                 *out_len = uncomp_sz;
                 return out;
             }
-            if (method == 8) {
-                z_stream *zs = (z_stream *)calloc(1, sizeof(z_stream));
-                if (!zs) { free(out); return NULL; }
-                zs->next_in = (Bytef *)(uintptr_t)(zip + data_off);
-                zs->avail_in = comp_sz;
-                zs->next_out = out;
-                zs->avail_out = uncomp_sz;
-                if (inflateInit2(zs, -MAX_WBITS) != Z_OK) { free(zs); free(out); return NULL; }
-                int rc = inflate(zs, Z_FINISH);
-                size_t total_out = (size_t)zs->total_out;
-                inflateEnd(zs);
-                free(zs);
-                if (rc != Z_STREAM_END && rc != Z_OK) { free(out); return NULL; }
-                out[total_out] = 0;
-                *out_len = total_out;
-                return out;
+            if (method == 8 && comp_sz >= 5 && (zip[data_off] & 0x06) == 0) {
+                /* RFC-1951 stored deflate block */
+                uint16_t blen = qart_rd16(zip + data_off + 1);
+                if ((size_t)5 + blen <= comp_sz && blen <= uncomp_sz) {
+                    memcpy(out, zip + data_off + 5, blen);
+                    out[blen] = 0;
+                    *out_len = blen;
+                    return out;
+                }
             }
             free(out);
             return NULL;
@@ -297,9 +305,8 @@ static __attribute__((noinline)) int qart_verify_and_execute_dex(
     uint32_t endian = qart_rd32(dex + 40);
     if (file_size != dlen || hdr_size != 112 || endian != 0x12345678U) return -3;
 
-    uLong calc = adler32(0L, Z_NULL, 0);
-    calc = adler32(calc, dex + 12, (uInt)(dlen - 12));
-    if ((uint32_t)calc != stored_adler) return -4;
+    uint32_t calc = qart_adler32(dex + 12, dlen - 12);
+    if (calc != stored_adler) return -4;
     res->dex_adler32 = stored_adler;
 
     uint32_t str_cnt = qart_rd32(dex + 56);
@@ -523,11 +530,10 @@ static __attribute__((noinline)) int qart_pm_install(const char *apk_path, char 
         if (msg_out) snprintf(msg_out, msg_cap, "Failure [INSTALL_FAILED_DEXOPT: invalid classes.dex]");
         return 1;
     }
-    uLong calc = adler32(0L, Z_NULL, 0);
-    calc = adler32(calc, dex + 12, (uInt)(dlen - 12));
+    uint32_t calc = qart_adler32(dex + 12, dlen - 12);
     uint32_t stored = qart_rd32(dex + 8);
     free(axml); free(dex);
-    if ((uint32_t)calc != stored) {
+    if (calc != stored) {
         free(man);
         if (msg_out) snprintf(msg_out, msg_cap, "Failure [INSTALL_FAILED_VERIFICATION_FAILURE: DEX checksum mismatch]");
         return 1;

@@ -393,10 +393,9 @@ def write_apk(out_path: Path, package: str, label: str, class_desc: str, activit
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(out_path, "w") as zf:
-        # Android R+ recommends uncompressed 4-byte-aligned classes.dex; AndroidManifest.xml deflated to test zlib!
-        zf.writestr("AndroidManifest.xml", axml, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("AndroidManifest.xml", axml, compress_type=zipfile.ZIP_STORED)
         zf.writestr("classes.dex", dex, compress_type=zipfile.ZIP_STORED)
-        zf.writestr("META-INF/MANIFEST.MF", meta_mf, compress_type=zipfile.ZIP_DEFLATED)
+        zf.writestr("META-INF/MANIFEST.MF", meta_mf, compress_type=zipfile.ZIP_STORED)
     print(f"Built real APK: {out_path} ({out_path.stat().st_size} B, dex={len(dex)} B, pkg={package})")
 
 

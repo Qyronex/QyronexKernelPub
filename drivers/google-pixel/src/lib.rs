@@ -39,6 +39,15 @@ impl PixelSocGeneration {
         }
     }
 
+    pub const fn codename(self) -> &'static str {
+        match self {
+            Self::TensorG1Gs101 => "gs101",
+            Self::TensorG2Gs201 => "gs201",
+            Self::TensorG3Zuma => "zuma",
+            Self::TensorG4ZumaPro | Self::EmulatorVirtGki => "zumapro",
+        }
+    }
+
     pub const fn supports_hw_mte(self) -> bool {
         matches!(self, Self::TensorG3Zuma | Self::TensorG4ZumaPro)
     }

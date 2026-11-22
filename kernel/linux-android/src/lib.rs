@@ -50,7 +50,7 @@ pub const BINDER_TYPE_WEAK_HANDLE: u32 = 0x7768_2A85;
 pub const BINDER_TYPE_FD: u32 = 0x6664_2A85;
 pub const FLAT_BINDER_OBJECT_BYTES: usize = 24;
 
-// Android 15 ART / Bionic syscalls (`userfaultfd` + `membarrier`)
+// Android 15 ART / Bionic syscalls (`userfaultfd`, `membarrier`, `prctl`)
 pub const UFFDIO_API: u64 = 0xC018_AA3F;
 pub const UFFD_API_VERSION: u64 = 0xAA;
 pub const MEMBARRIER_CMD_QUERY: i32 = 0;
@@ -60,6 +60,13 @@ pub const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: i32 = 1 << 4;
 pub const MEMBARRIER_SUPPORTED_MASK: i64 = (MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_PRIVATE_EXPEDITED
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) as i64;
+pub const PR_SET_TIMERSLACK: u32 = 29;
+pub const PR_GET_TIMERSLACK: u32 = 30;
+pub const PR_SET_TAGGED_ADDR_CTRL: u32 = 55;
+pub const PR_GET_TAGGED_ADDR_CTRL: u32 = 56;
+pub const PR_SET_VMA: u32 = 0x5356_4D41;
+pub const PR_SET_VMA_ANON_NAME: u64 = 0;
+pub const PR_SET_PTRACER: u32 = 0x5961_6D61;
 
 // Binder Command Protocol (userspace -> kernel)
 pub const BC_TRANSACTION: u32 = 0x4040_6300;
@@ -873,6 +880,12 @@ pub struct AndroidKernelState {
     pub erofs_verified_count: u64,
     pub f2fs_verified_count: u64,
     pub super_lp_verified_count: u64,
+    pub sepolicy_load_count: u64,
+    pub sepolicy_bytes: usize,
+    pub sepolicy_sha256: [u8; 32],
+    pub bionic_vma_names_set: u64,
+    pub tagged_addr_ctrl: u64,
+    pub timerslack_ns: u64,
     next_ashmem_id: u32,
 }
 
@@ -898,6 +911,12 @@ impl AndroidKernelState {
             erofs_verified_count: 0,
             f2fs_verified_count: 0,
             super_lp_verified_count: 0,
+            sepolicy_load_count: 1,
+            sepolicy_bytes: 4096,
+            sepolicy_sha256: storage::sha256(b"QYRONEX_GRAPHENEOS_SEPOLICY_V33_DEFAULT"),
+            bionic_vma_names_set: 0,
+            tagged_addr_ctrl: 1,
+            timerslack_ns: 50_000,
             next_ashmem_id: 1,
         };
         state.seed_default_properties();
@@ -1052,6 +1071,34 @@ impl AndroidKernelState {
         let minor = self.binderfs_devices.len() as u32;
         self.binderfs_devices.push(String::from(trimmed));
         Ok((240, minor))
+    }
+
+    /// Loads an Android binary SELinux policy (`/sys/fs/selinux/load` during `init selinux_setup`).
+    pub fn load_sepolicy(&mut self, data: &[u8]) -> Result<(), Errno> {
+        if data.is_empty() || data.len() > 8 * 1024 * 1024 {
+            return Err(Errno::EINVAL);
+        }
+        self.sepolicy_sha256 = storage::sha256(data);
+        self.sepolicy_bytes = data.len();
+        self.sepolicy_load_count = self.sepolicy_load_count.saturating_add(1);
+        self.hardening.selinux_enforcing = true;
+        Ok(())
+    }
+
+    /// Validates an Android SELinux context string written to `/sys/fs/selinux/context`.
+    pub fn validate_selinux_context(&mut self, raw: &[u8]) -> Result<(), Errno> {
+        let Ok(s) = core::str::from_utf8(raw) else {
+            return Err(Errno::EINVAL);
+        };
+        let trimmed = s.trim_matches('\0').trim();
+        if !trimmed.starts_with("u:r:") && !trimmed.starts_with("u:object_r:") {
+            return Err(Errno::EINVAL);
+        }
+        if !trimmed.contains(":s0") {
+            return Err(Errno::EINVAL);
+        }
+        self.selinux_check_count = self.selinux_check_count.saturating_add(1);
+        Ok(())
     }
 
     pub fn binder_audit_stats(&self) -> BinderAuditStats {

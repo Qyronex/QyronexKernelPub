@@ -37,8 +37,9 @@ use kernal_linux_android::{
     BINDER_VERSION, BINDER_WRITE_READ, BINDER_WRITE_READ_BYTES, BR_NOOP, BR_REPLY, BR_TRANSACTION,
     BR_TRANSACTION_COMPLETE, BinderDomain, BinderTransactionData, BinderTransferredFd,
     BinderWriteRead, DMA_HEAP_IOCTL_ALLOC, FLAT_BINDER_OBJECT_BYTES, FlatBinderObject,
-    MAX_BINDER_PAYLOAD_BYTES, MEMBARRIER_CMD_QUERY, MEMBARRIER_SUPPORTED_MASK, UFFD_API_VERSION,
-    UFFDIO_API,
+    MAX_BINDER_PAYLOAD_BYTES, MEMBARRIER_CMD_QUERY, MEMBARRIER_SUPPORTED_MASK,
+    PR_GET_TAGGED_ADDR_CTRL, PR_GET_TIMERSLACK, PR_SET_PTRACER, PR_SET_TAGGED_ADDR_CTRL,
+    PR_SET_TIMERSLACK, PR_SET_VMA, PR_SET_VMA_ANON_NAME, UFFD_API_VERSION, UFFDIO_API,
     ebpf::{
         BPF_MAP_CREATE, BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_MAP_LOOKUP_ELEM,
         BPF_MAP_UPDATE_ELEM, BPF_OBJ_GET, BPF_OBJ_PIN, BPF_PROG_LOAD, BPF_PROG_TEST_RUN, BpfInsn,
@@ -80,6 +81,13 @@ enum AndroidNodeKind {
     SelinuxStatus,
     SelinuxCheckreqprot,
     SelinuxDenyUnknown,
+    SelinuxLoad,
+    SelinuxContext,
+    SelinuxNull,
+    ProcBootconfig,
+    DtAndroidCompatible,
+    DtAndroidHardware,
+    DtAndroidSlotSuffix,
     PowerWakeLock,
     PowerWakeUnlock,
     PowerState,
@@ -120,6 +128,7 @@ impl AndroidNodeKind {
             | Self::CameraLwis
             | Self::BpfMap(_)
             | Self::BpfProg(_)
+            | Self::SelinuxNull
             | Self::AndroidLogMain => S_IFCHR_MODE,
             _ => S_IFREG_MODE,
         }
@@ -150,6 +159,13 @@ impl AndroidNodeKind {
             Self::SelinuxStatus => (0, 45_013),
             Self::SelinuxCheckreqprot => (0, 45_014),
             Self::SelinuxDenyUnknown => (0, 45_015),
+            Self::SelinuxLoad => (0, 45_016),
+            Self::SelinuxContext => (0, 45_017),
+            Self::SelinuxNull => ((1u64 << 8) | 3, 45_018),
+            Self::ProcBootconfig => (0, 45_019),
+            Self::DtAndroidCompatible => (0, 45_060),
+            Self::DtAndroidHardware => (0, 45_061),
+            Self::DtAndroidSlotSuffix => (0, 45_062),
             Self::PowerWakeLock => (0, 45_020),
             Self::PowerWakeUnlock => (0, 45_021),
             Self::PowerState => (0, 45_022),
@@ -193,6 +209,17 @@ impl AndroidNodeKind {
             Self::SelinuxStatus => b"/sys/fs/selinux/status",
             Self::SelinuxCheckreqprot => b"/sys/fs/selinux/checkreqprot",
             Self::SelinuxDenyUnknown => b"/sys/fs/selinux/deny_unknown",
+            Self::SelinuxLoad => b"/sys/fs/selinux/load",
+            Self::SelinuxContext => b"/sys/fs/selinux/context",
+            Self::SelinuxNull => b"/sys/fs/selinux/null",
+            Self::ProcBootconfig => b"/proc/bootconfig",
+            Self::DtAndroidCompatible => {
+                b"/sys/firmware/devicetree/base/firmware/android/compatible"
+            }
+            Self::DtAndroidHardware => b"/sys/firmware/devicetree/base/firmware/android/hardware",
+            Self::DtAndroidSlotSuffix => {
+                b"/sys/firmware/devicetree/base/firmware/android/slot_suffix"
+            }
             Self::PowerWakeLock => b"/sys/power/wake_lock",
             Self::PowerWakeUnlock => b"/sys/power/wake_unlock",
             Self::PowerState => b"/sys/power/state",
@@ -786,7 +813,7 @@ fn match_android_path(path: &[u8]) -> Option<AndroidNodeKind> {
         b"/dev/edgetpu" => Some(AndroidNodeKind::EdgeTpu),
         b"/dev/umts_ipc0" => Some(AndroidNodeKind::ModemIpc),
         b"/dev/lwis-isp" => Some(AndroidNodeKind::CameraLwis),
-        b"/dev/pmsg0" | b"/dev/log/main" | b"/dev/log/system" => {
+        b"/dev/pmsg0" | b"/dev/kmsg" | b"/dev/log/main" | b"/dev/log/system" => {
             Some(AndroidNodeKind::AndroidLogMain)
         }
         b"/sys/fs/selinux/enforce" => Some(AndroidNodeKind::SelinuxEnforce),
@@ -795,6 +822,21 @@ fn match_android_path(path: &[u8]) -> Option<AndroidNodeKind> {
         b"/sys/fs/selinux/status" => Some(AndroidNodeKind::SelinuxStatus),
         b"/sys/fs/selinux/checkreqprot" => Some(AndroidNodeKind::SelinuxCheckreqprot),
         b"/sys/fs/selinux/deny_unknown" => Some(AndroidNodeKind::SelinuxDenyUnknown),
+        b"/sys/fs/selinux/load" | b"/sys/fs/selinux/policy" => Some(AndroidNodeKind::SelinuxLoad),
+        b"/sys/fs/selinux/context" | b"/sys/fs/selinux/access" => {
+            Some(AndroidNodeKind::SelinuxContext)
+        }
+        b"/sys/fs/selinux/null" => Some(AndroidNodeKind::SelinuxNull),
+        b"/proc/bootconfig" => Some(AndroidNodeKind::ProcBootconfig),
+        b"/sys/firmware/devicetree/base/firmware/android/compatible" => {
+            Some(AndroidNodeKind::DtAndroidCompatible)
+        }
+        b"/sys/firmware/devicetree/base/firmware/android/hardware" => {
+            Some(AndroidNodeKind::DtAndroidHardware)
+        }
+        b"/sys/firmware/devicetree/base/firmware/android/slot_suffix" => {
+            Some(AndroidNodeKind::DtAndroidSlotSuffix)
+        }
         b"/sys/power/wake_lock" => Some(AndroidNodeKind::PowerWakeLock),
         b"/sys/power/wake_unlock" => Some(AndroidNodeKind::PowerWakeUnlock),
         b"/sys/power/state" => Some(AndroidNodeKind::PowerState),
@@ -866,6 +908,35 @@ fn render_node_bytes(state: &Step45State, kind: AndroidNodeKind) -> Vec<u8> {
         }
         AndroidNodeKind::SelinuxCheckreqprot => b"0".to_vec(),
         AndroidNodeKind::SelinuxDenyUnknown => b"1".to_vec(),
+        AndroidNodeKind::SelinuxLoad => format!(
+            "sepolicy_loads={}\nsepolicy_bytes={}\nsepolicy_sha256_prefix={:02x}{:02x}{:02x}{:02x}\n",
+            a.sepolicy_load_count,
+            a.sepolicy_bytes,
+            a.sepolicy_sha256[0],
+            a.sepolicy_sha256[1],
+            a.sepolicy_sha256[2],
+            a.sepolicy_sha256[3]
+        )
+        .into_bytes(),
+        AndroidNodeKind::SelinuxContext => b"u:r:init:s0\0".to_vec(),
+        AndroidNodeKind::SelinuxNull => Vec::new(),
+        AndroidNodeKind::ProcBootconfig => format!(
+            "androidboot.hardware = \"{}\"\nandroidboot.slot_suffix = \"{}\"\nandroidboot.dynamic_partitions = \"true\"\nandroidboot.verifiedbootstate = \"green\"\nandroidboot.selinux = \"enforcing\"\nandroidboot.dm_verity = \"enforcing\"\nandroidboot.boot_devices = \"soc/1d84000.ufshc\"\n",
+            state.pixel.soc.codename(),
+            state.pixel.bootctl.active_suffix()
+        )
+        .into_bytes(),
+        AndroidNodeKind::DtAndroidCompatible => b"android,firmware\0".to_vec(),
+        AndroidNodeKind::DtAndroidHardware => {
+            let mut v = state.pixel.soc.codename().as_bytes().to_vec();
+            v.push(0);
+            v
+        }
+        AndroidNodeKind::DtAndroidSlotSuffix => {
+            let mut v = state.pixel.bootctl.active_suffix().as_bytes().to_vec();
+            v.push(0);
+            v
+        }
         AndroidNodeKind::PowerWakeLock => {
             let mut s = String::new();
             for (i, w) in a.wakelocks.iter().enumerate() {
@@ -915,8 +986,12 @@ fn render_node_bytes(state: &Step45State, kind: AndroidNodeKind) -> Vec<u8> {
         AndroidNodeKind::GrapheneOsStatus => {
             let h = a.hardening;
             format!(
-                "profile=GrapheneOS-Qyronex-Hardened\nselinux={}\nwx_ttbr1_isolated={}\ncapability_binder={}\nzero_on_free={}\nexec_spawning={}\nptrace_scope={}\nunprivileged_userns={}\nkptr_restrict={}\ndmesg_restrict={}\nhw_pan={}\nhw_mte={}\navb_verified_boot={}\n",
+                "profile=GrapheneOS-Qyronex-Hardened\nselinux={}\nsepolicy_loads={}\nsepolicy_bytes={}\nbionic_vma_names={}\ntagged_addr_ctrl={}\nwx_ttbr1_isolated={}\ncapability_binder={}\nzero_on_free={}\nexec_spawning={}\nptrace_scope={}\nunprivileged_userns={}\nkptr_restrict={}\ndmesg_restrict={}\nhw_pan={}\nhw_mte={}\navb_verified_boot={}\n",
                 if h.selinux_enforcing { "enforcing" } else { "permissive" },
+                a.sepolicy_load_count,
+                a.sepolicy_bytes,
+                a.bionic_vma_names_set,
+                a.tagged_addr_ctrl,
                 if h.wx_ttbr1_isolated { "active" } else { "off" },
                 if h.capability_binder_enforced { "enforced" } else { "off" },
                 u8::from(h.zero_on_free_allocator),
@@ -1107,6 +1182,13 @@ pub(super) fn try_handle_syscall(
             request.args[0],
             request.args[1],
         )?))),
+        167 => handle_android_prctl(
+            request.args[0] as u32,
+            request.args[1],
+            request.args[2],
+            request.args[3],
+            request.args[4],
+        ),
         // bpf(cmd, attr, size) — Android bpfloader / netd eBPF maps + verified bytecode VM
         280 => Ok(Some(encode_result(handle_bpf_syscall(
             request.args[0] as u32,
@@ -1372,6 +1454,15 @@ fn handle_write(
                     Err(Errno::EPERM)
                 }
             }
+            AndroidNodeKind::SelinuxLoad => {
+                state.android_mut().load_sepolicy(&kbuf)?;
+                Ok(take as i64)
+            }
+            AndroidNodeKind::SelinuxContext => {
+                state.android_mut().validate_selinux_context(&kbuf)?;
+                Ok(take as i64)
+            }
+            AndroidNodeKind::SelinuxNull => Ok(take as i64),
             AndroidNodeKind::PowerWakeLock => {
                 let name = core::str::from_utf8(&kbuf).map_err(|_| Errno::EINVAL)?;
                 state.android_mut().acquire_wakelock(name)?;
@@ -1906,6 +1997,56 @@ fn handle_membarrier(cmd: i32) -> Result<i64, Errno> {
         return Ok(MEMBARRIER_SUPPORTED_MASK);
     }
     Ok(0)
+}
+
+fn handle_android_prctl(
+    option: u32,
+    arg2: u64,
+    _arg3: u64,
+    _arg4: u64,
+    arg5: u64,
+) -> Result<Option<SyscallReturn>, ()> {
+    match option {
+        PR_SET_VMA => {
+            if arg2 != PR_SET_VMA_ANON_NAME {
+                return Ok(Some(encode_result(Err(Errno::EINVAL))));
+            }
+            if arg5 != 0 {
+                let mut vma_name = [0u8; 80];
+                if let Err(e) = read_user_cstr(arg5, &mut vma_name) {
+                    return Ok(Some(encode_result(Err(e))));
+                }
+            }
+            let _ = with_step45_state(|state| {
+                state.android_mut().bionic_vma_names_set += 1;
+            });
+            Ok(Some(encode_result(Ok(0))))
+        }
+        PR_SET_TAGGED_ADDR_CTRL => {
+            let _ = with_step45_state(|state| {
+                state.android_mut().tagged_addr_ctrl = arg2 & 0xFFFF;
+            });
+            Ok(Some(encode_result(Ok(0))))
+        }
+        PR_GET_TAGGED_ADDR_CTRL => {
+            let val = with_step45_state(|state| state.android().tagged_addr_ctrl as i64)?;
+            Ok(Some(encode_result(Ok(val))))
+        }
+        PR_SET_TIMERSLACK => {
+            let _ = with_step45_state(|state| {
+                if arg2 > 0 {
+                    state.android_mut().timerslack_ns = arg2;
+                }
+            });
+            Ok(Some(encode_result(Ok(0))))
+        }
+        PR_GET_TIMERSLACK => {
+            let val = with_step45_state(|state| state.android().timerslack_ns as i64)?;
+            Ok(Some(encode_result(Ok(val))))
+        }
+        PR_SET_PTRACER => Ok(Some(encode_result(Ok(0)))),
+        _ => Ok(None),
+    }
 }
 
 fn handle_binderfs_control_ioctl(cmd: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {

@@ -73,10 +73,11 @@ if [ "$BUILD_FIRST" = "1" ] || [ ! -f "$KERNEL_ELF" ] || [ ! -f "$SYSTEM_IMG" ] 
   fi
 fi
 
-APPEND_LINE="console=ttyAMA0 root=/dev/vda1 rw init=/sbin/init udev.children_max=2 systemd.unit=multi-user.target androidboot.hardware=${SOC} androidboot.selinux=enforcing androidboot.verifiedbootstate=green"
+APPEND_LINE="console=ttyAMA0 init=/init androidboot.hardware=${SOC} androidboot.slot_suffix=_a androidboot.selinux=enforcing androidboot.verifiedbootstate=green androidboot.dm_verity=enforcing"
 
 echo "==================================================================="
-echo "  Qyronex OS - Android 15 / GrapheneOS Pixel Emulator"
+echo "  Qyronex OS v0.7.0 - Pure Native Android 15 / GrapheneOS Emulator"
+echo "  Stack  : Native /init + Direct-DRM SurfaceFlinger (NO Wayland!)"
 echo "  Kernel : $KERNEL_ELF"
 echo "  System : $SYSTEM_IMG"
 echo "  Profil : Google Pixel ($SOC) | SELinux: enforcing | Binder v8"

@@ -46,8 +46,8 @@ Linux compatibility targets the **userspace ABI**. Linux kernel modules are not 
 | **Linux Userspace ABI & VFS** | [Linux ABI & VFS](docs/assets/qyronex_linux_abi_and_vfs.png) | [Debian 13 Compatibility (DE)](docs/de/DEBIAN_13_KOMPATIBILITAET.md) |
 | **x86_64 SMP, PCIe & Internet Stack** | [x86_64, PCIe & Internet](docs/assets/qyronex_x86_pcie_internet_stack.png) | [x86_64, PCIe & Network (DE)](docs/de/X86_PCIE_UND_NETZWERK.md) |
 | **Raspberry Pi 3B+ / 4 / 5 SoC Stack** | [RPi Hardware Stack](docs/assets/qyronex_rpi_hardware_stack.png) | [Hardware & Drivers (DE)](docs/de/HARDWARE_UND_TREIBER.md) |
-| **Wayland (`labwc`) & XFCE 4.20 Desktop** | [Desktop Graphics Stack](docs/assets/qyronex_desktop_wayland_stack.png) | [Desktop & Graphics (DE)](docs/de/DESKTOP_UND_GRAFIK.md) |
-| **Android 15 / GrapheneOS Pixel Edition** | [Clickable GrapheneOS 15 UI & APK VM](docs/assets/qyronex_android_grapheneos_emulator.png) | [Android / Pixel / GrapheneOS Guide (v0.6.0 · 15/15 + eBPF/dm-verity/APK-DEX)](docs/ANDROID_PIXEL_GRAPHENEOS.md) |
+| **Wayland (`labwc`) & XFCE 4.20 Desktop (PC / RPi)** | [Desktop Graphics Stack](docs/assets/qyronex_desktop_wayland_stack.png) | [Desktop & Graphics (DE)](docs/de/DESKTOP_UND_GRAFIK.md) |
+| **Pure Native Android 15 / GrapheneOS Pixel Edition (No Wayland)** | [Direct-DRM SurfaceFlinger & APK VM](docs/assets/qyronex_android_grapheneos_emulator.png) | [Android / Pixel / GrapheneOS Guide (v0.7.0 · 16/16 Pure Native Direct-DRM + Standard GrapheneOS Handoff)](docs/ANDROID_PIXEL_GRAPHENEOS.md) |
 | **Installable ISO & MBR SD-Card Layout** | [RPi Boot & ISO Layout](docs/assets/qyronex_rpi_boot_iso_layout.png) | [Boot Protocol](docs/BOOT_PROTOCOL.md) · [DE](docs/de/BOOT_PROTOKOLL.md) |
 
 ## Build & ISOs (Raspberry Pi, x86_64 UEFI, Android 15 / GrapheneOS Pixel)
@@ -63,10 +63,11 @@ cargo xtask arm-build
 Build the release ISOs:
 
 ```bash
-bash tools/build-rpi-iso.sh        # dist/qyronex-rpi-installer.iso + qyronex-rpi-sdcard.img
-bash tools/build-x86-iso.sh        # dist/qyronex-x86_64-uefi.iso
-bash tools/build-android-iso.sh    # dist/qyronex-android-pixel-grapheneos.iso + qyronex-pixel-boot.img + qyronex-pixel-vendor-boot.img
-bash tools/android/start-android-emulator.sh --vnc   # Launch Android 15 / GrapheneOS Emulator
+bash tools/build-rpi-iso.sh        # dist/qyronex-rpi-installer.iso + qyronex-rpi-sdcard.img (Wayland/XFCE Desktop)
+bash tools/build-x86-iso.sh        # dist/qyronex-x86_64-uefi.iso (PC UEFI)
+bash tools/build-android-iso.sh    # dist/qyronex-android-pixel-grapheneos.iso + qyronex-pixel-boot.img + qyronex-pixel-vendor-boot.img (Pure Native Android — No Wayland!)
+bash tools/android/start-android-emulator.sh --vnc   # Launch Pure Native Android 15 / GrapheneOS Emulator
+bash tools/android/flash-pixel-grapheneos.sh --boot  # Non-destructive RAM boot test on Google Pixel via fastboot
 ```
 
 ## Run in QEMU

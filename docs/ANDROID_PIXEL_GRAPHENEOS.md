@@ -1,67 +1,70 @@
-# Qyronex OS — Android 15 / GrapheneOS Google Pixel Edition (v0.6.0)
+# Qyronex OS — Pure Native Android 15 / GrapheneOS Google Pixel Edition (v0.7.0)
 
-Die **Qyronex Android 15 / GrapheneOS Pixel Edition (v0.6.0)** erweitert den AArch64-Hybrid-Kernel um die vollständige, speichersichere Android-15-Kernel-ABI (`#![forbid(unsafe_code)]` in `kernel/linux-android` und `drivers/google-pixel`), **eBPF (`sys_bpf` 280)**, **dm-verity SHA-256 Merkle-Verifikation**, **EROFS / F2FS / `super.img` Dynamic Partitions (`LP_METADATA`) / FUSE v7.39**, **Google Pixel Tensor G1–G4 / Mali-G715 CSF GPU / Edge TPU / Camera LWIS / Shannon 5G Modem / Titan M2 HALs**, eine echte **Android `.apk`/`.dex`-Dalvik-VM (`qyronex-art`, `dalvikvm`, `pm`, `am`)** sowie eine **vollständig per Maus und Tastatur bedienbare GrapheneOS-15-Wayland-Oberfläche** (`labwc` + natives ARM64 GTK3 `gtk-layer-shell`) — verpackt als eigenständige Release-ISO (`dist/qyronex-android-pixel-grapheneos.iso`) plus AOSP Boot Image v4 (`dist/qyronex-pixel-boot.img`) und AOSP Vendor Boot Image v4 (`dist/qyronex-pixel-vendor-boot.img`).
+Die **Qyronex Pure Native Android 15 / GrapheneOS Pixel Edition (v0.7.0)** trennt die Display- und Userland-Architektur strikt nach Plattform:
+- **PC (`x86_64`) & Raspberry Pi (`ARM64` Desktop):** Nutzen weiterhin den Debian-13-Wayland/XFCE-Desktop-Stack (`labwc` + GTK3).
+- **Android / Google Pixel (`qyronex-android-pixel-grapheneos.iso`, `qyronex-pixel-boot.img`, `qyronex-pixel-vendor-boot.img`):** Läuft **100 % nativ ohne Wayland, ohne GTK3, ohne `systemd` und ohne Debian-Desktop** direkt über das native **Android First-Stage & Second-Stage `/init`**, `/system/bin/servicemanager` (`/dev/binder`), den **Direct-DRM/KMS `SurfaceFlinger`** (`/dev/dri/card0` + `/dev/ashmem` + `/dev/input/event0` Maus-/Touch-Input) und die eingebettete **Dalvik-Bytecode-VM (`qyronex-art`)** — inklusive automatischer **Standard-GrapheneOS-Second-Stage-Übergabe** (`/system/bin/init second_stage`) sowie **`tools/android/flash-pixel-grapheneos.sh`** für `fastboot boot` / `fastboot flash` auf einem Google Pixel!
 
-![Qyronex GrapheneOS 15 Home Launcher (Wayland / GTK3)](assets/qyronex_android_grapheneos_emulator.png)
+![Qyronex Pure Native Android 15 / GrapheneOS Direct-DRM SurfaceFlinger (Kein Wayland)](assets/qyronex_android_grapheneos_emulator.png)
 
-## Neu in v0.6.0 — Vollständige Kernel-, Hardware- & Android-APK/DEX-Plattform (Live-Screenshots)
+## Neu in v0.7.0 — Pure Native Android Stack (Kein Wayland!) & Standard-GrapheneOS-Handoff
 
-| Live Android Activity Host (Executed `PixelSecurityBench.apk` Dalvik DEX 035) | GrapheneOS Auditor (15/15 Attestation GREEN) |
+| Live Android Activity (Executed `PixelSecurityBench.apk` Dalvik DEX 035) | GrapheneOS Auditor (16/16 Native Android 15 & Bionic Attestation) |
 |---|---|
-| ![APK Dalvik Activity](assets/qyronex_grapheneos_apk_dalvik_activity.png) | ![Auditor 15/15](assets/qyronex_grapheneos_auditor_15_15.png) |
+| ![APK Dalvik Activity](assets/qyronex_grapheneos_apk_dalvik_activity.png) | ![Auditor 16/16](assets/qyronex_grapheneos_auditor_15_15.png) |
 
-| GrapheneOS Apps & Android APK Installer (`pm` / `am` + Binder v8) | Settings -> About Pixel & Kernel (Mali-G715 CSF, Edge TPU, Titan M2) |
+| GrapheneOS Apps — APK Package Manager (`pm`/`am`) & Binder v8 | Settings -> Pixel Tensor G4, Mali-G715 CSF GPU & SELinux Lockdown |
 |---|---|
-| ![Apps & APK Installer](assets/qyronex_grapheneos_apps_apk_installer.png) | ![Settings Pixel HW](assets/qyronex_grapheneos_settings_pixel_hw.png) |
+| ![Apps & APK Manager](assets/qyronex_grapheneos_apps_apk_installer.png) | ![Settings Pixel HW](assets/qyronex_grapheneos_settings_pixel_hw.png) |
 
-## Vollständig bedienbare GrapheneOS-15-App-Suite & Android-APK-Laufzeit
+## Zwei Betriebsmodi von `/init` (First-Stage & Second-Stage)
 
-Alle Elemente der Top-Statusleiste (`SELINUX: ENFORCING`, `Binder v8 · tx · FD`, `5G · IP`, `Quick Settings`), der unteren Android-15-Navigations- & Dock-Leiste (`< Back`, `O Home`, `[] Apps`), der Web-Suchleiste, der 4 Telemetrie-Karten sowie aller **10 Apps + Android Activity Host** sind live klickbar und öffnen ohne Einfrieren:
-
-| App | Funktion |
-|---|---|
-| **Apps & APK Installer** | Echter Android-APK-Manager (`pm` / `am` / `qyronex-art` Dalvik VM) mit Ein-Klick-**`Run APK`** / **`Install & Run`** für `GrapheneWelcome.apk`, `PixelSecurityBench.apk` und `QyronexHardwareInfo.apk`, Live-`/data/system/packages.list` **und** Live-`/dev/binder`-ServiceManager-Explorer |
-| **Android Activity Host** | Natives GrapheneOS-Activity-Fenster, das echte `.apk`-Archive (ZIP/DEFLATE + Binary AXML `AndroidManifest.xml` + `classes.dex` DEX 035 mit Adler-32-Prüfung) per Dalvik-Bytecode-VM ausführt (`android.util.Log`, `android.os.SystemProperties`, `android.app.Activity`) |
-| **Auditor (15/15)** | Live-**15/15-Hardware-, Kernel-, eBPF-, dm-verity-, EROFS/F2FS/FUSE-, Pixel-HAL-, Binder-FD-Passing- & APK-DEX-Attestierung** |
-| **Settings** | 5-Tab-Systemeinstellungen: Live-**SELinux-Enforcing-Lockdown-Test** (`-EPERM`), Live-`getprop`/`setprop`, persistente App-Berechtigungen, Live-Netzwerk-/POSIX-TCP-Test & vollständige **Pixel Tensor / Mali-G715 / Edge TPU / dm-verity / eBPF / Storage-Telemetrie** |
-| **Vanadium** | Eingebauter gehärteter Webbrowser mit Adressleiste, Lesezeichen, Live-HTTP/HTTPS-Abruf über VirtIO-Net **und** `Full NetSurf`-Button (`netsurf-gtk`) |
-| **Terminal** | Interaktive Android-15-/Linux-Shell (`getprop`, `service list`, `pm list`, `am start`, `dumpsys`, `qyronex-android-selftest`, `uname -a`) |
-| **Files** | Echter POSIX-ext4-/sysfs-/binderfs-Dateimanager (`/data`, `/data/local/tmp`, `/system/app`, `/sys/kernel/qyronex/android`, `/dev/binderfs`, `/`) inkl. **`Install & Run APK`**-Button und `Edit in Notes` |
-| **Logcat** | Live-Stream aus `/dev/log/main` (Auto-Refresh + eigene Log-Events, inkl. `PackageManager`- & `ActivityTaskManager`-Events) |
-| **Notes / Calculator / Gallery** | Persistenter Texteditor auf `/data` (ext4), Dezimal-/Hex-Rechner und `GdkPixbuf`-Bildbetrachter für `/data/pictures` |
-
-| Interaktive Android-15-Shell (`service list`, `getprop`) | Vanadium Web Browser (Live HTTP/HTTPS + NetSurf) |
-|---|---|
-| ![Terminal](assets/qyronex_grapheneos_terminal_binder.png) | ![Vanadium](assets/qyronex_grapheneos_vanadium_browser.png) |
+1. **Standard-GrapheneOS-Handoff-Modus (Official GrapheneOS Userland):**
+   - Beim Booten lädt `/init` (PID 1) zuerst die binäre SELinux-Policy v33 nach `/sys/fs/selinux/load`, validiert den Kontext `u:r:init:s0` auf `/sys/fs/selinux/context` und prüft `/proc/bootconfig` sowie `/sys/firmware/devicetree/base/firmware/android/{compatible,hardware,slot_suffix}`.
+   - Anschließend prüft `/init` vorhandene System-Partitionen (`/dev/vdb`, `/dev/vdb1`, `/dev/sda`, `/dev/sda1`, `erofs` oder `ext4`) auf ein offizielles Standard-GrapheneOS-/AOSP-System (`/system/bin/init` + `/system/bin/linker64`).
+   - Wird ein Standard-GrapheneOS-System erkannt, mountet `/init` die Partition und übergibt per `chroot` + `execv("/system/bin/init", ["init", "second_stage", NULL])` direkt an das unveränderte offizielle GrapheneOS!
+2. **Standalone Pure Native Android Modus (Emulator & Boot-Image-Selbsttest):**
+   - Ist keine externe GrapheneOS-`super`/`system`-Partition angeschlossen, startet `/init` direkt das im Boot-Image enthaltene native Android-15-Laufzeitsystem (**ohne Wayland, ohne GTK3, ohne `systemd`**):
+     - Startet `/system/bin/servicemanager` auf `/dev/binder` (Binder v8).
+     - Installiert `GrapheneWelcome.apk`, `PixelSecurityBench.apk` und `QyronexHardwareInfo.apk` über `/system/bin/pm` nach `/data/app/` und `/data/system/packages.list`.
+     - Führt die **16/16 Native Android 15 & Bionic Kernel-Selbsttest-Suite** (`qyronex-android-selftest`) in ~2 Sekunden aus.
+     - Startet `/system/bin/surfaceflinger` (**Direct-DRM/KMS `1280x800x32` auf `/dev/dri/card0`** mit Hardware-Cursor und vollständigem Maus-/Touch-Klick-Support über `/dev/input/event0`).
 
 ## Architektur & Qyronex-Vorteile gegenüber Standard-Linux/Android
 
 | Komponente | Implementierung in Qyronex | Sicherheits- & Architekturvorteil |
 |---|---|---|
-| **eBPF-Subsystem (`sys_bpf` nr 280)** | [`kernel/linux-android/src/ebpf.rs`](../kernel/linux-android/src/ebpf.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Hash- & Array-Maps, **Fail-Closed-Bytecode-Verifier** (lehnt Rückwärtssprünge/Endlosschleifen & ungültige Register mit `-EACCES` ab), 64-Bit-VM (`BPF_PROG_TEST_RUN`), `/sys/fs/bpf`-Pinning & Live-Stats unter `/sys/kernel/qyronex/android/bpf_stats` |
-| **`dm-verity` SHA-256 Merkle & Device-Mapper** | [`kernel/linux-android/src/storage.rs`](../kernel/linux-android/src/storage.rs) (`/dev/mapper/control`) | FIPS-180-4 SHA-256 Merkle-Tree-Blockverifikation; **1-Bit-Manipulation wird fail-closed mit `-EIO` blockiert** (`DM_VERSION` 4.48, `/sys/kernel/qyronex/android/dm_verity_status`) |
-| **EROFS, F2FS, `super.img` LP & FUSE v7.39** | [`kernel/linux-android/src/storage.rs`](../kernel/linux-android/src/storage.rs) (`/dev/fuse`, `storage_fs_status`) | Echter On-Disk-Parser für **EROFS** (`0xE0F5E1E2`, Superblock, Inodes, Dirents, Dateien), **F2FS** (`0xF2F52010`, Encryption/Verity/Casefold-Flags), Android **`super.img` Dynamic Partitions** (`LP_METADATA` Geometry + Partition-Table) & echter **`FUSE_INIT` v7.39 Handshake** |
-| **Google Pixel Tensor G1–G4 Hardware HALs** | [`drivers/google-pixel/src/lib.rs`](../drivers/google-pixel/src/lib.rs) (`/dev/mali0`, `/dev/edgetpu`, `/dev/umts_ipc0`, `/dev/lwis-isp`) | Open-Source-HALs in `#![forbid(unsafe_code)]` Rust für **ARM Mali-G78/G710/G715 CSF GPU** (`KBASE_IOCTL_VERSION_CHECK`, `KBASE_IOCTL_GET_GPUPROPS`), **Tensor Edge TPU** mit IOMMU-Isolation, **Camera LWIS**, **Shannon 5G Modem IOMMU**, **Titan M2 StrongBox KeyMint 3.0 / 64 Weaver-Slots** & A/B **`bootctl`** |
-| **Android APK/DEX Dalvik VM (`qyronex-art`)** | [`tools/android/src/qyronex_art_core.h`](../tools/android/src/qyronex_art_core.h) + [`mkapk.py`](../tools/android/mkapk.py) | Echter ZIP/DEFLATE-APK-Reader (`zlib`), Binary AXML `AndroidManifest.xml`-Parser, DEX-035-Adler-32-Prüfung, 16-Bit-Dalvik-Bytecode-Interpreter (`pm install/list/uninstall`, `am start`, `dalvikvm`) & 3 gebaute `.apk`-Pakete |
-| **64-Bit Binder v8 + Cross-Process FD Passing** | [`kernel/linux-android/src/lib.rs`](../kernel/linux-android/src/lib.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Treble-Domains (`/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`), `binderfs` (`BINDER_CTL_ADD`), `BINDER_TYPE_FD` Cross-Process-FD-Transfer, `CapRights`-Prüfung, `userfaultfd` (282), `membarrier` (283), Ashmem & DMA-Heap mit Zero-on-Free |
-| **AOSP Boot v4 & Vendor Boot v4** | [`tools/android/mkbootimg_v4.py`](../tools/android/mkbootimg_v4.py) | Spezifikationskonformes `ANDROID!` v4 (`dist/qyronex-pixel-boot.img`) **und** `VNDRBOOT` v4 (`dist/qyronex-pixel-vendor-boot.img` mit DTB, bootconfig & Vendor-Ramdisk-Table) |
+| **Pure Native Direct-DRM `SurfaceFlinger` (Kein Wayland!)** | [`tools/android/src/surfaceflinger.c`](../tools/android/src/surfaceflinger.c) | Direktes Double-Buffered DRM/KMS-Scanout (`1280x800x32`, `/dev/dri/card0`), `/dev/ashmem`-Layer-Pinning, 10 registrierte Binder-v8-Systemdienste, evdev-Touch/Tablet-Hitbox-Engine (`/dev/input/event0`) & eingebettete Dalvik-VM (`qyronex_art_core.h`) |
+| **Android Bionic `prctl` & First-Stage BootConfig/SEPolicy** | [`kernel/linux-android/src/lib.rs`](../kernel/linux-android/src/lib.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Bionic `PR_SET_VMA` (`PR_SET_VMA_ANON_NAME`), `PR_SET_TAGGED_ADDR_CTRL` / `PR_GET_TAGGED_ADDR_CTRL` (ARM64 TBI/MTE), `PR_SET_TIMERSLACK`, `/proc/bootconfig`, `/sys/firmware/devicetree/base/firmware/android/*`, `/sys/fs/selinux/{load,policy,context,access,null}` & `/dev/kmsg` |
+| **eBPF-Subsystem (`sys_bpf` nr 280)** | [`kernel/linux-android/src/ebpf.rs`](../kernel/linux-android/src/ebpf.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Hash- & Array-Maps, **Fail-Closed-Bytecode-Verifier** (lehnt Rückwärtssprünge/Endlosschleifen & ungültige Register mit `-EACCES` ab), 64-Bit-VM (`BPF_PROG_TEST_RUN`), `/sys/fs/bpf`-Pinning & Live-Stats |
+| **`dm-verity` SHA-256 Merkle & Device-Mapper** | [`kernel/linux-android/src/storage.rs`](../kernel/linux-android/src/storage.rs) (`/dev/mapper/control`) | FIPS-180-4 SHA-256 Merkle-Tree-Blockverifikation; **1-Bit-Manipulation wird fail-closed mit `-EIO` blockiert** (`DM_VERSION` 4.48) |
+| **EROFS, F2FS, `super.img` LP & FUSE v7.39** | [`kernel/linux-android/src/storage.rs`](../kernel/linux-android/src/storage.rs) (`/dev/fuse`, `storage_fs_status`) | Echter On-Disk-Parser für **EROFS** (`0xE0F5E1E2`), **F2FS** (`0xF2F52010`), Android **`super.img` Dynamic Partitions** (`LP_METADATA`) & **`FUSE_INIT` v7.39 Handshake** |
+| **Google Pixel Tensor G1–G4 Hardware HALs** | [`drivers/google-pixel/src/lib.rs`](../drivers/google-pixel/src/lib.rs) (`/dev/mali0`, `/dev/edgetpu`, `/dev/umts_ipc0`, `/dev/lwis-isp`) | Open-Source-HALs in `#![forbid(unsafe_code)]` Rust für **ARM Mali-G78/G710/G715 CSF GPU**, **Tensor Edge TPU** mit IOMMU-Isolation, **Camera LWIS**, **Shannon 5G Modem IOMMU**, **Titan M2 StrongBox KeyMint 3.0 / 64 Weaver-Slots** & A/B **`bootctl`** |
+| **Android APK/DEX Dalvik VM (`qyronex-art`)** | [`tools/android/src/qyronex_art_core.h`](../tools/android/src/qyronex_art_core.h) + [`mkapk.py`](../tools/android/mkapk.py) | Eigenständiger, statisch kompilierter ZIP/AXML/DEX-035-Reader mit RFC-1950 Adler-32-Prüfung, 16-Bit-Dalvik-Bytecode-Interpreter (`pm`, `am`, `dalvikvm`, `zygote64`) & 3 echten `.apk`-Paketen |
 
-## Bauen & Im Emulator starten
+## Bauen, Im Emulator starten & Auf Google Pixel per Fastboot testen
 
 ```bash
-# 1. Android-15-/GrapheneOS-ISO, Boot v4, Vendor Boot v4, APKs & System-Image bauen
+# 1. Pure-Native-Android-15-ISO, Boot v4, Vendor Boot v4, Initramfs & 64-MiB-Partition bauen (Kein Wayland!)
 ./tools/build-android-iso.sh
 
 # 2. Im grafischen Qyronex Android-Emulator (Browser-VNC auf http://127.0.0.1:6082) starten
 ./tools/android/start-android-emulator.sh --vnc
 
-# Optional: SoC-Profil waehlen (gs101 | gs201 | zuma | zumapro | virt)
-./tools/android/start-android-emulator.sh --soc zumapro --vnc
+# 3. Optional: Offizielles GrapheneOS system.img als zweites Laufwerk fuer Second-Stage-Handoff einbinden
+./tools/android/start-android-emulator.sh --graphene-system /pfad/zu/grapheneos-system.img --vnc
+
+# 4. Auf einem physischen Google Pixel (Pixel 6 / 7 / 8 / 9 mit installiertem Standard-GrapheneOS &
+#    entsperrtem Bootloader im Fastboot-Modus):
+#    a) Nicht-destruktiver RAM-Test (veraendert den Flash-Speicher des Handys NICHT!):
+./tools/android/flash-pixel-grapheneos.sh --boot
+
+#    b) Permanentes Flashen von boot + vendor_boot auf den aktiven Slot:
+./tools/android/flash-pixel-grapheneos.sh --flash
 ```
 
-## Live-Verifikation im Emulator (15/15 Kernel- & APK-Selbsttest)
+## Live-Verifikation (16/16 Native Android 15 & Bionic Kernel-Selbsttest)
 
-Beim Systemstart startet `qyronex-desktop.service` automatisch `/system/bin/servicemanager`, führt `qyronex-android-selftest` (**15/15 Tests**) aus und startet anschließend die `labwc`-Wayland-Sitzung mit `qyronex-appd` und `qyronex-graphene-ui shell`:
+Beim Systemstart führt `/init` automatisch `qyronex-android-selftest` (**16/16 Tests**) aus:
 
 1. `SELINUX_ENFORCING_LOCKDOWN` — Verifiziert `1` und lehnt Downgrade auf `0` mit `-EPERM` ab.
 2. `BINDER_V8_IPC_SERVICEMANAGER` — Echter prozessübergreifender Binder-v8-RPC (`PING`, `ADD_SERVICE`, `GET_SERVICE`, `LIST_SERVICES`).
@@ -78,8 +81,12 @@ Beim Systemstart startet `qyronex-desktop.service` automatisch `/system/bin/serv
 13. `EROFS_F2FS_SUPER_LP_FUSE` — Live-Kernel-Validierung echter EROFS-, F2FS- und `super.img`-LP-Images sowie `/dev/fuse` `FUSE_INIT` v7.39 Handshake.
 14. `PIXEL_MALI_GPU_EDGETPU_HAL` — `/dev/mali0` `KBASE_IOCTL_VERSION_CHECK` + `KBASE_IOCTL_GET_GPUPROPS`, `/dev/edgetpu`, `/dev/umts_ipc0` & IOMMU-Status.
 15. `APK_DEX_DALVIK_VM_PM_AM_EXEC` — Echte Installation (`pm install`) und Dalvik-Bytecode-Ausführung (`am start`) von `GrapheneWelcome.apk` mit verifiziertem Adler-32 & Ergebnis-Output.
+16. `BIONIC_PRCTL_BOOTCONFIG_SEPOLICY` — Android Bionic `prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME)`, `PR_SET_TAGGED_ADDR_CTRL` (ARM64 TBI/MTE), `/proc/bootconfig`, `/sys/firmware/devicetree/base/firmware/android/compatible`, `/sys/fs/selinux/load` (`sepolicy` v33), `/sys/fs/selinux/context` (`u:r:init:s0`) & `/dev/kmsg`.
 
-## Ehrliche Abgrenzung: Open-Source-Kern vs. signierte Hersteller-Blobs
+## Technische Transparenz für den Einsatz auf physischer Google-Pixel-Hardware
 
-- **Vollständig implementiert & live verifiziert in Qyronex OS v0.6.0:** Der komplette speichersichere Rust-Android-15-Kernel (15/15 Checks inkl. Binder v8 + FD-Passing, eBPF, dm-verity, EROFS, F2FS, `super.img` LP, FUSE v7.39, Ashmem, DMA-Heap, SELinux-Lockdown), die Open-Source-Pixel-Tensor-Hardware-HALs (Mali-G715 CSF, Edge TPU, Camera LWIS, Shannon 5G Modem IOMMU, Titan M2, `bootctl`), AOSP `boot.img` v4 + `vendor_boot.img` v4, die native APK/DEX-Dalvik-VM (`qyronex-art`, `pm`, `am`) mit 3 lauffähigen `.apk`-Paketen sowie die komplett klickbare GrapheneOS-15-Wayland-Oberfläche.
-- **Was aus urheberrechtlichen & technischen Gründen nicht selbst erzeugt werden kann:** Proprietäre, kryptografisch signierte Binär-Firmwares von Google/ARM/Samsung (Mali-CSF-Firmware, Edge-TPU-Firmware, Shannon-5G-Baseband-Firmware, Camera-3A-Blobs — im HAL explizit als `awaiting-pixel-factory-blob` ausgewiesen) sowie das vollständige Multi-Millionen-LOC-Upstream-AOSP-Java/ART-`system_server`-Framework. Für einen Stock-Factory-Image-Daily-Driver auf einem physischen Google Pixel müssen diese signierten Vendor-Blobs und das Upstream-AOSP/GrapheneOS-Userland aus dem offiziellen Factory-Image bereitgestellt werden.
+- **Was sofort bereitsteht (`dist/qyronex-pixel-boot.img` & `dist/qyronex-pixel-vendor-boot.img`):**
+  - Standardkonformes AOSP Boot Image v4 (`ANDROID!`) mit ARM64-Linux-Image-Header (`ARMd`) und reinem Native-Android-Initramfs (`/init`, `/sepolicy`, `/fstab.zumapro`, `/first_stage_ramdisk/fstab.{zumapro,zuma,gs201,gs101}`).
+  - Mit `./tools/android/flash-pixel-grapheneos.sh --boot` (`fastboot boot dist/qyronex-pixel-boot.img`) kann das Boot-Image **nicht-destruktiv direkt im RAM** eines Google Pixel (mit installiertem Standard-GrapheneOS und entsperrtem Bootloader) gestartet werden; nach einem normalen Neustart bootet das Handy wieder den unveränderten Original-Kernel.
+- **Was auf physischer Google-Pixel-Tensor-Hardware (Bare-Metal `gs101`/`gs201`/`zuma`/`zumapro`) zusätzlich zum Emulator-/VirtIO-Treiberstack benötigt wird:**
+  - Während im Emulator VirtIO-Blk, VirtIO-GPU (`DRM/KMS`) und PL011-UART die Block- und Display-Ausgabe übernehmen, nutzt ein physisches Google Pixel proprietäre Samsung/Google-SoC-Controller (physischer Exynos/Tensor UFS-3.1/4.0-Host-Controller für `/dev/sda` `super`, physischer Samsung DPU/Exynos-DRM MIPI-DSI-Display-Controller, Google S2MPG10/12/14 SPMI-PMICs sowie kryptografisch signierte Hersteller-Firmwares für Mali-CSF, Edge TPU und Shannon 5G Baseband).
