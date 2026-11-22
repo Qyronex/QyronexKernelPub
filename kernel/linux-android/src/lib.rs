@@ -15,6 +15,9 @@
 
 extern crate alloc;
 
+pub mod ebpf;
+pub mod storage;
+
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec;
@@ -864,6 +867,12 @@ pub struct AndroidKernelState {
     pub selinux_check_count: u64,
     pub ashmem_regions: Vec<AshmemRegion>,
     pub binderfs_devices: Vec<String>,
+    pub ebpf: ebpf::EbpfSubsystem,
+    pub dm: storage::DmControlState,
+    pub fuse: storage::FuseSessionState,
+    pub erofs_verified_count: u64,
+    pub f2fs_verified_count: u64,
+    pub super_lp_verified_count: u64,
     next_ashmem_id: u32,
 }
 
@@ -883,6 +892,12 @@ impl AndroidKernelState {
                 String::from("hwbinder"),
                 String::from("vndbinder"),
             ],
+            ebpf: ebpf::EbpfSubsystem::new(),
+            dm: storage::DmControlState::new_with_android_root(),
+            fuse: storage::FuseSessionState::new(),
+            erofs_verified_count: 0,
+            f2fs_verified_count: 0,
+            super_lp_verified_count: 0,
             next_ashmem_id: 1,
         };
         state.seed_default_properties();
@@ -911,6 +926,12 @@ impl AndroidKernelState {
             ("ro.grapheneos.hardened_malloc", "1"),
             ("ro.grapheneos.exec_spawning", "1"),
             ("ro.grapheneos.titan_m2", "strongbox"),
+            ("ro.boot.vbmeta.hash_alg", "sha256"),
+            ("ro.boot.dynamic_partitions", "true"),
+            ("ro.boot.dm_verity", "enforcing"),
+            ("ro.qyronex.ebpf.verifier", "enforcing"),
+            ("ro.qyronex.storage.fs", "ext4,erofs,f2fs,fuse,dm-verity"),
+            ("ro.qyronex.art.runtime", "qyronex-art-dalvik-v15"),
             ("persist.sys.timezone", "Europe/Berlin"),
             ("sys.boot_completed", "0"),
         ];

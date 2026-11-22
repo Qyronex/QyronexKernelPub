@@ -373,6 +373,10 @@ impl MemFs {
             (b"ashmem", 10, 63, 0o666),
             (b"pmsg0", 10, 64, 0o222),
             (b"fuse", 10, 229, 0o666),
+            (b"mali0", 10, 120, 0o666),
+            (b"edgetpu", 10, 121, 0o666),
+            (b"umts_ipc0", 10, 122, 0o660),
+            (b"lwis-isp", 10, 123, 0o660),
         ] {
             let rdev = makedev(maj, min);
             let _ = self.seed_node(
@@ -500,6 +504,28 @@ impl MemFs {
                 MemNodeKind::ChrDev(ctl_rdev),
                 S_IFCHR | 0o666,
                 ctl_rdev,
+                b"",
+                now,
+            );
+        }
+        if let Some(map_ino) = self.seed_node(
+            mount_id,
+            root_ino,
+            b"mapper",
+            MemNodeKind::Dir,
+            S_IFDIR | 0o755,
+            0,
+            b"",
+            now,
+        ) {
+            let dm_rdev = makedev(10, 236);
+            let _ = self.seed_node(
+                mount_id,
+                map_ino,
+                b"control",
+                MemNodeKind::ChrDev(dm_rdev),
+                S_IFCHR | 0o660,
+                dm_rdev,
                 b"",
                 now,
             );

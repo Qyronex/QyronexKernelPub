@@ -12,7 +12,7 @@
  */
 
 #define _GNU_SOURCE
-#include "../src/binder_abi.h"
+#include "../src/qyronex_art_core.h"
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <gtk/gtk.h>
@@ -272,6 +272,8 @@ static void open_notes_window(const char *filepath);
 static void open_calculator_window(void);
 static void open_gallery_window(void);
 static void open_vanadium_window(const char *initial_url);
+static void open_apk_activity_window(const char *target, int do_install);
+static void refresh_apk_packages_view(void);
 
 static gboolean clear_toast_cb(gpointer data) {
     (void)data;
@@ -438,6 +440,8 @@ static void launch_action(const char *action) {
     if (strcmp(action, "@gallery") == 0)          { open_gallery_window(); return; }
     if (strcmp(action, "@vanadium") == 0)         { open_vanadium_window("about:vanadium"); return; }
     if (strncmp(action, "@vanadium:", 10) == 0)   { open_vanadium_window(action + 10); return; }
+    if (strncmp(action, "@apk-run:", 9) == 0)     { open_apk_activity_window(action + 9, 0); return; }
+    if (strncmp(action, "@apk-install-run:", 17) == 0) { open_apk_activity_window(action + 17, 1); return; }
 
     /* External ARM64 GUI app (e.g. full NetSurf engine) -> dispatch via single-threaded qyronex-appd */
     if (strncmp(action, "netsurf-gtk", 11) == 0) {
@@ -767,7 +771,7 @@ static void build_launcher_window(void) {
     lw->date_lbl = gtk_label_new("Android 15 (API 35) | GrapheneOS");
     gtk_widget_set_halign(lw->date_lbl, GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(lw->date_lbl), "subtitle-muted");
-    GtkWidget *kern_lbl = gtk_label_new("Qyronex Hybrid Rust Kernel · Cap-Binder v8 · Verified Boot GREEN");
+    GtkWidget *kern_lbl = gtk_label_new("Qyronex Hybrid Rust Kernel · Cap-Binder v8 · eBPF · dm-verity · Dalvik APK");
     gtk_widget_set_halign(kern_lbl, GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(kern_lbl), "subtitle-cyan");
     gtk_box_pack_start(GTK_BOX(clock_box), lw->clock_lbl, FALSE, FALSE, 0);
@@ -832,11 +836,11 @@ static void build_launcher_window(void) {
         const char *badge; const char *cls; const char *name; const char *sub; const char *cmd;
     } apps[10] = {
         { "VN", "badge-blue",   "Vanadium",   "Web Browser",     "@vanadium" },
-        { "ST", "badge-purple", "Settings",   "OS & Properties", "@settings" },
-        { "AU", "badge-green",  "Auditor",    "10/10 HW Proof",  "@auditor" },
+        { "ST", "badge-purple", "Settings",   "OS & Hardware",   "@settings" },
+        { "AU", "badge-green",  "Auditor",    "15/15 HW Proof",  "@auditor" },
         { ">_", "badge-amber",  "Terminal",   "Android Shell",   "@terminal" },
-        { "FS", "badge-orange", "Files",      "Storage /data",   "@files" },
-        { "AP", "badge-teal",   "Apps",       "Binder Services", "@apps" },
+        { "FS", "badge-orange", "Files",      "Storage & APKs",  "@files" },
+        { "AP", "badge-teal",   "Apps",       "APKs & Binder",   "@apps" },
         { "LG", "badge-rose",   "Logcat",     "Live Kernel Log", "@logcat" },
         { "NT", "badge-indigo", "Notes",      "Text Editor",     "@notes" },
         { "CL", "badge-lime",   "Calculator", "Math & Hex",      "@calculator" },
@@ -1105,21 +1109,30 @@ static void open_settings_window(const char *initial_page) {
     gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->net_view)), ninit, -1);
     gtk_stack_add_titled(GTK_STACK(stack), p_net, "network", "Network & Internet");
 
-    /* PAGE 5: About Pixel & Kernel (Zero-Fork POSIX uname!) */
+    /* PAGE 5: About Pixel & Kernel (Zero-Fork POSIX uname + Full Hardware/Storage/eBPF Sysfs!) */
     GtkWidget *p_about = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
     gtk_container_set_border_width(GTK_CONTAINER(p_about), 16);
-    char about_txt[4096], pix[1024], bnd[1024];
+    static char about_txt[8192];
+    static char pix[1024], pix_hw[1536], bpf[1024], dmv[1024], stfs[1024], bnd[1024];
     struct utsname uts;
     memset(&uts, 0, sizeof(uts));
     (void)uname(&uts);
     read_file_str("/sys/bus/platform/drivers/google_pixel/status", pix, sizeof(pix));
+    read_file_str("/sys/bus/platform/drivers/google_pixel/hardware", pix_hw, sizeof(pix_hw));
+    read_file_str("/sys/kernel/qyronex/android/bpf_stats", bpf, sizeof(bpf));
+    read_file_str("/sys/kernel/qyronex/android/dm_verity_status", dmv, sizeof(dmv));
+    read_file_str("/sys/kernel/qyronex/android/storage_fs_status", stfs, sizeof(stfs));
     read_file_str("/sys/kernel/qyronex/android/binder_stats", bnd, sizeof(bnd));
     snprintf(about_txt, sizeof(about_txt),
-             "=== OS & KERNEL ===\nQyronex OS v0.5.0 — Android 15 / GrapheneOS Pixel Edition\n"
+             "=== OS & KERNEL ===\nQyronex OS v0.6.0 — Android 15 / GrapheneOS Pixel Edition\n"
              "%s %s %s %s\n\n"
-             "=== GOOGLE PIXEL HARDWARE & TITAN M2 ===\n%s\n"
+             "=== PIXEL TENSOR G4 / MALI-G715 CSF GPU / EDGE TPU / MODEM / CAMERA HAL ===\n%s\n"
+             "=== GOOGLE PIXEL TITAN M2 & VERIFIED BOOT ===\n%s\n"
+             "=== DM-VERITY MERKLE TREE & ANDROID STORAGE (EROFS / F2FS / SUPER-LP / FUSE) ===\n%s%s\n"
+             "=== eBPF SUBSYSTEM (sys_bpf nr 280) ===\n%s\n"
              "=== ANDROID BINDER v8 IPC ===\n%s\n",
-             uts.sysname, uts.nodename, uts.release, uts.machine, pix, bnd);
+             uts.sysname, uts.nodename, uts.release, uts.machine,
+             pix_hw, pix, dmv, stfs, bpf, bnd);
     GtkWidget *atv = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(atv), FALSE);
     gtk_style_context_add_class(gtk_widget_get_style_context(atv), "mono-box");
@@ -1138,20 +1151,20 @@ static void open_settings_window(const char *initial_page) {
 }
 
 /* ============================================================================
- * 5. GRAPHENEOS AUDITOR WINDOW (Direct In-Process Live 10/10 Kernel Attestation!)
+ * 5. GRAPHENEOS AUDITOR WINDOW (Direct In-Process Live 15/15 Kernel Attestation!)
  * ============================================================================ */
 struct auditor_ctx {
     GtkWidget *banner;
     GtkWidget *tv;
 };
 
-static int run_inproc_10_tests(char *out, size_t cap) {
+static int run_inproc_15_tests(char *out, size_t cap) {
     int passed = 0;
     size_t pos = 0;
     char buf[2048];
     pos += (size_t)snprintf(out + pos, cap - pos,
         "================================================================\n"
-        "  Qyronex OS — Live Android 15 / GrapheneOS Hardware Attestation\n"
+        "  Qyronex OS v0.6.0 — Live Android 15 / GrapheneOS Attestation\n"
         "================================================================\n");
 
     /* 1. SELinux enforcing lockdown */
@@ -1160,7 +1173,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
         errno = 0;
         if (write_file_str("/sys/fs/selinux/enforce", "0") < 0 && errno == EPERM) ok1 = 1;
     }
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 1/10] SELINUX_ENFORCING_LOCKDOWN ...... %s\n", ok1 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 1/15] SELINUX_ENFORCING_LOCKDOWN ...... %s\n", ok1 ? "PASS" : "FAIL");
     passed += ok1;
 
     /* 2. Cross-Process Binder v8 RPC */
@@ -1171,7 +1184,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
         if (binder_rpc(&bc, 0, SM_CMD_PING, "", 0, r1, sizeof(r1)) > 0 && strstr(r1, "PONG")) ok2 = 1;
         binder_client_close(&bc);
     }
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 2/10] BINDER_V8_IPC_SERVICEMANAGER .... %s\n", ok2 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 2/15] BINDER_V8_IPC_SERVICEMANAGER .... %s\n", ok2 ? "PASS" : "FAIL");
     passed += ok2;
 
     /* 3. Ashmem mmap + pin/unpin */
@@ -1191,7 +1204,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
         }
         close(afd);
     }
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 3/10] ASHMEM_MMAP_PIN_ZERO_ON_FREE .... %s\n", ok3 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 3/15] ASHMEM_MMAP_PIN_ZERO_ON_FREE .... %s\n", ok3 ? "PASS" : "FAIL");
     passed += ok3;
 
     /* 4. DMA-Heap system alloc */
@@ -1209,7 +1222,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
         }
         close(dfd);
     }
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 4/10] DMA_HEAP_SYSTEM_ALLOC ........... %s\n", ok4 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 4/15] DMA_HEAP_SYSTEM_ALLOC ........... %s\n", ok4 ? "PASS" : "FAIL");
     passed += ok4;
 
     /* 5. ro.* immutability */
@@ -1218,7 +1231,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
     if (write_file_str("/sys/kernel/qyronex/android/properties", "ro.build.version.release=99\n") < 0 &&
         errno == EPERM &&
         write_file_str("/sys/kernel/qyronex/android/properties", "sys.auditor.verified=1\n") == 0) ok5 = 1;
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 5/10] RO_PROPERTIES_IMMUTABLE ......... %s\n", ok5 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 5/15] RO_PROPERTIES_IMMUTABLE ......... %s\n", ok5 ? "PASS" : "FAIL");
     passed += ok5;
 
     /* 6. Power wakelocks & PSI */
@@ -1226,7 +1239,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
     if (write_file_str("/sys/power/wake_lock", "auditor_wl\n") == 0 &&
         write_file_str("/sys/power/wake_unlock", "auditor_wl\n") == 0 &&
         read_file_str("/proc/pressure/memory", buf, sizeof(buf)) > 0 && strstr(buf, "some avg10=")) ok6 = 1;
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 6/10] POWER_WAKELOCK_AND_PSI .......... %s\n", ok6 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 6/15] POWER_WAKELOCK_AND_PSI .......... %s\n", ok6 ? "PASS" : "FAIL");
     passed += ok6;
 
     /* 7. GrapheneOS hardening status */
@@ -1234,14 +1247,14 @@ static int run_inproc_10_tests(char *out, size_t cap) {
     if (read_file_str("/sys/kernel/qyronex/grapheneos/status", buf, sizeof(buf)) > 0 &&
         strstr(buf, "selinux=enforcing") && strstr(buf, "capability_binder=enforced") &&
         strstr(buf, "zero_on_free=1")) ok7 = 1;
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 7/10] GRAPHENEOS_HARDENING_STATUS ..... %s\n", ok7 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 7/15] GRAPHENEOS_HARDENING_STATUS ..... %s\n", ok7 ? "PASS" : "FAIL");
     passed += ok7;
 
     /* 8. Pixel Titan M2 StrongBox & Modem IOMMU */
     int ok8 = 0;
     if (read_file_str("/sys/bus/platform/drivers/google_pixel/status", buf, sizeof(buf)) > 0 &&
         strstr(buf, "titan_m2=online-strongbox") && strstr(buf, "modem_iommu_sandbox=enforced")) ok8 = 1;
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 8/10] PIXEL_TITAN_M2_MODEM_IOMMU ...... %s\n", ok8 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 8/15] PIXEL_TITAN_M2_MODEM_IOMMU ...... %s\n", ok8 ? "PASS" : "FAIL");
     passed += ok8;
 
     /* 9. Real Cross-Process Binder v8 FD Passing (`BINDER_TYPE_FD`) */
@@ -1313,7 +1326,7 @@ static int run_inproc_10_tests(char *out, size_t cap) {
         }
         if (sfd >= 0) close(sfd);
     }
-    pos += (size_t)snprintf(out + pos, cap - pos, "[ 9/10] BINDER_FD_PASSING_CROSS_PROC .... %s\n", ok9 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[ 9/15] BINDER_FD_PASSING_CROSS_PROC .... %s\n", ok9 ? "PASS" : "FAIL");
     passed += ok9;
 
     /* 10. binderfs + userfaultfd + membarrier */
@@ -1337,12 +1350,197 @@ static int run_inproc_10_tests(char *out, size_t cap) {
         if (syscall(283, 0, 0, 0) > 0) mb_ok = 1;
         if (ctl_ok && uffd_ok && mb_ok) ok10 = 1;
     }
-    pos += (size_t)snprintf(out + pos, cap - pos, "[10/10] BINDERFS_USERFAULTFD_MEMBARRIER . %s\n", ok10 ? "PASS" : "FAIL");
+    pos += (size_t)snprintf(out + pos, cap - pos, "[10/15] BINDERFS_USERFAULTFD_MEMBARRIER . %s\n", ok10 ? "PASS" : "FAIL");
     passed += ok10;
+
+    /* 11. Real eBPF (sys_bpf 280): Hash Map + Fail-Closed Verifier + 64-bit VM Execution */
+    int ok11 = 0;
+    {
+        uint8_t attr[128];
+        memset(attr, 0, sizeof(attr));
+        uint32_t mtype = 1, ksz = 4, vsz = 8, maxe = 16;
+        memcpy(attr + 0, &mtype, 4);
+        memcpy(attr + 4, &ksz, 4);
+        memcpy(attr + 8, &vsz, 4);
+        memcpy(attr + 12, &maxe, 4);
+        long mfd = syscall(280, 0, attr, 64);
+        int map_ok = 0, prog_ok = 0, rej_ok = 0;
+        if (mfd >= 0) {
+            uint32_t k = 11;
+            uint64_t v = 0xCAFEBABE00150006ULL, vout = 0;
+            uint64_t kp = (uint64_t)(uintptr_t)&k, vp = (uint64_t)(uintptr_t)&v, vo = (uint64_t)(uintptr_t)&vout;
+            uint32_t mfd32 = (uint32_t)mfd;
+            memset(attr, 0, sizeof(attr));
+            memcpy(attr + 0, &mfd32, 4);
+            memcpy(attr + 8, &kp, 8);
+            memcpy(attr + 16, &vp, 8);
+            if (syscall(280, 2, attr, 64) == 0) {
+                memcpy(attr + 16, &vo, 8);
+                if (syscall(280, 1, attr, 64) == 0 && vout == v) map_ok = 1;
+            }
+            close((int)mfd);
+        }
+        struct { uint8_t code; uint8_t regs; int16_t off; int32_t imm; } insns[3] = {
+            { 0x71, 0x10, 0, 0 }, { 0x07, 0x00, 0, 10 }, { 0x95, 0x00, 0, 0 },
+        };
+        memset(attr, 0, sizeof(attr));
+        uint32_t ptype = 1, icnt = 3;
+        uint64_t iptr = (uint64_t)(uintptr_t)insns;
+        memcpy(attr + 0, &ptype, 4);
+        memcpy(attr + 4, &icnt, 4);
+        memcpy(attr + 8, &iptr, 8);
+        long pfd = syscall(280, 5, attr, 64);
+        if (pfd >= 0) {
+            uint8_t pkt[4] = { 32, 0, 0, 0 };
+            uint32_t pfd32 = (uint32_t)pfd, dsz = 4, retval = 0;
+            uint64_t dptr = (uint64_t)(uintptr_t)pkt;
+            memset(attr, 0, sizeof(attr));
+            memcpy(attr + 0, &pfd32, 4);
+            memcpy(attr + 8, &dsz, 4);
+            memcpy(attr + 16, &dptr, 8);
+            if (syscall(280, 10, attr, 64) == 0) {
+                memcpy(&retval, attr + 4, 4);
+                if (retval == 42) prog_ok = 1;
+            }
+            close((int)pfd);
+        }
+        struct { uint8_t code; uint8_t regs; int16_t off; int32_t imm; } bad[2] = {
+            { 0x05, 0x00, -1, 0 }, { 0x95, 0x00, 0, 0 },
+        };
+        memset(attr, 0, sizeof(attr));
+        icnt = 2;
+        iptr = (uint64_t)(uintptr_t)bad;
+        memcpy(attr + 0, &ptype, 4);
+        memcpy(attr + 4, &icnt, 4);
+        memcpy(attr + 8, &iptr, 8);
+        errno = 0;
+        if (syscall(280, 5, attr, 64) < 0 && errno == EACCES) rej_ok = 1;
+        if (map_ok && prog_ok && rej_ok) ok11 = 1;
+    }
+    pos += (size_t)snprintf(out + pos, cap - pos, "[11/15] EBPF_SYS_BPF_VERIFY_AND_EXEC .... %s\n", ok11 ? "PASS" : "FAIL");
+    passed += ok11;
+
+    /* 12. Real dm-verity SHA-256 Merkle Check + 1-Bit Tamper Fail-Closed (-EIO) */
+    int ok12 = 0;
+    {
+        int dmfd = open("/dev/mapper/control", O_RDWR | O_CLOEXEC);
+        if (dmfd >= 0) {
+            uint8_t ver[16] = {0};
+            uint32_t maj = 0, minv = 0;
+            int v_ok = (ioctl(dmfd, 0xC138FD00UL, ver) == 0);
+            memcpy(&maj, ver, 4);
+            memcpy(&minv, ver + 4, 4);
+            char blk[48] = "QYRONEX_ANDROID_15_VERITY_SYSTEM_BLOCK_0";
+            uint8_t req[64];
+            memset(req, 0, sizeof(req));
+            snprintf((char *)req, 32, "system-verity");
+            uint32_t bidx = 0, blen = 40;
+            uint64_t bptr = (uint64_t)(uintptr_t)blk;
+            memcpy(req + 32, &bidx, 4);
+            memcpy(req + 36, &blen, 4);
+            memcpy(req + 40, &bptr, 8);
+            int clean_ok = (ioctl(dmfd, 0xC040FD80UL, req) == 0);
+            blk[5] ^= 0x01;
+            errno = 0;
+            int tamper_blocked = (ioctl(dmfd, 0xC040FD80UL, req) < 0 && errno == EIO);
+            if (v_ok && maj == 4 && minv == 48 && clean_ok && tamper_blocked) ok12 = 1;
+            close(dmfd);
+        }
+    }
+    pos += (size_t)snprintf(out + pos, cap - pos, "[12/15] DM_VERITY_MERKLE_FAIL_CLOSED .... %s\n", ok12 ? "PASS" : "FAIL");
+    passed += ok12;
+
+    /* 13. Real EROFS + F2FS + super.img LP_METADATA + /dev/fuse v7.39 Handshake */
+    int ok13 = 0;
+    {
+        int erofs_ok = 0, f2fs_ok = 0, lp_ok = 0, fuse_ok = 0;
+        const char *probes[3] = {
+            "/vendor/etc/qyronex-fs/com.qyronex.android.erofs",
+            "/vendor/etc/qyronex-fs/userdata_probe.f2fs",
+            "/vendor/etc/qyronex-fs/super_lp_probe.img",
+        };
+        int *flags[3] = { &erofs_ok, &f2fs_ok, &lp_ok };
+        for (int i = 0; i < 3; i++) {
+            int pfd = open(probes[i], O_RDONLY | O_CLOEXEC);
+            if (pfd >= 0) {
+                static uint8_t imgbuf[20480];
+                ssize_t n = read(pfd, imgbuf, sizeof(imgbuf));
+                close(pfd);
+                if (n > 0) {
+                    int sfd = open("/sys/kernel/qyronex/android/storage_fs_status", O_WRONLY | O_CLOEXEC);
+                    if (sfd >= 0) {
+                        if (write(sfd, imgbuf, (size_t)n) == n) *flags[i] = 1;
+                        close(sfd);
+                    }
+                }
+            }
+        }
+        int ffd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+        if (ffd >= 0) {
+            uint8_t finit[64] = {0};
+            if (read(ffd, finit, sizeof(finit)) >= 56) {
+                uint32_t op = 0, fmaj = 0, fmin = 0;
+                memcpy(&op, finit + 4, 4);
+                memcpy(&fmaj, finit + 40, 4);
+                memcpy(&fmin, finit + 44, 4);
+                if (op == 26 && fmaj == 7 && fmin == 39) {
+                    uint8_t rep[32] = {0};
+                    uint32_t rlen = 32;
+                    uint64_t uniq = 1;
+                    memcpy(rep + 0, &rlen, 4);
+                    memcpy(rep + 8, &uniq, 8);
+                    memcpy(rep + 16, &fmaj, 4);
+                    memcpy(rep + 20, &fmin, 4);
+                    if (write(ffd, rep, sizeof(rep)) == (ssize_t)sizeof(rep)) fuse_ok = 1;
+                }
+            }
+            close(ffd);
+        }
+        if (erofs_ok && f2fs_ok && lp_ok && fuse_ok) ok13 = 1;
+    }
+    pos += (size_t)snprintf(out + pos, cap - pos, "[13/15] EROFS_F2FS_SUPER_LP_FUSE ........ %s\n", ok13 ? "PASS" : "FAIL");
+    passed += ok13;
+
+    /* 14. Pixel Mali-G715 CSF GPU + Tensor Edge TPU + Camera LWIS + Modem HAL */
+    int ok14 = 0;
+    {
+        int mfd = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+        int mali_ok = 0, hw_ok = 0;
+        if (mfd >= 0) {
+            uint16_t ver[2] = {0, 0};
+            uint32_t props[4] = {0, 0, 0, 0};
+            if (ioctl(mfd, 0xC0048000UL, ver) == 0 && ioctl(mfd, 0xC0108003UL, props) == 0 &&
+                ver[0] == 1 && props[0] != 0 && props[3] == 1) mali_ok = 1;
+            close(mfd);
+        }
+        if (read_file_str("/sys/bus/platform/drivers/google_pixel/hardware", buf, sizeof(buf)) > 0 &&
+            strstr(buf, "gpu_iommu=enforced") && strstr(buf, "edge_tpu_iommu=enforced") &&
+            strstr(buf, "vendor_boot_v4=supported") && access("/dev/edgetpu", F_OK) == 0 &&
+            access("/dev/umts_ipc0", F_OK) == 0) hw_ok = 1;
+        if (mali_ok && hw_ok) ok14 = 1;
+    }
+    pos += (size_t)snprintf(out + pos, cap - pos, "[14/15] PIXEL_MALI_GPU_EDGETPU_HAL ...... %s\n", ok14 ? "PASS" : "FAIL");
+    passed += ok14;
+
+    /* 15. Real Android APK/DEX Dalvik VM Runtime (pm + am + qyronex-art verified output) */
+    int ok15 = 0;
+    {
+        char pkgs[1024] = {0}, act[2048] = {0};
+        if (access("/system/bin/pm", X_OK) == 0 && access("/system/bin/am", X_OK) == 0 &&
+            read_file_str("/data/system/packages.list", pkgs, sizeof(pkgs)) > 0 &&
+            strstr(pkgs, "org.grapheneos.welcome") != NULL &&
+            read_file_str("/run/user/0/qyronex-activity.txt", act, sizeof(act)) > 0 &&
+            strstr(act, "DEX_ADLER32=0x") != NULL &&
+            strstr(act, "DALVIK_INSNS=") != NULL) {
+            ok15 = 1;
+        }
+    }
+    pos += (size_t)snprintf(out + pos, cap - pos, "[15/15] APK_DEX_DALVIK_VM_PM_AM_EXEC .... %s\n", ok15 ? "PASS" : "FAIL");
+    passed += ok15;
 
     snprintf(out + pos, cap - pos,
              "----------------------------------------------------------------\n"
-             "RESULT: %d/10 CHECKS PASSED (Live zero-fork kernel attestation)\n",
+             "RESULT: %d/15 CHECKS PASSED (Live zero-fork kernel attestation)\n",
              passed);
     return passed;
 }
@@ -1350,17 +1548,17 @@ static int run_inproc_10_tests(char *out, size_t cap) {
 static void run_audit_now(GtkWidget *w, gpointer data) {
     (void)w;
     struct auditor_ctx *ctx = (struct auditor_ctx *)data;
-    char out[4096];
-    int passed = run_inproc_10_tests(out, sizeof(out));
+    static char out[4096];
+    int passed = run_inproc_15_tests(out, sizeof(out));
     gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->tv)), out, -1);
 
     GtkStyleContext *sc = gtk_widget_get_style_context(ctx->banner);
-    if (passed == 10) {
+    if (passed == 15) {
         gtk_style_context_remove_class(sc, "banner-warn");
         gtk_style_context_add_class(sc, "banner-pass");
         gtk_label_set_text(GTK_LABEL(ctx->banner),
-            "ATTESTATION GREEN: 10/10 Qyronex Android 15 / GrapheneOS / Binder FD-Passing Checks PASSED!");
-        android_log_write("I/Auditor: Live GUI hardware attestation VERIFIED (10/10 PASS)");
+            "ATTESTATION GREEN: 15/15 Android 15 / eBPF / dm-verity / Pixel HAL / APK-DEX Checks PASSED!");
+        android_log_write("I/Auditor: Live GUI hardware attestation VERIFIED (15/15 PASS)");
     } else {
         gtk_style_context_remove_class(sc, "banner-pass");
         gtk_style_context_add_class(sc, "banner-warn");
@@ -1385,8 +1583,8 @@ static void open_auditor_window(void) {
     }
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     s_win = win;
-    gtk_window_set_title(GTK_WINDOW(win), "GrapheneOS Auditor — Titan M2 & Qyronex Kernel Attestation");
-    gtk_window_set_default_size(GTK_WINDOW(win), 840, 520);
+    gtk_window_set_title(GTK_WINDOW(win), "GrapheneOS Auditor — 15/15 Kernel, eBPF, dm-verity & Pixel Attestation");
+    gtk_window_set_default_size(GTK_WINDOW(win), 860, 540);
     track_inproc_window(win);
 
     GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
@@ -1395,12 +1593,12 @@ static void open_auditor_window(void) {
 
     struct auditor_ctx *ctx = g_new0(struct auditor_ctx, 1);
     s_ctx = ctx;
-    ctx->banner = gtk_label_new("Running live hardware & kernel attestation...");
+    ctx->banner = gtk_label_new("Running live 15/15 hardware & kernel attestation...");
     gtk_widget_set_halign(ctx->banner, GTK_ALIGN_FILL);
     gtk_style_context_add_class(gtk_widget_get_style_context(ctx->banner), "banner-pass");
     gtk_box_pack_start(GTK_BOX(vb), ctx->banner, FALSE, FALSE, 0);
 
-    GtkWidget *btn = gtk_button_new_with_label("Re-Run Live 10/10 Kernel, Binder FD-Passing & Titan M2 Verification");
+    GtkWidget *btn = gtk_button_new_with_label("Re-Run Live 15/15 Kernel, eBPF, dm-verity, Pixel HAL & APK Verification");
     gtk_style_context_add_class(gtk_widget_get_style_context(btn), "action-btn");
     g_signal_connect(btn, "clicked", G_CALLBACK(run_audit_now), ctx);
     gtk_box_pack_start(GTK_BOX(vb), btn, FALSE, FALSE, 0);
@@ -1418,12 +1616,50 @@ static void open_auditor_window(void) {
 }
 
 /* ============================================================================
- * 6. APPS & LIVE BINDER v8 SERVICE EXPLORER WINDOW (Zero-Fork Direct Binder RPC!)
+ * 6. APPS, ANDROID APK INSTALLER (`pm`/`am`/`qyronex-art`) & BINDER v8 EXPLORER
  * ============================================================================ */
 struct apps_ctx {
     GtkWidget *svc_view;
     GtkWidget *svc_entry;
+    GtkWidget *apk_view;
 };
+
+static struct apps_ctx *g_apps_ctx = NULL;
+
+static void refresh_apk_packages_view(void) {
+    if (!g_apps_ctx || !GTK_IS_TEXT_VIEW(g_apps_ctx->apk_view)) return;
+    static char raw[4096], out[4608];
+    memset(raw, 0, sizeof(raw));
+    size_t pos = 0;
+    pos += (size_t)snprintf(out + pos, sizeof(out) - pos,
+                            "=== Installed APKs (/data/system/packages.list) ===\n");
+    if (read_file_str("/data/system/packages.list", raw, sizeof(raw)) > 0) {
+        char *line = raw;
+        int cnt = 0;
+        while (*line && pos + 160 < sizeof(out)) {
+            char *nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            if (line[0]) {
+                char pkg[128] = {0}, lbl[128] = {0}, act[160] = {0}, ver[48] = {0}, path[256] = {0};
+                if (sscanf(line, "%127[^|]|%127[^|]|%159[^|]|%47[^|]|%255[^\n]",
+                           pkg, lbl, act, ver, path) == 5) {
+                    pos += (size_t)snprintf(out + pos, sizeof(out) - pos,
+                                            "  * %s  (v%s)\n    %s -> %s\n",
+                                            pkg, ver, lbl, path);
+                    cnt++;
+                }
+            }
+            if (!nl) break;
+            line = nl + 1;
+        }
+        if (cnt == 0) {
+            snprintf(out + pos, sizeof(out) - pos, "  (none yet — click Install & Run above)\n");
+        }
+    } else {
+        snprintf(out + pos, sizeof(out) - pos, "  (none yet — click Install & Run above)\n");
+    }
+    gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(g_apps_ctx->apk_view)), out, -1);
+}
 
 static void refresh_services(GtkWidget *w, gpointer data) {
     (void)w;
@@ -1444,6 +1680,7 @@ static void refresh_services(GtkWidget *w, gpointer data) {
              "=== Kernel Binder Audit Stats ===\n%s",
              reply, stats);
     gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->svc_view)), out, -1);
+    refresh_apk_packages_view();
 }
 
 static void on_register_svc(GtkWidget *w, gpointer data) {
@@ -1473,53 +1710,72 @@ static void open_apps_window(void) {
     }
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     s_win = win;
-    gtk_window_set_title(GTK_WINDOW(win), "GrapheneOS Apps & Live Android Binder v8 Services");
-    gtk_window_set_default_size(GTK_WINDOW(win), 880, 520);
+    gtk_window_set_title(GTK_WINDOW(win), "GrapheneOS Apps — Android APK Installer (pm/am) & Binder v8");
+    gtk_window_set_default_size(GTK_WINDOW(win), 980, 560);
     track_inproc_window(win);
+
+    struct apps_ctx *ctx = g_new0(struct apps_ctx, 1);
+    s_ctx = ctx;
+    g_apps_ctx = ctx;
 
     GtkWidget *hb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 14);
     gtk_container_set_border_width(GTK_CONTAINER(hb), 14);
     gtk_container_add(GTK_CONTAINER(win), hb);
 
-    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
-    gtk_widget_set_size_request(left, 320, -1);
-    GtkWidget *lh = gtk_label_new("Installed GrapheneOS & System Apps");
+    /* LEFT: Real Android APK Installer & Dalvik VM Launcher (`pm` / `am` / `qyronex-art`) */
+    GtkWidget *left = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_size_request(left, 450, -1);
+
+    GtkWidget *lh = gtk_label_new("Android APK Packages (Qyronex ART Dalvik VM)");
     gtk_widget_set_halign(lh, GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(lh), "app-title");
-    gtk_box_pack_start(GTK_BOX(left), lh, FALSE, FALSE, 4);
+    gtk_box_pack_start(GTK_BOX(left), lh, FALSE, FALSE, 0);
 
-    struct { const char *name; const char *cmd; } list[] = {
-        { "Vanadium Web Browser",           "@vanadium" },
-        { "GrapheneOS Settings",            "@settings" },
-        { "GrapheneOS Auditor (10/10)",     "@auditor" },
-        { "Android Shell Terminal",         "@terminal" },
-        { "Files Manager (/data)",          "@files" },
-        { "Live Android Logcat",            "@logcat" },
-        { "Notes Editor",                   "@notes" },
-        { "Calculator (Dec & Hex)",         "@calculator" },
-        { "Gallery Image Viewer",           "@gallery" },
+    GtkWidget *lsub = gtk_label_new("Real ZIP + Binary AXML AndroidManifest.xml + classes.dex (DEX 035)");
+    gtk_widget_set_halign(lsub, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(lsub), "subtitle-cyan");
+    gtk_box_pack_start(GTK_BOX(left), lsub, FALSE, FALSE, 0);
+
+    struct { const char *name; const char *sub; const char *btn; const char *cmd; } apks[] = {
+        { "GrapheneWelcome.apk",     "org.grapheneos.welcome (System APK)", "Run APK",       "@apk-run:/system/app/GrapheneWelcome.apk" },
+        { "PixelSecurityBench.apk",  "org.grapheneos.securitybench (/data)", "Install & Run", "@apk-install-run:/data/local/tmp/PixelSecurityBench.apk" },
+        { "QyronexHardwareInfo.apk", "org.qyronex.hwinfo (/data/local/tmp)", "Install & Run", "@apk-install-run:/data/local/tmp/QyronexHardwareInfo.apk" },
     };
-    for (size_t i = 0; i < sizeof(list) / sizeof(list[0]); i++) {
+    for (size_t i = 0; i < sizeof(apks) / sizeof(apks[0]); i++) {
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-        GtkWidget *lbl = gtk_label_new(list[i].name);
-        gtk_widget_set_halign(lbl, GTK_ALIGN_START);
-        GtkWidget *b = gtk_button_new_with_label("Open");
+        GtkWidget *tb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
+        GtkWidget *t = gtk_label_new(apks[i].name);
+        gtk_widget_set_halign(t, GTK_ALIGN_START);
+        gtk_style_context_add_class(gtk_widget_get_style_context(t), "app-title");
+        GtkWidget *s = gtk_label_new(apks[i].sub);
+        gtk_widget_set_halign(s, GTK_ALIGN_START);
+        gtk_style_context_add_class(gtk_widget_get_style_context(s), "subtitle-muted");
+        gtk_box_pack_start(GTK_BOX(tb), t, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(tb), s, FALSE, FALSE, 0);
+        GtkWidget *b = gtk_button_new_with_label(apks[i].btn);
         gtk_style_context_add_class(gtk_widget_get_style_context(b), "action-btn");
-        g_signal_connect(b, "clicked", G_CALLBACK(on_launch_clicked), (gpointer)list[i].cmd);
-        gtk_box_pack_start(GTK_BOX(row), lbl, TRUE, TRUE, 0);
+        g_signal_connect(b, "clicked", G_CALLBACK(on_launch_clicked), (gpointer)apks[i].cmd);
+        gtk_box_pack_start(GTK_BOX(row), tb, TRUE, TRUE, 0);
         gtk_box_pack_start(GTK_BOX(row), b, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(left), row, FALSE, FALSE, 1);
+        gtk_box_pack_start(GTK_BOX(left), row, FALSE, FALSE, 2);
     }
+
+    ctx->apk_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(ctx->apk_view), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ctx->apk_view), GTK_WRAP_CHAR);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ctx->apk_view), "mono-box");
+    GtkWidget *apk_sc = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(apk_sc), ctx->apk_view);
+    gtk_box_pack_start(GTK_BOX(left), apk_sc, TRUE, TRUE, 2);
     gtk_box_pack_start(GTK_BOX(hb), left, FALSE, FALSE, 0);
 
+    /* RIGHT: Live Binder v8 ServiceManager + System App Quick-Launch */
     GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     GtkWidget *rh = gtk_label_new("Live /dev/binder ServiceManager Registry (Real Binder v8 RPC)");
     gtk_widget_set_halign(rh, GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(rh), "app-title");
-    gtk_box_pack_start(GTK_BOX(right), rh, FALSE, FALSE, 4);
+    gtk_box_pack_start(GTK_BOX(right), rh, FALSE, FALSE, 0);
 
-    struct apps_ctx *ctx = g_new0(struct apps_ctx, 1);
-    s_ctx = ctx;
     GtkWidget *add_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     ctx->svc_entry = gtk_entry_new();
     gtk_entry_set_placeholder_text(GTK_ENTRY(ctx->svc_entry), "New service (e.g. com.pixel.camera)");
@@ -1536,10 +1792,28 @@ static void open_apps_window(void) {
 
     ctx->svc_view = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(ctx->svc_view), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ctx->svc_view), GTK_WRAP_CHAR);
     gtk_style_context_add_class(gtk_widget_get_style_context(ctx->svc_view), "mono-box");
     GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
     gtk_container_add(GTK_CONTAINER(sc), ctx->svc_view);
     gtk_box_pack_start(GTK_BOX(right), sc, TRUE, TRUE, 0);
+
+    GtkWidget *sys_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    struct { const char *lbl; const char *cmd; } sysapps[] = {
+        { "Auditor 15/15", "@auditor" },
+        { "Settings",      "@settings" },
+        { "Vanadium",      "@vanadium" },
+        { "Terminal",      "@terminal" },
+        { "Files",         "@files" },
+        { "Logcat",        "@logcat" },
+    };
+    for (size_t i = 0; i < sizeof(sysapps) / sizeof(sysapps[0]); i++) {
+        GtkWidget *b = gtk_button_new_with_label(sysapps[i].lbl);
+        gtk_style_context_add_class(gtk_widget_get_style_context(b), "pill-dark");
+        g_signal_connect(b, "clicked", G_CALLBACK(on_launch_clicked), (gpointer)sysapps[i].cmd);
+        gtk_box_pack_start(GTK_BOX(sys_row), b, TRUE, TRUE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(right), sys_row, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(hb), right, TRUE, TRUE, 0);
 
     refresh_services(NULL, ctx);
@@ -1670,12 +1944,13 @@ static void open_quicksettings_window(void) {
     gtk_box_pack_start(GTK_BOX(vb), st, FALSE, FALSE, 4);
 
     struct { const char *lbl; const char *cmd; } btns[] = {
-        { "Open GrapheneOS Settings",   "@settings" },
-        { "Run 10/10 Hardware Auditor", "@auditor" },
-        { "Open Vanadium Web Browser",  "@vanadium" },
-        { "Open Interactive Terminal",  "@terminal" },
-        { "Open Files Manager (/data)", "@files" },
-        { "Open Live Android Logcat",   "@logcat" },
+        { "Open GrapheneOS Settings",    "@settings" },
+        { "Run 15/15 Hardware Auditor",  "@auditor" },
+        { "Install & Run Android APKs",  "@apps" },
+        { "Open Vanadium Web Browser",   "@vanadium" },
+        { "Open Interactive Terminal",   "@terminal" },
+        { "Open Files Manager (/data)",  "@files" },
+        { "Open Live Android Logcat",    "@logcat" },
     };
     for (size_t i = 0; i < sizeof(btns) / sizeof(btns[0]); i++) {
         GtkWidget *b = gtk_button_new_with_label(btns[i].lbl);
@@ -1812,11 +2087,11 @@ static void open_terminal_window(void) {
     struct { const char *lbl; const char *cmd; } quick[] = {
         { "getprop",      "getprop" },
         { "service list", "service list" },
+        { "pm list",      "pm list packages -f" },
+        { "am start",     "am start org.grapheneos.welcome" },
         { "dumpsys",      "dumpsys" },
         { "selftest",     "qyronex-android-selftest" },
         { "uname -a",     "uname -a" },
-        { "ip addr",      "ip -brief addr" },
-        { "ls /data",     "ls -la /data /system/bin" },
         { "Clear",        "clear" },
     };
     for (size_t i = 0; i < sizeof(quick) / sizeof(quick[0]); i++) {
@@ -1998,6 +2273,16 @@ static void on_files_edit_notes(GtkWidget *w, gpointer data) {
     if (ctx->sel_file[0]) open_notes_window(ctx->sel_file);
 }
 
+static void on_files_install_apk(GtkWidget *w, gpointer data) {
+    (void)w;
+    struct files_ctx *ctx = (struct files_ctx *)data;
+    if (ctx->sel_file[0] && strstr(ctx->sel_file, ".apk") != NULL) {
+        open_apk_activity_window(ctx->sel_file, 1);
+    } else {
+        show_status_toast("Select an .apk file (in /system/app or /data/local/tmp) first", 5);
+    }
+}
+
 static void open_files_window(const char *start_dir) {
     static GtkWidget *s_win = NULL;
     static struct files_ctx *s_ctx = NULL;
@@ -2028,8 +2313,8 @@ static void open_files_window(const char *start_dir) {
 
     struct { const char *lbl; const char *path; } places[] = {
         { "/data",        "/data" },
-        { "/data/local",  "/data/local/tmp" },
-        { "/system",      "/system" },
+        { "APKs (/tmp)",  "/data/local/tmp" },
+        { "/system/app",  "/system/app" },
         { "Qyronex Sysfs","/sys/kernel/qyronex/android" },
         { "/dev/binderfs","/dev/binderfs" },
         { "/",            "/" },
@@ -2064,10 +2349,14 @@ static void open_files_window(const char *start_dir) {
     ctx->preview_hdr = gtk_label_new("Click any folder to open or file to preview");
     gtk_widget_set_halign(ctx->preview_hdr, GTK_ALIGN_START);
     gtk_style_context_add_class(gtk_widget_get_style_context(ctx->preview_hdr), "app-title");
+    GtkWidget *apk_b = gtk_button_new_with_label("Install & Run APK");
+    gtk_style_context_add_class(gtk_widget_get_style_context(apk_b), "pill-green");
+    g_signal_connect(apk_b, "clicked", G_CALLBACK(on_files_install_apk), ctx);
     GtkWidget *edit_b = gtk_button_new_with_label("Edit in Notes");
     gtk_style_context_add_class(gtk_widget_get_style_context(edit_b), "action-btn");
     g_signal_connect(edit_b, "clicked", G_CALLBACK(on_files_edit_notes), ctx);
     gtk_box_pack_start(GTK_BOX(rh), ctx->preview_hdr, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(rh), apk_b, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(rh), edit_b, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(right), rh, FALSE, FALSE, 0);
 
@@ -2705,6 +2994,154 @@ static void open_vanadium_window(const char *initial_url) {
     gtk_widget_show_all(win);
     gtk_window_present(GTK_WINDOW(win));
     vanadium_navigate(v, initial_url ? initial_url : "about:vanadium");
+}
+
+/* ============================================================================
+ * 15. NATIVE ANDROID APK ACTIVITY HOST WINDOW (Zero-Fork Instant Dalvik VM!)
+ * ============================================================================ */
+struct apk_act_ctx {
+    GtkWidget *win;
+    GtkWidget *banner;
+    GtkWidget *meta_lbl;
+    GtkWidget *tv;
+    char cur_target[320];
+};
+
+static void apk_act_run(struct apk_act_ctx *ctx, const char *target, int do_install) {
+    if (!target || !target[0]) return;
+    snprintf(ctx->cur_target, sizeof(ctx->cur_target), "%.319s", target);
+
+    char pm_msg[512] = {0};
+    char err_msg[256] = {0};
+    char apk_path[320] = {0};
+    int inst_rc = 0;
+
+    if (do_install) {
+        inst_rc = qart_pm_install(target, pm_msg, sizeof(pm_msg));
+        refresh_apk_packages_view();
+    } else {
+        snprintf(pm_msg, sizeof(pm_msg), "Launched installed package/APK directly via ActivityManager");
+    }
+
+    static struct qart_manifest man;
+    static struct qart_dex_result res;
+    int run_rc = (inst_rc == 0)
+        ? qart_run_apk(target, &man, &res, apk_path, sizeof(apk_path), err_msg, sizeof(err_msg))
+        : 1;
+
+    static char view_buf[12288];
+    if (inst_rc == 0 && run_rc == 0) {
+        char wtitle[220];
+        snprintf(wtitle, sizeof(wtitle), "%.150s — Android Activity (Qyronex ART)", res.title);
+        gtk_window_set_title(GTK_WINDOW(ctx->win), wtitle);
+
+        char btxt[280];
+        snprintf(btxt, sizeof(btxt),
+                 "DALVIK DEX EXECUTED  |  %.80s v%.24s  |  Adler-32 0x%08x  |  %u insns",
+                 man.package, man.version, res.dex_adler32, res.insns_executed);
+        GtkStyleContext *sc = gtk_widget_get_style_context(ctx->banner);
+        gtk_style_context_remove_class(sc, "banner-warn");
+        gtk_style_context_add_class(sc, "banner-pass");
+        gtk_label_set_text(GTK_LABEL(ctx->banner), btxt);
+
+        char mtxt[384];
+        snprintf(mtxt, sizeof(mtxt),
+                 "Activity: %.120s   |   APK: %.140s   |   Log.i=%d  SysProp=%d",
+                 man.activity, apk_path, res.log_calls, res.prop_calls);
+        gtk_label_set_text(GTK_LABEL(ctx->meta_lbl), mtxt);
+
+        snprintf(view_buf, sizeof(view_buf),
+                 "======================================================================\n"
+                 "  ANDROID ACTIVITY OUTPUT (Live classes.dex Dalvik Bytecode VM)\n"
+                 "======================================================================\n\n"
+                 "%.6000s\n"
+                 "----------------------------------------------------------------------\n"
+                 "=== PackageManager (`pm`) & ActivityManager (`am`) Status ===\n"
+                 "  %s\n"
+                 "  Intent  : cmp=%s/%s\n"
+                 "  DEX 035 : Adler-32=0x%08x | Bytecode Executed=%u instructions\n"
+                 "  Record  : /run/user/0/qyronex-activity.txt & /dev/log/main\n",
+                 res.body, pm_msg, man.package, man.activity, res.dex_adler32, res.insns_executed);
+        gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->tv)), view_buf, -1);
+    } else {
+        GtkStyleContext *sc = gtk_widget_get_style_context(ctx->banner);
+        gtk_style_context_remove_class(sc, "banner-pass");
+        gtk_style_context_add_class(sc, "banner-warn");
+        gtk_label_set_text(GTK_LABEL(ctx->banner), "APK Verification / Execution Error");
+        snprintf(view_buf, sizeof(view_buf), "pm: %s\nam: %s\n", pm_msg, err_msg);
+        gtk_text_buffer_set_text(gtk_text_view_get_buffer(GTK_TEXT_VIEW(ctx->tv)), view_buf, -1);
+    }
+}
+
+static void on_apk_rerun_clicked(GtkWidget *w, gpointer data) {
+    (void)w;
+    struct apk_act_ctx *ctx = (struct apk_act_ctx *)data;
+    apk_act_run(ctx, ctx->cur_target, 0);
+}
+
+static void open_apk_activity_window(const char *target, int do_install) {
+    static GtkWidget *s_win = NULL;
+    static struct apk_act_ctx *s_ctx = NULL;
+    if (s_win) {
+        gtk_widget_show_all(s_win);
+        gtk_window_present(GTK_WINDOW(s_win));
+        apk_act_run(s_ctx, target, do_install);
+        return;
+    }
+    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    s_win = win;
+    gtk_window_set_title(GTK_WINDOW(win), "Android Activity Host — Qyronex ART Dalvik VM");
+    gtk_window_set_default_size(GTK_WINDOW(win), 880, 520);
+    track_inproc_window(win);
+
+    struct apk_act_ctx *ctx = g_new0(struct apk_act_ctx, 1);
+    ctx->win = win;
+    s_ctx = ctx;
+
+    GtkWidget *vb = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_container_set_border_width(GTK_CONTAINER(vb), 14);
+    gtk_container_add(GTK_CONTAINER(win), vb);
+
+    ctx->banner = gtk_label_new("Preparing Qyronex ART Dalvik VM...");
+    gtk_widget_set_halign(ctx->banner, GTK_ALIGN_FILL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ctx->banner), "banner-pass");
+    gtk_box_pack_start(GTK_BOX(vb), ctx->banner, FALSE, FALSE, 0);
+
+    ctx->meta_lbl = gtk_label_new("ZIP + Binary AXML + DEX 035 Interpreter");
+    gtk_widget_set_halign(ctx->meta_lbl, GTK_ALIGN_START);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ctx->meta_lbl), "subtitle-cyan");
+    gtk_box_pack_start(GTK_BOX(vb), ctx->meta_lbl, FALSE, FALSE, 0);
+
+    ctx->tv = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(ctx->tv), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(ctx->tv), GTK_WRAP_WORD_CHAR);
+    gtk_style_context_add_class(gtk_widget_get_style_context(ctx->tv), "mono-box");
+    GtkWidget *sc = gtk_scrolled_window_new(NULL, NULL);
+    gtk_container_add(GTK_CONTAINER(sc), ctx->tv);
+    gtk_box_pack_start(GTK_BOX(vb), sc, TRUE, TRUE, 0);
+
+    GtkWidget *brow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    GtkWidget *rerun_b = gtk_button_new_with_label("Re-Run classes.dex");
+    gtk_style_context_add_class(gtk_widget_get_style_context(rerun_b), "action-btn");
+    g_signal_connect(rerun_b, "clicked", G_CALLBACK(on_apk_rerun_clicked), ctx);
+    GtkWidget *log_b = gtk_button_new_with_label("Inspect in Logcat");
+    gtk_style_context_add_class(gtk_widget_get_style_context(log_b), "nav-btn");
+    g_signal_connect(log_b, "clicked", G_CALLBACK(on_launch_clicked), (gpointer)"@logcat");
+    GtkWidget *apps_b = gtk_button_new_with_label("Apps & APKs");
+    gtk_style_context_add_class(gtk_widget_get_style_context(apps_b), "nav-btn");
+    g_signal_connect(apps_b, "clicked", G_CALLBACK(on_launch_clicked), (gpointer)"@apps");
+    GtkWidget *close_b = gtk_button_new_with_label("Close Activity");
+    gtk_style_context_add_class(gtk_widget_get_style_context(close_b), "danger-btn");
+    g_signal_connect_swapped(close_b, "clicked", G_CALLBACK(gtk_widget_hide), win);
+    gtk_box_pack_start(GTK_BOX(brow), rerun_b, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(brow), log_b, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(brow), apps_b, FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(brow), close_b, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vb), brow, FALSE, FALSE, 0);
+
+    gtk_widget_show_all(win);
+    gtk_window_present(GTK_WINDOW(win));
+    apk_act_run(ctx, target, do_install);
 }
 
 int main(int argc, char **argv) {

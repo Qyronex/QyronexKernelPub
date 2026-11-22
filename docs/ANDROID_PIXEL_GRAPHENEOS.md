@@ -1,29 +1,34 @@
-# Qyronex OS — Android 15 / GrapheneOS Google Pixel Edition (v0.5.1)
+# Qyronex OS — Android 15 / GrapheneOS Google Pixel Edition (v0.6.0)
 
-Die **Qyronex Android 15 / GrapheneOS Pixel Edition** erweitert den AArch64-Hybrid-Kernel um eine speichersichere Android-15-Kernel-ABI (`#![forbid(unsafe_code)]` im Subsystem- & Pixel-Treiber-Crate), GrapheneOS-Kernel-Härtung, eine Google-Pixel-Tensor-/Titan-M2-Treiberschicht sowie eine **vollständig per Maus und Tastatur bedienbare, klickbare GrapheneOS-15-Wayland-Oberfläche** (`labwc` + natives ARM64 GTK3 `gtk-layer-shell`) mit 10 echten lauffähigen Apps — verpackt als eigenständige Release-ISO (`dist/qyronex-android-pixel-grapheneos.iso`) plus AOSP GKI Boot Image v4 (`dist/qyronex-pixel-boot.img`).
+Die **Qyronex Android 15 / GrapheneOS Pixel Edition (v0.6.0)** erweitert den AArch64-Hybrid-Kernel um die vollständige, speichersichere Android-15-Kernel-ABI (`#![forbid(unsafe_code)]` in `kernel/linux-android` und `drivers/google-pixel`), **eBPF (`sys_bpf` 280)**, **dm-verity SHA-256 Merkle-Verifikation**, **EROFS / F2FS / `super.img` Dynamic Partitions (`LP_METADATA`) / FUSE v7.39**, **Google Pixel Tensor G1–G4 / Mali-G715 CSF GPU / Edge TPU / Camera LWIS / Shannon 5G Modem / Titan M2 HALs**, eine echte **Android `.apk`/`.dex`-Dalvik-VM (`qyronex-art`, `dalvikvm`, `pm`, `am`)** sowie eine **vollständig per Maus und Tastatur bedienbare GrapheneOS-15-Wayland-Oberfläche** (`labwc` + natives ARM64 GTK3 `gtk-layer-shell`) — verpackt als eigenständige Release-ISO (`dist/qyronex-android-pixel-grapheneos.iso`) plus AOSP Boot Image v4 (`dist/qyronex-pixel-boot.img`) und AOSP Vendor Boot Image v4 (`dist/qyronex-pixel-vendor-boot.img`).
 
 ![Qyronex GrapheneOS 15 Home Launcher (Wayland / GTK3)](assets/qyronex_android_grapheneos_emulator.png)
 
-## Vollständig bedienbare GrapheneOS-15-App-Suite (Live-Screenshots)
+## Neu in v0.6.0 — Vollständige Kernel-, Hardware- & Android-APK/DEX-Plattform (Live-Screenshots)
 
-Alle Elemente der Top-Statusleiste (`SELINUX: ENFORCING`, `Binder v8 · tx · FD`, `5G · IP`, `Quick Settings`), der unteren Android-15-Navigations- & Dock-Leiste (`< Back`, `O Home`, `[] Apps`), der Web-Suchleiste, der 4 Telemetrie-Karten sowie aller **10 Apps** sind live klickbar und öffnen ohne Einfrieren oder Verzögerung:
+| Live Android Activity Host (Executed `PixelSecurityBench.apk` Dalvik DEX 035) | GrapheneOS Auditor (15/15 Attestation GREEN) |
+|---|---|
+| ![APK Dalvik Activity](assets/qyronex_grapheneos_apk_dalvik_activity.png) | ![Auditor 15/15](assets/qyronex_grapheneos_auditor_15_15.png) |
+
+| GrapheneOS Apps & Android APK Installer (`pm` / `am` + Binder v8) | Settings -> About Pixel & Kernel (Mali-G715 CSF, Edge TPU, Titan M2) |
+|---|---|
+| ![Apps & APK Installer](assets/qyronex_grapheneos_apps_apk_installer.png) | ![Settings Pixel HW](assets/qyronex_grapheneos_settings_pixel_hw.png) |
+
+## Vollständig bedienbare GrapheneOS-15-App-Suite & Android-APK-Laufzeit
+
+Alle Elemente der Top-Statusleiste (`SELINUX: ENFORCING`, `Binder v8 · tx · FD`, `5G · IP`, `Quick Settings`), der unteren Android-15-Navigations- & Dock-Leiste (`< Back`, `O Home`, `[] Apps`), der Web-Suchleiste, der 4 Telemetrie-Karten sowie aller **10 Apps + Android Activity Host** sind live klickbar und öffnen ohne Einfrieren:
 
 | App | Funktion |
 |---|---|
-| **Vanadium** | Eingebauter gehärteter Webbrowser mit Adressleiste, Lesezeichen, Live-HTTP/HTTPS-Abruf über VirtIO-Net (`curl` via `qyronex-appd`) **und** `Full NetSurf`-Button für vollständiges grafisches HTML/CSS-Rendering (`netsurf-gtk`) |
-| **Settings** | 5-Tab-Systemeinstellungen: Live-**SELinux-Enforcing-Lockdown-Test** (versucht Downgrade auf Permissive -> Kernel blockiert mit `-EPERM`), Live-`getprop`/`setprop`, persistente App-Berechtigungen (`/data/system/permissions.conf`), Live-Netzwerk-/POSIX-TCP-Test & Pixel-Hardware-Info |
-| **Auditor** | Live-**10/10-Hardware-, Kernel-, Binder-FD-Passing- & Titan-M2-Attestierung** mit direkter Live-Auswertung im Fenster |
-| **Terminal** | Interaktive Android-15-/Linux-Shell (`getprop`, `service list`, `dumpsys`, `qyronex-android-selftest`, `uname -a`, `ip addr`, beliebige Shell-Befehle über `qyronex-appd`) |
-| **Files** | Echter POSIX-ext4-/sysfs-/binderfs-Dateimanager (`/data`, `/system`, `/sys/kernel/qyronex/android`, `/dev/binderfs`, `/`) mit Dateivorschau und direktem Öffnen in Notes |
-| **Apps & Binder** | App-Launcher & Live-`/dev/binder`-ServiceManager-Explorer (alle registrierten Services + neue Services live registrieren + Kernel-Binder-Audit-Zähler) |
-| **Logcat** | Live-Stream aus `/dev/log/main` (Auto-Refresh + eigene Log-Events schreiben) |
-| **Notes** | Persistenter Texteditor auf `/data` (ext4) mit `Reload` und `Save to Disk` |
-| **Calculator** | Klickbarer Dezimal- & Hex-Rechner |
-| **Gallery** | Echter `GdkPixbuf`-Bildbetrachter für `/data/pictures` mit Vor/Zurück-Navigation |
-
-| GrapheneOS Settings & Live SELinux `-EPERM`-Test | GrapheneOS Auditor (10/10 Attestation GREEN) |
-|---|---|
-| ![Settings](assets/qyronex_grapheneos_settings_selinux.png) | ![Auditor](assets/qyronex_grapheneos_auditor_10_10.png) |
+| **Apps & APK Installer** | Echter Android-APK-Manager (`pm` / `am` / `qyronex-art` Dalvik VM) mit Ein-Klick-**`Run APK`** / **`Install & Run`** für `GrapheneWelcome.apk`, `PixelSecurityBench.apk` und `QyronexHardwareInfo.apk`, Live-`/data/system/packages.list` **und** Live-`/dev/binder`-ServiceManager-Explorer |
+| **Android Activity Host** | Natives GrapheneOS-Activity-Fenster, das echte `.apk`-Archive (ZIP/DEFLATE + Binary AXML `AndroidManifest.xml` + `classes.dex` DEX 035 mit Adler-32-Prüfung) per Dalvik-Bytecode-VM ausführt (`android.util.Log`, `android.os.SystemProperties`, `android.app.Activity`) |
+| **Auditor (15/15)** | Live-**15/15-Hardware-, Kernel-, eBPF-, dm-verity-, EROFS/F2FS/FUSE-, Pixel-HAL-, Binder-FD-Passing- & APK-DEX-Attestierung** |
+| **Settings** | 5-Tab-Systemeinstellungen: Live-**SELinux-Enforcing-Lockdown-Test** (`-EPERM`), Live-`getprop`/`setprop`, persistente App-Berechtigungen, Live-Netzwerk-/POSIX-TCP-Test & vollständige **Pixel Tensor / Mali-G715 / Edge TPU / dm-verity / eBPF / Storage-Telemetrie** |
+| **Vanadium** | Eingebauter gehärteter Webbrowser mit Adressleiste, Lesezeichen, Live-HTTP/HTTPS-Abruf über VirtIO-Net **und** `Full NetSurf`-Button (`netsurf-gtk`) |
+| **Terminal** | Interaktive Android-15-/Linux-Shell (`getprop`, `service list`, `pm list`, `am start`, `dumpsys`, `qyronex-android-selftest`, `uname -a`) |
+| **Files** | Echter POSIX-ext4-/sysfs-/binderfs-Dateimanager (`/data`, `/data/local/tmp`, `/system/app`, `/sys/kernel/qyronex/android`, `/dev/binderfs`, `/`) inkl. **`Install & Run APK`**-Button und `Edit in Notes` |
+| **Logcat** | Live-Stream aus `/dev/log/main` (Auto-Refresh + eigene Log-Events, inkl. `PackageManager`- & `ActivityTaskManager`-Events) |
+| **Notes / Calculator / Gallery** | Persistenter Texteditor auf `/data` (ext4), Dezimal-/Hex-Rechner und `GdkPixbuf`-Bildbetrachter für `/data/pictures` |
 
 | Interaktive Android-15-Shell (`service list`, `getprop`) | Vanadium Web Browser (Live HTTP/HTTPS + NetSurf) |
 |---|---|
@@ -33,18 +38,18 @@ Alle Elemente der Top-Statusleiste (`SELINUX: ENFORCING`, `Binder v8 · tx · FD
 
 | Komponente | Implementierung in Qyronex | Sicherheits- & Architekturvorteil |
 |---|---|---|
-| **64-Bit Android Binder v8 + Cross-Process FD Passing** | [`kernel/linux-android`](../kernel/linux-android/src/lib.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Treble-Domain-Trennung (`/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`), **echtes `flat_binder_object`-Objekt- & FD-Passing (`BINDER_TYPE_FD`, `BINDER_TYPE_BINDER`, `BINDER_TYPE_HANDLE`)** mit prozessübergreifender FD-Übertragung, **Qyronex `CapRights`-Prüfung** auf jeder Transaktion & Audit-Zähler `total_fd_transfers` |
-| **`binderfs`, `FUSE`, `userfaultfd` & `membarrier`** | `/dev/binderfs/binder-control` (`BINDER_CTL_ADD`), `/dev/fuse`, Syscalls `282` (`UFFDIO_API`) & `283` (`MEMBARRIER_*`) | Dynamische Binder-Device-Erzeugung für Android-Container/APEX, ART-GC-Grundlagen (`userfaultfd` & `membarrier`) |
-| **Android Shared Memory & DMA-Heap** | `/dev/ashmem`, `/dev/dma_heap/system` | Echtes `mmap(MAP_SHARED)` mit Dirty-Writeback, Pin/Unpin und **GrapheneOS Zero-on-Free Sanitization** beim Schließen |
-| **GrapheneOS Kernel-Lockdown** | `/sys/fs/selinux/{enforce,checkreqprot,deny_unknown}`, `/sys/kernel/qyronex/grapheneos/status` | **SELinux Enforcing nicht herabstufbar** (`write("0")` -> `-EPERM`), unveränderliche `ro.*`-System-Properties, W^X TTBR1-Isolation, HW PAN & ARMv8.5 MTE-Telemetrie |
-| **Google Pixel Tensor & Titan M2** | [`drivers/google-pixel`](../drivers/google-pixel/src/lib.rs) | Tensor G1–G4 (`gs101`, `gs201`, `zuma`, `zumapro`), Titan M2 StrongBox KeyMint 3.0 & 64 Weaver-Slots, UFS A/B-Slot-Management, **IOMMU-gesandboxter Shannon-5G-Modem-DMA-Pfad** |
-| **Android GKI Boot Image v4** | [`tools/android/mkbootimg_v4.py`](../tools/android/mkbootimg_v4.py) | Spezifikationskonformes AOSP `ANDROID!` v4-Boot-Image (`dist/qyronex-pixel-boot.img`) mit ARM64-Image-Header (`ARM\x64`) & Initramfs |
-| **Wayland-Compositor & GrapheneOS-15-Shell** | [`tools/android/ui/qyronex_graphene_ui.c`](../tools/android/ui/qyronex_graphene_ui.c) + [`qyronex_appd.c`](../tools/android/src/qyronex_appd.c) | `labwc` Wayland + Zero-Fork Single-Process GTK3 `gtk-layer-shell` + nativer C-App-Daemon `qyronex-appd`, plus `/system/bin/servicemanager`, `getprop`, `setprop`, `service`, `dumpsys`, `logcat`, `qyronex-android-selftest` |
+| **eBPF-Subsystem (`sys_bpf` nr 280)** | [`kernel/linux-android/src/ebpf.rs`](../kernel/linux-android/src/ebpf.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Hash- & Array-Maps, **Fail-Closed-Bytecode-Verifier** (lehnt Rückwärtssprünge/Endlosschleifen & ungültige Register mit `-EACCES` ab), 64-Bit-VM (`BPF_PROG_TEST_RUN`), `/sys/fs/bpf`-Pinning & Live-Stats unter `/sys/kernel/qyronex/android/bpf_stats` |
+| **`dm-verity` SHA-256 Merkle & Device-Mapper** | [`kernel/linux-android/src/storage.rs`](../kernel/linux-android/src/storage.rs) (`/dev/mapper/control`) | FIPS-180-4 SHA-256 Merkle-Tree-Blockverifikation; **1-Bit-Manipulation wird fail-closed mit `-EIO` blockiert** (`DM_VERSION` 4.48, `/sys/kernel/qyronex/android/dm_verity_status`) |
+| **EROFS, F2FS, `super.img` LP & FUSE v7.39** | [`kernel/linux-android/src/storage.rs`](../kernel/linux-android/src/storage.rs) (`/dev/fuse`, `storage_fs_status`) | Echter On-Disk-Parser für **EROFS** (`0xE0F5E1E2`, Superblock, Inodes, Dirents, Dateien), **F2FS** (`0xF2F52010`, Encryption/Verity/Casefold-Flags), Android **`super.img` Dynamic Partitions** (`LP_METADATA` Geometry + Partition-Table) & echter **`FUSE_INIT` v7.39 Handshake** |
+| **Google Pixel Tensor G1–G4 Hardware HALs** | [`drivers/google-pixel/src/lib.rs`](../drivers/google-pixel/src/lib.rs) (`/dev/mali0`, `/dev/edgetpu`, `/dev/umts_ipc0`, `/dev/lwis-isp`) | Open-Source-HALs in `#![forbid(unsafe_code)]` Rust für **ARM Mali-G78/G710/G715 CSF GPU** (`KBASE_IOCTL_VERSION_CHECK`, `KBASE_IOCTL_GET_GPUPROPS`), **Tensor Edge TPU** mit IOMMU-Isolation, **Camera LWIS**, **Shannon 5G Modem IOMMU**, **Titan M2 StrongBox KeyMint 3.0 / 64 Weaver-Slots** & A/B **`bootctl`** |
+| **Android APK/DEX Dalvik VM (`qyronex-art`)** | [`tools/android/src/qyronex_art_core.h`](../tools/android/src/qyronex_art_core.h) + [`mkapk.py`](../tools/android/mkapk.py) | Echter ZIP/DEFLATE-APK-Reader (`zlib`), Binary AXML `AndroidManifest.xml`-Parser, DEX-035-Adler-32-Prüfung, 16-Bit-Dalvik-Bytecode-Interpreter (`pm install/list/uninstall`, `am start`, `dalvikvm`) & 3 gebaute `.apk`-Pakete |
+| **64-Bit Binder v8 + Cross-Process FD Passing** | [`kernel/linux-android/src/lib.rs`](../kernel/linux-android/src/lib.rs) + [`step45_android.rs`](../kernel/core-aarch64/src/step45_android.rs) | Treble-Domains (`/dev/binder`, `/dev/hwbinder`, `/dev/vndbinder`), `binderfs` (`BINDER_CTL_ADD`), `BINDER_TYPE_FD` Cross-Process-FD-Transfer, `CapRights`-Prüfung, `userfaultfd` (282), `membarrier` (283), Ashmem & DMA-Heap mit Zero-on-Free |
+| **AOSP Boot v4 & Vendor Boot v4** | [`tools/android/mkbootimg_v4.py`](../tools/android/mkbootimg_v4.py) | Spezifikationskonformes `ANDROID!` v4 (`dist/qyronex-pixel-boot.img`) **und** `VNDRBOOT` v4 (`dist/qyronex-pixel-vendor-boot.img` mit DTB, bootconfig & Vendor-Ramdisk-Table) |
 
 ## Bauen & Im Emulator starten
 
 ```bash
-# 1. Android-15-/GrapheneOS-ISO, GKI Boot Image v4 & System-Image bauen
+# 1. Android-15-/GrapheneOS-ISO, Boot v4, Vendor Boot v4, APKs & System-Image bauen
 ./tools/build-android-iso.sh
 
 # 2. Im grafischen Qyronex Android-Emulator (Browser-VNC auf http://127.0.0.1:6082) starten
@@ -54,9 +59,9 @@ Alle Elemente der Top-Statusleiste (`SELINUX: ENFORCING`, `Binder v8 · tx · FD
 ./tools/android/start-android-emulator.sh --soc zumapro --vnc
 ```
 
-## Live-Verifikation im Emulator (10/10 Kernel-Selbsttest)
+## Live-Verifikation im Emulator (15/15 Kernel- & APK-Selbsttest)
 
-Beim Systemstart startet `qyronex-desktop.service` automatisch `/system/bin/servicemanager`, führt `qyronex-android-selftest` (10/10 Tests) aus und startet anschließend die `labwc`-Wayland-Sitzung mit `qyronex-appd` und `qyronex-graphene-ui shell`:
+Beim Systemstart startet `qyronex-desktop.service` automatisch `/system/bin/servicemanager`, führt `qyronex-android-selftest` (**15/15 Tests**) aus und startet anschließend die `labwc`-Wayland-Sitzung mit `qyronex-appd` und `qyronex-graphene-ui shell`:
 
 1. `SELINUX_ENFORCING_LOCKDOWN` — Verifiziert `1` und lehnt Downgrade auf `0` mit `-EPERM` ab.
 2. `BINDER_V8_IPC_SERVICEMANAGER` — Echter prozessübergreifender Binder-v8-RPC (`PING`, `ADD_SERVICE`, `GET_SERVICE`, `LIST_SERVICES`).
@@ -66,10 +71,15 @@ Beim Systemstart startet `qyronex-desktop.service` automatisch `/system/bin/serv
 6. `POWER_WAKELOCK_AND_PSI` — `/sys/power/wake_lock`, `wake_unlock`, `/proc/pressure/memory`.
 7. `GRAPHENEOS_HARDENING_STATUS` — Live-Prüfung der GrapheneOS-/Qyronex-Härtungsparameter.
 8. `PIXEL_TITAN_M2_MODEM_IOMMU` — Live-Telemetrie für Titan M2 StrongBox & Shannon-Modem-IOMMU-Sandbox.
-9. `BINDER_FD_PASSING_CROSS_PROC` — Echte prozessübergreifende Übergabe eines Ashmem-FDs via `BINDER_TYPE_FD` (`SM_CMD_ECHO_FD`) inkl. Daten-Verifikation im Zielprozess.
-10. `BINDERFS_USERFAULTFD_MEMBARRIER` — Dynamisches `BINDER_CTL_ADD` auf `/dev/binderfs/binder-control`, `sys_userfaultfd` (`UFFDIO_API`) und `sys_membarrier`.
+9. `BINDER_FD_PASSING_CROSS_PROC` — Echte prozessübergreifende Übergabe eines Ashmem-FDs via `BINDER_TYPE_FD` (`SM_CMD_ECHO_FD`).
+10. `BINDERFS_USERFAULTFD_MEMBARRIER` — Dynamisches `BINDER_CTL_ADD`, `sys_userfaultfd` (`UFFDIO_API`) und `sys_membarrier`.
+11. `EBPF_SYS_BPF_VERIFY_AND_EXEC` — `sys_bpf` (280): Hash-Map CRUD, gültiger eBPF-Filter (`BPF_PROG_TEST_RUN` -> `42`) & Fail-Closed-Ablehnung (`-EACCES`) eines Rückwärtssprungs.
+12. `DM_VERITY_MERKLE_FAIL_CLOSED` — `/dev/mapper/control`: `DM_VERSION` 4.48, SHA-256 Merkle-Verifikation eines sauberen Blocks & `-EIO` bei 1-Bit-Manipulation.
+13. `EROFS_F2FS_SUPER_LP_FUSE` — Live-Kernel-Validierung echter EROFS-, F2FS- und `super.img`-LP-Images sowie `/dev/fuse` `FUSE_INIT` v7.39 Handshake.
+14. `PIXEL_MALI_GPU_EDGETPU_HAL` — `/dev/mali0` `KBASE_IOCTL_VERSION_CHECK` + `KBASE_IOCTL_GET_GPUPROPS`, `/dev/edgetpu`, `/dev/umts_ipc0` & IOMMU-Status.
+15. `APK_DEX_DALVIK_VM_PM_AM_EXEC` — Echte Installation (`pm install`) und Dalvik-Bytecode-Ausführung (`am start`) von `GrapheneWelcome.apk` mit verifiziertem Adler-32 & Ergebnis-Output.
 
-## Transparenz: Emulator vs. physisches Google Pixel (Stock-GrapheneOS Daily Driver)
+## Ehrliche Abgrenzung: Open-Source-Kern vs. signierte Hersteller-Blobs
 
-- **Sofort live & vollständig klickbar im QEMU-AArch64-Emulator:** Der komplette Qyronex Android-15-Kernel (10/10 Tests inkl. Binder-v8-FD-Passing, `binderfs`, `userfaultfd`, `membarrier`, Ashmem, DMA-Heap, SELinux-Lockdown), die komplette klickbare Wayland-/GTK3-GrapheneOS-15-Oberfläche mit allen 10 Apps, `servicemanager`, Android-CLI-Suite und das AOSP GKI Boot Image v4 (`qyronex-pixel-boot.img`).
-- **Was für das Booten eines unveränderten signierten Google-Pixel-AOSP/GrapheneOS-`super.img` (Daily Driver auf echter Pixel-Hardware) noch zusätzlich erforderlich bleibt:** Die vollständige **Android-ART-/Java-Runtime (`system_server`, APK-Installation & Zygote)**, zusätzliche Dateisystem-/Sicherheits-Subsysteme (`erofs`, `f2fs`, `dm-verity`, `eBPF`) sowie die proprietären **Google-Tensor-Vendor-Komponenten** (`vendor_boot`, `vendor_dlkm`, Mali-GPU-Treiber, geschlossene GXP/TPU/Kamera- und Shannon-5G-Modem-Firmware-Blobs).
+- **Vollständig implementiert & live verifiziert in Qyronex OS v0.6.0:** Der komplette speichersichere Rust-Android-15-Kernel (15/15 Checks inkl. Binder v8 + FD-Passing, eBPF, dm-verity, EROFS, F2FS, `super.img` LP, FUSE v7.39, Ashmem, DMA-Heap, SELinux-Lockdown), die Open-Source-Pixel-Tensor-Hardware-HALs (Mali-G715 CSF, Edge TPU, Camera LWIS, Shannon 5G Modem IOMMU, Titan M2, `bootctl`), AOSP `boot.img` v4 + `vendor_boot.img` v4, die native APK/DEX-Dalvik-VM (`qyronex-art`, `pm`, `am`) mit 3 lauffähigen `.apk`-Paketen sowie die komplett klickbare GrapheneOS-15-Wayland-Oberfläche.
+- **Was aus urheberrechtlichen & technischen Gründen nicht selbst erzeugt werden kann:** Proprietäre, kryptografisch signierte Binär-Firmwares von Google/ARM/Samsung (Mali-CSF-Firmware, Edge-TPU-Firmware, Shannon-5G-Baseband-Firmware, Camera-3A-Blobs — im HAL explizit als `awaiting-pixel-factory-blob` ausgewiesen) sowie das vollständige Multi-Millionen-LOC-Upstream-AOSP-Java/ART-`system_server`-Framework. Für einen Stock-Factory-Image-Daily-Driver auf einem physischen Google Pixel müssen diese signierten Vendor-Blobs und das Upstream-AOSP/GrapheneOS-Userland aus dem offiziellen Factory-Image bereitgestellt werden.

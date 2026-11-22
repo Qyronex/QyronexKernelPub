@@ -39,13 +39,25 @@ use kernal_linux_android::{
     BinderWriteRead, DMA_HEAP_IOCTL_ALLOC, FLAT_BINDER_OBJECT_BYTES, FlatBinderObject,
     MAX_BINDER_PAYLOAD_BYTES, MEMBARRIER_CMD_QUERY, MEMBARRIER_SUPPORTED_MASK, UFFD_API_VERSION,
     UFFDIO_API,
+    ebpf::{
+        BPF_MAP_CREATE, BPF_MAP_DELETE_ELEM, BPF_MAP_GET_NEXT_KEY, BPF_MAP_LOOKUP_ELEM,
+        BPF_MAP_UPDATE_ELEM, BPF_OBJ_GET, BPF_OBJ_PIN, BPF_PROG_LOAD, BPF_PROG_TEST_RUN, BpfInsn,
+        BpfPinnedTarget, MAX_BPF_INSNS,
+    },
+    storage::{
+        DM_DEV_STATUS_CMD, DM_VERSION_CMD, EROFS_SUPER_MAGIC_V1, ErofsSuperblock, F2FS_SUPER_MAGIC,
+        F2fsSuperblock, LP_METADATA_GEOMETRY_MAGIC, QYRONEX_DM_VERITY_VERIFY_BLOCK,
+        SuperPartitionTable,
+    },
 };
 use kernal_linux_fd::SubsystemHandle;
 
-/// Dedicated file-descriptor base for Step-45 Android/Pixel/GrapheneOS descriptors (`1024..1056`),
+/// Dedicated file-descriptor base for Step-45 Android/Pixel/GrapheneOS descriptors (`1024..1088`),
 /// cleanly partitioned above `DEV_FD_BASE` (`992..1024`).
 pub(super) const ANDROID_FD_BASE: i32 = 1024;
-const MAX_ANDROID_FDS: usize = 32;
+const MAX_ANDROID_FDS: usize = 64;
+const KBASE_IOCTL_VERSION_CHECK: u64 = 0xC004_8000;
+const KBASE_IOCTL_GET_GPUPROPS: u64 = 0xC010_8003;
 const O_CLOEXEC_U64: u64 = 0x0008_0000;
 const O_NONBLOCK_U64: u64 = 0x0800;
 const O_DIRECTORY_U64: u64 = 0x0000_4000;
@@ -76,8 +88,20 @@ enum AndroidNodeKind {
     PsiIo,
     QyronexProperties,
     QyronexBinderStats,
+    QyronexBpfStats,
+    QyronexDmVerityStatus,
+    QyronexStorageFsStatus,
     GrapheneOsStatus,
     GooglePixelStatus,
+    GooglePixelHardware,
+    MaliGpuInfo,
+    DmControl,
+    MaliGpu,
+    EdgeTpu,
+    ModemIpc,
+    CameraLwis,
+    BpfMap(u32),
+    BpfProg(u32),
 }
 
 impl AndroidNodeKind {
@@ -89,6 +113,13 @@ impl AndroidNodeKind {
             | Self::DmaHeapSystem
             | Self::Fuse
             | Self::UserfaultFd
+            | Self::DmControl
+            | Self::MaliGpu
+            | Self::EdgeTpu
+            | Self::ModemIpc
+            | Self::CameraLwis
+            | Self::BpfMap(_)
+            | Self::BpfProg(_)
             | Self::AndroidLogMain => S_IFCHR_MODE,
             _ => S_IFREG_MODE,
         }
@@ -105,6 +136,13 @@ impl AndroidNodeKind {
             Self::DmaHeapSystem => ((252u64 << 8), 45_005),
             Self::Fuse => ((10u64 << 8) | 229, 45_008),
             Self::UserfaultFd => (0, 45_009),
+            Self::DmControl => ((10u64 << 8) | 236, 45_050),
+            Self::MaliGpu => ((10u64 << 8) | 120, 45_051),
+            Self::EdgeTpu => ((10u64 << 8) | 121, 45_052),
+            Self::ModemIpc => ((10u64 << 8) | 122, 45_053),
+            Self::CameraLwis => ((10u64 << 8) | 123, 45_054),
+            Self::BpfMap(id) => (0, 45_100 + id as u64),
+            Self::BpfProg(id) => (0, 45_200 + id as u64),
             Self::AndroidLogMain => ((10u64 << 8) | 64, 45_006),
             Self::SelinuxEnforce => (0, 45_010),
             Self::SelinuxMls => (0, 45_011),
@@ -122,6 +160,11 @@ impl AndroidNodeKind {
             Self::QyronexBinderStats => (0, 45_041),
             Self::GrapheneOsStatus => (0, 45_042),
             Self::GooglePixelStatus => (0, 45_043),
+            Self::QyronexBpfStats => (0, 45_044),
+            Self::QyronexDmVerityStatus => (0, 45_045),
+            Self::QyronexStorageFsStatus => (0, 45_046),
+            Self::GooglePixelHardware => (0, 45_047),
+            Self::MaliGpuInfo => (0, 45_048),
         }
     }
 
@@ -136,6 +179,13 @@ impl AndroidNodeKind {
             Self::DmaHeapSystem => b"/dev/dma_heap/system",
             Self::Fuse => b"/dev/fuse",
             Self::UserfaultFd => b"anon_inode:[userfaultfd]",
+            Self::DmControl => b"/dev/mapper/control",
+            Self::MaliGpu => b"/dev/mali0",
+            Self::EdgeTpu => b"/dev/edgetpu",
+            Self::ModemIpc => b"/dev/umts_ipc0",
+            Self::CameraLwis => b"/dev/lwis-isp",
+            Self::BpfMap(_) => b"anon_inode:bpf-map",
+            Self::BpfProg(_) => b"anon_inode:bpf-prog",
             Self::AndroidLogMain => b"/dev/log/main",
             Self::SelinuxEnforce => b"/sys/fs/selinux/enforce",
             Self::SelinuxMls => b"/sys/fs/selinux/mls",
@@ -151,8 +201,13 @@ impl AndroidNodeKind {
             Self::PsiIo => b"/proc/pressure/io",
             Self::QyronexProperties => b"/sys/kernel/qyronex/android/properties",
             Self::QyronexBinderStats => b"/sys/kernel/qyronex/android/binder_stats",
+            Self::QyronexBpfStats => b"/sys/kernel/qyronex/android/bpf_stats",
+            Self::QyronexDmVerityStatus => b"/sys/kernel/qyronex/android/dm_verity_status",
+            Self::QyronexStorageFsStatus => b"/sys/kernel/qyronex/android/storage_fs_status",
             Self::GrapheneOsStatus => b"/sys/kernel/qyronex/grapheneos/status",
             Self::GooglePixelStatus => b"/sys/bus/platform/drivers/google_pixel/status",
+            Self::GooglePixelHardware => b"/sys/bus/platform/drivers/google_pixel/hardware",
+            Self::MaliGpuInfo => b"/sys/class/misc/mali0/device/gpuinfo",
         }
     }
 }
@@ -726,6 +781,11 @@ fn match_android_path(path: &[u8]) -> Option<AndroidNodeKind> {
         b"/dev/ashmem" => Some(AndroidNodeKind::Ashmem),
         b"/dev/dma_heap/system" => Some(AndroidNodeKind::DmaHeapSystem),
         b"/dev/fuse" => Some(AndroidNodeKind::Fuse),
+        b"/dev/mapper/control" => Some(AndroidNodeKind::DmControl),
+        b"/dev/mali0" => Some(AndroidNodeKind::MaliGpu),
+        b"/dev/edgetpu" => Some(AndroidNodeKind::EdgeTpu),
+        b"/dev/umts_ipc0" => Some(AndroidNodeKind::ModemIpc),
+        b"/dev/lwis-isp" => Some(AndroidNodeKind::CameraLwis),
         b"/dev/pmsg0" | b"/dev/log/main" | b"/dev/log/system" => {
             Some(AndroidNodeKind::AndroidLogMain)
         }
@@ -743,10 +803,21 @@ fn match_android_path(path: &[u8]) -> Option<AndroidNodeKind> {
         b"/proc/pressure/io" => Some(AndroidNodeKind::PsiIo),
         b"/sys/kernel/qyronex/android/properties" => Some(AndroidNodeKind::QyronexProperties),
         b"/sys/kernel/qyronex/android/binder_stats" => Some(AndroidNodeKind::QyronexBinderStats),
+        b"/sys/kernel/qyronex/android/bpf_stats" => Some(AndroidNodeKind::QyronexBpfStats),
+        b"/sys/kernel/qyronex/android/dm_verity_status" => {
+            Some(AndroidNodeKind::QyronexDmVerityStatus)
+        }
+        b"/sys/kernel/qyronex/android/storage_fs_status" => {
+            Some(AndroidNodeKind::QyronexStorageFsStatus)
+        }
         b"/sys/kernel/qyronex/grapheneos/status" => Some(AndroidNodeKind::GrapheneOsStatus),
         b"/sys/bus/platform/drivers/google_pixel/status" => {
             Some(AndroidNodeKind::GooglePixelStatus)
         }
+        b"/sys/bus/platform/drivers/google_pixel/hardware" => {
+            Some(AndroidNodeKind::GooglePixelHardware)
+        }
+        b"/sys/class/misc/mali0/device/gpuinfo" => Some(AndroidNodeKind::MaliGpuInfo),
         _ => None,
     }
 }
@@ -863,7 +934,7 @@ fn render_node_bytes(state: &Step45State, kind: AndroidNodeKind) -> Vec<u8> {
         AndroidNodeKind::GooglePixelStatus => {
             let p = &state.pixel;
             format!(
-                "model={}\ncores={}\ntitan_m2={}\nkeymint_version={}\nweaver_slots={}\nufs_slot=_{}\ndisplay={}x{}@{}Hz\nmodem_iommu_sandbox={}\nhw_mte={}\n",
+                "model={}\ncores={}\ntitan_m2={}\nkeymint_version={}\nweaver_slots={}\nufs_slot=_{}\ndisplay={}x{}@{}Hz\nmodem_iommu_sandbox={}\ngpu={}\ngpu_iommu={}\nedge_tpu=gen{}\nedge_tpu_iommu={}\ncamera_lwis={}\nhw_mte={}\n",
                 p.soc.model_name(),
                 p.soc.cpu_cores(),
                 if p.titan_m2.online { "online-strongbox" } else { "offline" },
@@ -874,7 +945,96 @@ fn render_node_bytes(state: &Step45State, kind: AndroidNodeKind) -> Vec<u8> {
                 p.display.height,
                 p.display.refresh_hz,
                 if p.modem_ipc.iommu_sandboxed { "enforced" } else { "off" },
+                p.gpu.gpu_name,
+                if p.gpu.iommu_isolated { "enforced" } else { "off" },
+                p.edge_tpu.generation,
+                if p.edge_tpu.iommu_sandboxed { "enforced" } else { "off" },
+                if p.camera_lwis.initialized { "online" } else { "offline" },
                 u8::from(p.hw_mte_enabled)
+            )
+            .into_bytes()
+        }
+        AndroidNodeKind::GooglePixelHardware => {
+            let p = &state.pixel;
+            format!(
+                "soc={}\ngpu_name={}\ngpu_id=0x{:08x}\ngpu_cores={}\ngpu_l2_kb={}\ngpu_csf={}.{}\ngpu_iommu={}\nedge_tpu_gen={}\nedge_tpu_iommu={}\nedge_tpu_vendor_fw={}\ncamera_lwis_sensors={}\ncamera_vendor_3a_blobs={}\nmodem_shannon_iommu={}\nbootctl_active_slot={}\nbootctl_slot_a_ok={}\nvendor_boot_v4=supported\n",
+                p.soc.model_name(),
+                p.gpu.gpu_name,
+                p.gpu.gpu_id,
+                p.gpu.shader_cores,
+                p.gpu.l2_cache_kb,
+                p.gpu.csf_version_major,
+                p.gpu.csf_version_minor,
+                if p.gpu.iommu_isolated { "enforced" } else { "off" },
+                p.edge_tpu.generation,
+                if p.edge_tpu.iommu_sandboxed { "enforced" } else { "off" },
+                if p.edge_tpu.vendor_firmware_loaded { "loaded" } else { "awaiting-pixel-factory-blob" },
+                p.camera_lwis.sensor_slots,
+                if p.camera_lwis.vendor_3a_blobs_present { "loaded" } else { "awaiting-pixel-factory-blob" },
+                if p.modem_ipc.iommu_sandboxed { "enforced" } else { "off" },
+                p.bootctl.active_suffix(),
+                u8::from(p.bootctl.slot_a_successful),
+            )
+            .into_bytes()
+        }
+        AndroidNodeKind::MaliGpuInfo => {
+            let g = &state.pixel.gpu;
+            format!(
+                "{} {} cores {}KB L2 (GPU_ID=0x{:08x}, CSF {}.{}, IOMMU={})\n",
+                g.gpu_name,
+                g.shader_cores,
+                g.l2_cache_kb,
+                g.gpu_id,
+                g.csf_version_major,
+                g.csf_version_minor,
+                if g.iommu_isolated { "isolated" } else { "off" }
+            )
+            .into_bytes()
+        }
+        AndroidNodeKind::QyronexBpfStats => {
+            format!(
+                "ebpf_verifier=enforcing\nmaps={}\nprograms={}\npinned_objects={}\ntotal_runs={}\nverifier_rejects={}\n",
+                a.ebpf.maps.len(),
+                a.ebpf.progs.len(),
+                a.ebpf.pins.len(),
+                a.ebpf.total_runs,
+                a.ebpf.verifier_rejects
+            )
+            .into_bytes()
+        }
+        AndroidNodeKind::QyronexDmVerityStatus => {
+            let dev_count = a.dm.devices.len();
+            let root_hex = if let Some(d) = a.dm.devices.first() {
+                format!(
+                    "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    d.root_digest[0],
+                    d.root_digest[1],
+                    d.root_digest[2],
+                    d.root_digest[3],
+                    d.root_digest[4],
+                    d.root_digest[5],
+                    d.root_digest[6],
+                    d.root_digest[7]
+                )
+            } else {
+                String::from("none")
+            };
+            format!(
+                "mode=enforcing-sha256-merkle\ndevices={}\nroot_digest_prefix={}\nverified_blocks={}\ncorruption_blocks_blocked={}\n",
+                dev_count, root_hex, a.dm.verified_blocks, a.dm.corruption_blocks
+            )
+            .into_bytes()
+        }
+        AndroidNodeKind::QyronexStorageFsStatus => {
+            format!(
+                "supported_fs=ext4,erofs,f2fs,fuse,super_lp,dm_verity\nerofs_verified={}\nf2fs_verified={}\nsuper_lp_verified={}\nfuse_initialized={}\nfuse_proto={}.{}\nfuse_requests_served={}\n",
+                a.erofs_verified_count,
+                a.f2fs_verified_count,
+                a.super_lp_verified_count,
+                u8::from(a.fuse.initialized),
+                a.fuse.proto_major,
+                a.fuse.proto_minor,
+                a.fuse.requests_served
             )
             .into_bytes()
         }
@@ -893,7 +1053,7 @@ pub(super) fn try_handle_syscall(
             request.args[2],
             frame,
         )?))),
-        48 => handle_faccessat_if_android(request.args[1]),
+        48 | 439 => handle_faccessat_if_android(request.args[1]),
         56 => handle_openat_if_android(request.args[1], request.args[2]),
         57 if is_android_fd(request.args[0]) => {
             Ok(Some(encode_result(handle_close(request.args[0])?)))
@@ -946,6 +1106,12 @@ pub(super) fn try_handle_syscall(
         80 if is_android_fd_or_alias(request.args[0]) => Ok(Some(encode_result(handle_fstat(
             request.args[0],
             request.args[1],
+        )?))),
+        // bpf(cmd, attr, size) — Android bpfloader / netd eBPF maps + verified bytecode VM
+        280 => Ok(Some(encode_result(handle_bpf_syscall(
+            request.args[0] as u32,
+            request.args[1],
+            request.args[2] as usize,
         )?))),
         // userfaultfd(flags) — Android 14/15 ART Concurrent Mark-Compact GC support
         282 => Ok(Some(encode_result(handle_userfaultfd(request.args[0])?))),
@@ -1111,6 +1277,10 @@ fn handle_read(
                 reg.data.clone()
             }
             AndroidNodeKind::Binder(_) => return Err(Errno::EINVAL),
+            AndroidNodeKind::Fuse => {
+                let msg = state.android_mut().fuse.build_init_request();
+                return Ok(msg[..count.min(msg.len())].to_vec());
+            }
             other => render_node_bytes(state, other),
         };
         if pos >= data.len() || count == 0 {
@@ -1149,7 +1319,7 @@ fn handle_write(
     let Ok((idx, alias_gen)) = resolve_slot_idx(process, raw_fd) else {
         return Ok(Err(Errno::EBADF));
     };
-    let take = count.min(4096);
+    let take = count.min(32768);
     let mut kbuf = vec![0u8; take];
     if take > 0
         && let Err(e) = copy_from_user(&mut kbuf, user_buf)
@@ -1161,6 +1331,38 @@ fn handle_write(
             return Err(Errno::EBADF);
         };
         match entry.kind {
+            AndroidNodeKind::Fuse => {
+                state.android_mut().fuse.handle_daemon_reply(&kbuf)?;
+                Ok(take as i64)
+            }
+            AndroidNodeKind::QyronexStorageFsStatus => {
+                // Live kernel validation of EROFS, F2FS, or Android super.img LP_METADATA images
+                if kbuf.len() >= 1028
+                    && u32::from_le_bytes([kbuf[1024], kbuf[1025], kbuf[1026], kbuf[1027]])
+                        == EROFS_SUPER_MAGIC_V1
+                {
+                    let sb = ErofsSuperblock::parse(&kbuf)?;
+                    let _ = sb.read_dir(&kbuf, u64::from(sb.root_nid))?;
+                    state.android_mut().erofs_verified_count += 1;
+                    Ok(take as i64)
+                } else if kbuf.len() >= 1028
+                    && u32::from_le_bytes([kbuf[1024], kbuf[1025], kbuf[1026], kbuf[1027]])
+                        == F2FS_SUPER_MAGIC
+                {
+                    let _ = F2fsSuperblock::parse(&kbuf)?;
+                    state.android_mut().f2fs_verified_count += 1;
+                    Ok(take as i64)
+                } else if kbuf.len() >= 12288 + 256
+                    && u32::from_le_bytes([kbuf[4096], kbuf[4097], kbuf[4098], kbuf[4099]])
+                        == LP_METADATA_GEOMETRY_MAGIC
+                {
+                    let _ = SuperPartitionTable::parse(&kbuf)?;
+                    state.android_mut().super_lp_verified_count += 1;
+                    Ok(take as i64)
+                } else {
+                    Err(Errno::EINVAL)
+                }
+            }
             AndroidNodeKind::SelinuxEnforce => {
                 // GrapheneOS kernel lockdown: enforcing mode cannot be downgraded to permissive.
                 let text = core::str::from_utf8(&kbuf).unwrap_or("").trim();
@@ -1292,11 +1494,383 @@ fn handle_ioctl(
         AndroidNodeKind::Binder(domain) => handle_binder_ioctl(domain, entry, cmd, arg, frame),
         AndroidNodeKind::BinderControl => handle_binderfs_control_ioctl(cmd, arg),
         AndroidNodeKind::UserfaultFd => handle_userfaultfd_ioctl(cmd, arg),
+        AndroidNodeKind::DmControl => handle_dm_control_ioctl(cmd, arg),
+        AndroidNodeKind::MaliGpu => handle_mali_gpu_ioctl(cmd, arg),
         AndroidNodeKind::Ashmem | AndroidNodeKind::DmaHeapSystem => {
             handle_ashmem_ioctl(entry.ashmem_region_id, cmd, arg)
         }
         _ => Ok(Err(Errno::ENOTTY)),
     }
+}
+
+fn alloc_android_fd(
+    process: ObjectId,
+    kind: AndroidNodeKind,
+    cloexec: bool,
+) -> Result<Result<i64, Errno>, ()> {
+    with_step45_state(|state| {
+        let Some(idx) = state.fds.iter().position(|s| !s.live) else {
+            return Err(Errno::EMFILE);
+        };
+        let fd_gen = state.next_fd_generation;
+        state.next_fd_generation = state.next_fd_generation.wrapping_add(1).max(1);
+        let mut owners = DirectProcessRefs::empty();
+        owners.init(process, cloexec);
+        state.fds[idx] = AndroidFdSlot {
+            live: true,
+            kind,
+            generation: fd_gen,
+            owners,
+            alias_refs: 0,
+            offset: 0,
+            status_flags: 0,
+            binder_endpoint_id: 0,
+            ashmem_region_id: 0,
+        };
+        Ok(i64::from(ANDROID_FD_BASE + (idx as i32)))
+    })
+}
+
+fn handle_bpf_syscall(cmd: u32, attr_ptr: u64, attr_size: usize) -> Result<Result<i64, Errno>, ()> {
+    let Some(process) = current_process_object() else {
+        return Err(());
+    };
+    let (uid, _) = current_uid_gid();
+    let rights = if uid == 0 || uid == 1000 {
+        CapRights::READ
+            .union(CapRights::WRITE)
+            .union(CapRights::CONTROL)
+    } else {
+        CapRights::READ.union(CapRights::WRITE)
+    };
+    let cap = Capability {
+        object: process,
+        rights,
+    };
+    let copy_len = attr_size.clamp(16, 128);
+    let mut attr = [0u8; 128];
+    if let Err(e) = copy_from_user(&mut attr[..copy_len], attr_ptr) {
+        return Ok(Err(e));
+    }
+    let u32_at = |off: usize| -> u32 {
+        u32::from_le_bytes([attr[off], attr[off + 1], attr[off + 2], attr[off + 3]])
+    };
+    let u64_at = |off: usize| -> u64 {
+        u64::from_le_bytes([
+            attr[off],
+            attr[off + 1],
+            attr[off + 2],
+            attr[off + 3],
+            attr[off + 4],
+            attr[off + 5],
+            attr[off + 6],
+            attr[off + 7],
+        ])
+    };
+
+    match cmd {
+        BPF_MAP_CREATE => {
+            let map_type = u32_at(0);
+            let key_size = u32_at(4);
+            let value_size = u32_at(8);
+            let max_entries = u32_at(12);
+            let map_id = match with_step45_state(|state| {
+                state.android_mut().ebpf.create_map(
+                    cap,
+                    map_type,
+                    key_size,
+                    value_size,
+                    max_entries,
+                )
+            })? {
+                Ok(id) => id,
+                Err(e) => return Ok(Err(e)),
+            };
+            alloc_android_fd(process, AndroidNodeKind::BpfMap(map_id), true)
+        }
+        BPF_MAP_LOOKUP_ELEM | BPF_MAP_UPDATE_ELEM | BPF_MAP_DELETE_ELEM | BPF_MAP_GET_NEXT_KEY => {
+            let map_fd = u64::from(u32_at(0));
+            let key_ptr = u64_at(8);
+            let val_ptr = u64_at(16);
+            let Ok((idx, alias_gen)) = resolve_slot_idx(process, map_fd) else {
+                return Ok(Err(Errno::EBADF));
+            };
+            let (map_id, key_sz, val_sz) = match with_step45_state(|state| {
+                let entry = resolve_slot(state, process, idx, alias_gen).ok_or(Errno::EBADF)?;
+                let AndroidNodeKind::BpfMap(id) = entry.kind else {
+                    return Err(Errno::EINVAL);
+                };
+                let m = state.android().ebpf.map(id).ok_or(Errno::ENOENT)?;
+                Ok((id, m.key_size as usize, m.value_size as usize))
+            })? {
+                Ok(v) => v,
+                Err(e) => return Ok(Err(e)),
+            };
+
+            let mut key = vec![0u8; key_sz];
+            if key_ptr != 0
+                && let Err(e) = copy_from_user(&mut key, key_ptr)
+            {
+                return Ok(Err(e));
+            }
+            match cmd {
+                BPF_MAP_UPDATE_ELEM => {
+                    let mut val = vec![0u8; val_sz];
+                    if let Err(e) = copy_from_user(&mut val, val_ptr) {
+                        return Ok(Err(e));
+                    }
+                    with_step45_state(|state| {
+                        state
+                            .android_mut()
+                            .ebpf
+                            .map_mut(map_id)
+                            .ok_or(Errno::ENOENT)?
+                            .update(&key, &val)
+                            .map(|()| 0i64)
+                    })
+                }
+                BPF_MAP_LOOKUP_ELEM => {
+                    let found = with_step45_state(|state| {
+                        let m = state.android().ebpf.map(map_id).ok_or(Errno::ENOENT)?;
+                        match m.lookup(&key)? {
+                            Some(v) => Ok(v.to_vec()),
+                            None => Err(Errno::ENOENT),
+                        }
+                    })?;
+                    match found {
+                        Ok(v) => {
+                            if let Err(e) = copy_to_user(val_ptr, &v) {
+                                return Ok(Err(e));
+                            }
+                            Ok(Ok(0))
+                        }
+                        Err(e) => Ok(Err(e)),
+                    }
+                }
+                BPF_MAP_DELETE_ELEM => with_step45_state(|state| {
+                    state
+                        .android_mut()
+                        .ebpf
+                        .map_mut(map_id)
+                        .ok_or(Errno::ENOENT)?
+                        .delete(&key)
+                        .map(|()| 0i64)
+                }),
+                BPF_MAP_GET_NEXT_KEY => {
+                    let next = with_step45_state(|state| {
+                        let m = state.android().ebpf.map(map_id).ok_or(Errno::ENOENT)?;
+                        m.next_key(if key_ptr == 0 { None } else { Some(&key) })
+                    })?;
+                    match next {
+                        Ok(nk) => {
+                            if let Err(e) = copy_to_user(val_ptr, &nk) {
+                                return Ok(Err(e));
+                            }
+                            Ok(Ok(0))
+                        }
+                        Err(e) => Ok(Err(e)),
+                    }
+                }
+                _ => Ok(Err(Errno::EINVAL)),
+            }
+        }
+        BPF_PROG_LOAD => {
+            // Canonical Linux `union bpf_attr` layout for `BPF_PROG_LOAD`:
+            // offset 0: u32 prog_type, offset 4: u32 insn_cnt, offset 8: u64 insns
+            let prog_type = u32_at(0);
+            let insn_cnt = u32_at(4) as usize;
+            let insns_ptr = u64_at(8);
+            if insn_cnt == 0 || insn_cnt > MAX_BPF_INSNS {
+                return Ok(Err(Errno::EINVAL));
+            }
+            let mut raw = vec![0u8; insn_cnt * 8];
+            if let Err(e) = copy_from_user(&mut raw, insns_ptr) {
+                return Ok(Err(e));
+            }
+            let mut insns = Vec::with_capacity(insn_cnt);
+            for chunk in raw.chunks_exact(8) {
+                let Some(insn) = BpfInsn::from_le_bytes(chunk) else {
+                    return Ok(Err(Errno::EINVAL));
+                };
+                insns.push(insn);
+            }
+            let prog_id = match with_step45_state(|state| {
+                state.android_mut().ebpf.load_program(cap, prog_type, insns)
+            })? {
+                Ok(id) => id,
+                Err(e) => return Ok(Err(e)),
+            };
+            alloc_android_fd(process, AndroidNodeKind::BpfProg(prog_id), true)
+        }
+        BPF_PROG_TEST_RUN => {
+            // Canonical Linux `union bpf_attr.test`:
+            // 0: u32 prog_fd, 4: u32 retval, 8: u32 data_size_in, 12: u32 data_size_out,
+            // 16: u64 data_in, 24: u64 data_out, 32: u32 repeat, 36: u32 duration
+            let prog_fd = u64::from(u32_at(0));
+            let data_size_in = (u32_at(8) as usize).min(4096);
+            let data_in_ptr = u64_at(16);
+            let Ok((idx, alias_gen)) = resolve_slot_idx(process, prog_fd) else {
+                return Ok(Err(Errno::EBADF));
+            };
+            let mut ctx_data = vec![0u8; data_size_in];
+            if data_size_in > 0
+                && data_in_ptr != 0
+                && let Err(e) = copy_from_user(&mut ctx_data, data_in_ptr)
+            {
+                return Ok(Err(e));
+            }
+            let res = with_step45_state(|state| {
+                let entry = resolve_slot(state, process, idx, alias_gen).ok_or(Errno::EBADF)?;
+                let AndroidNodeKind::BpfProg(pid) = entry.kind else {
+                    return Err(Errno::EINVAL);
+                };
+                state.android_mut().ebpf.test_run_program(pid, &ctx_data)
+            })?;
+            match res {
+                Ok(retval) => {
+                    attr[4..8].copy_from_slice(&retval.to_le_bytes());
+                    if let Err(e) = copy_to_user(attr_ptr, &attr[..copy_len]) {
+                        return Ok(Err(e));
+                    }
+                    Ok(Ok(0))
+                }
+                Err(e) => Ok(Err(e)),
+            }
+        }
+        BPF_OBJ_PIN => {
+            let path_ptr = u64_at(0);
+            let bpf_fd = u64::from(u32_at(8));
+            let mut pbuf = [0u8; 256];
+            let Ok(plen) = read_user_cstr(path_ptr, &mut pbuf) else {
+                return Ok(Err(Errno::EFAULT));
+            };
+            let path = core::str::from_utf8(&pbuf[..plen]).unwrap_or("");
+            let Ok((idx, alias_gen)) = resolve_slot_idx(process, bpf_fd) else {
+                return Ok(Err(Errno::EBADF));
+            };
+            with_step45_state(|state| {
+                let entry = resolve_slot(state, process, idx, alias_gen).ok_or(Errno::EBADF)?;
+                let target = match entry.kind {
+                    AndroidNodeKind::BpfMap(id) => BpfPinnedTarget::Map(id),
+                    AndroidNodeKind::BpfProg(id) => BpfPinnedTarget::Prog(id),
+                    _ => return Err(Errno::EINVAL),
+                };
+                state
+                    .android_mut()
+                    .ebpf
+                    .pin_object(path, target)
+                    .map(|()| 0i64)
+            })
+        }
+        BPF_OBJ_GET => {
+            let path_ptr = u64_at(0);
+            let mut pbuf = [0u8; 256];
+            let Ok(plen) = read_user_cstr(path_ptr, &mut pbuf) else {
+                return Ok(Err(Errno::EFAULT));
+            };
+            let path = core::str::from_utf8(&pbuf[..plen]).unwrap_or("");
+            let target = match with_step45_state(|state| {
+                state.android().ebpf.get_pinned(path).ok_or(Errno::ENOENT)
+            })? {
+                Ok(t) => t,
+                Err(e) => return Ok(Err(e)),
+            };
+            let kind = match target {
+                BpfPinnedTarget::Map(id) => AndroidNodeKind::BpfMap(id),
+                BpfPinnedTarget::Prog(id) => AndroidNodeKind::BpfProg(id),
+            };
+            alloc_android_fd(process, kind, true)
+        }
+        _ => Ok(Err(Errno::EINVAL)),
+    }
+}
+
+fn handle_dm_control_ioctl(cmd: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {
+    let cmd32 = cmd & 0xFFFF_FFFF;
+    if cmd32 == QYRONEX_DM_VERITY_VERIFY_BLOCK {
+        // Layout (64 bytes): name[32], u32 block_index, u32 data_len, u64 data_ptr, reserved[16]
+        let mut req = [0u8; 64];
+        if let Err(e) = copy_from_user(&mut req, arg) {
+            return Ok(Err(e));
+        }
+        let nend = req[..32].iter().position(|&b| b == 0).unwrap_or(32);
+        let name = core::str::from_utf8(&req[..nend]).unwrap_or("");
+        let block_index = u32::from_le_bytes([req[32], req[33], req[34], req[35]]) as usize;
+        let data_len =
+            (u32::from_le_bytes([req[36], req[37], req[38], req[39]]) as usize).min(4096);
+        let data_ptr = u64::from_le_bytes([
+            req[40], req[41], req[42], req[43], req[44], req[45], req[46], req[47],
+        ]);
+        let mut data = vec![0u8; data_len];
+        if data_len > 0
+            && let Err(e) = copy_from_user(&mut data, data_ptr)
+        {
+            return Ok(Err(e));
+        }
+        return with_step45_state(|state| {
+            state
+                .android_mut()
+                .dm
+                .verify_device_block(name, block_index, &data)
+                .map(|()| 0i64)
+        });
+    }
+    let dm_nr = (cmd32 & 0xFF) as u32;
+    if dm_nr == DM_VERSION_CMD {
+        // Linux `struct dm_ioctl`: first 12 bytes = version[3] = {4, 48, 0}
+        let mut ver = [0u8; 12];
+        ver[0..4].copy_from_slice(&4u32.to_le_bytes());
+        ver[4..8].copy_from_slice(&48u32.to_le_bytes());
+        ver[8..12].copy_from_slice(&0u32.to_le_bytes());
+        if let Err(e) = copy_to_user(arg, &ver) {
+            return Ok(Err(e));
+        }
+        return Ok(Ok(0));
+    }
+    if dm_nr == DM_DEV_STATUS_CMD {
+        return Ok(Ok(0));
+    }
+    Ok(Err(Errno::ENOTTY))
+}
+
+fn handle_mali_gpu_ioctl(cmd: u64, arg: u64) -> Result<Result<i64, Errno>, ()> {
+    let cmd32 = cmd & 0xFFFF_FFFF;
+    if cmd32 == KBASE_IOCTL_VERSION_CHECK {
+        let (maj, min) = with_step45_state(|state| {
+            (
+                state.pixel.gpu.csf_version_major,
+                state.pixel.gpu.csf_version_minor,
+            )
+        })?;
+        let mut out = [0u8; 4];
+        out[0..2].copy_from_slice(&maj.to_le_bytes());
+        out[2..4].copy_from_slice(&min.to_le_bytes());
+        if let Err(e) = copy_to_user(arg, &out) {
+            return Ok(Err(e));
+        }
+        return Ok(Ok(0));
+    }
+    if cmd32 == KBASE_IOCTL_GET_GPUPROPS {
+        let (gpu_id, cores, l2_kb, isolated) = with_step45_state(|state| {
+            let g = &state.pixel.gpu;
+            (
+                g.gpu_id,
+                u32::from(g.shader_cores),
+                u32::from(g.l2_cache_kb),
+                u32::from(g.iommu_isolated),
+            )
+        })?;
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&gpu_id.to_le_bytes());
+        out[4..8].copy_from_slice(&cores.to_le_bytes());
+        out[8..12].copy_from_slice(&l2_kb.to_le_bytes());
+        out[12..16].copy_from_slice(&isolated.to_le_bytes());
+        if let Err(e) = copy_to_user(arg, &out) {
+            return Ok(Err(e));
+        }
+        return Ok(Ok(0));
+    }
+    Ok(Err(Errno::ENOTTY))
 }
 
 fn handle_userfaultfd(flags: u64) -> Result<Result<i64, Errno>, ()> {

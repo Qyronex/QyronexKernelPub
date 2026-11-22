@@ -133,6 +133,24 @@ static int cmd_dumpsys(int argc, char **argv) {
         if (read_entire_file("/sys/bus/platform/drivers/google_pixel/status", buf, sizeof(buf)) >= 0) {
             printf("%s\n", buf);
         }
+        if (read_entire_file("/sys/bus/platform/drivers/google_pixel/hardware", buf, sizeof(buf)) >= 0) {
+            printf("%s\n", buf);
+        }
+    }
+    if (strcmp(topic, "all") == 0 || strcmp(topic, "ebpf") == 0) {
+        printf("=== ANDROID eBPF SUBSYSTEM (sys_bpf) ===\n");
+        if (read_entire_file("/sys/kernel/qyronex/android/bpf_stats", buf, sizeof(buf)) >= 0) {
+            printf("%s\n", buf);
+        }
+    }
+    if (strcmp(topic, "all") == 0 || strcmp(topic, "storage") == 0 || strcmp(topic, "verity") == 0) {
+        printf("=== DM-VERITY & STORAGE FILESYSTEMS (EROFS/F2FS/SUPER-LP/FUSE) ===\n");
+        if (read_entire_file("/sys/kernel/qyronex/android/dm_verity_status", buf, sizeof(buf)) >= 0) {
+            printf("%s\n", buf);
+        }
+        if (read_entire_file("/sys/kernel/qyronex/android/storage_fs_status", buf, sizeof(buf)) >= 0) {
+            printf("%s\n", buf);
+        }
     }
     if (strcmp(topic, "all") == 0 || strcmp(topic, "binder") == 0) {
         printf("=== ANDROID BINDER v8 STATS ===\n");
@@ -160,7 +178,7 @@ static int cmd_logcat(void) {
 
 static int cmd_selftest(void) {
     int passed = 0;
-    int total = 10;
+    int total = 15;
     char buf[2048];
 
     printf("\n============================================================\n");
@@ -178,7 +196,7 @@ static int cmd_selftest(void) {
             }
         }
     }
-    printf("[TEST 1/10] SELINUX_ENFORCING_LOCKDOWN ...... %s\n", ok1 ? "PASS" : "FAIL");
+    printf("[TEST 1/15] SELINUX_ENFORCING_LOCKDOWN ...... %s\n", ok1 ? "PASS" : "FAIL");
     passed += ok1;
 
     /* 2. Cross-Process Binder v8 IPC with servicemanager */
@@ -194,7 +212,7 @@ static int cmd_selftest(void) {
         }
         binder_client_close(&bc);
     }
-    printf("[TEST 2/10] BINDER_V8_IPC_SERVICEMANAGER .... %s\n", ok2 ? "PASS" : "FAIL");
+    printf("[TEST 2/15] BINDER_V8_IPC_SERVICEMANAGER .... %s\n", ok2 ? "PASS" : "FAIL");
     passed += ok2;
 
     /* 3. Ashmem mmap(MAP_SHARED) writeback + pin/unpin */
@@ -224,7 +242,7 @@ static int cmd_selftest(void) {
         }
         close(afd);
     }
-    printf("[TEST 3/10] ASHMEM_MMAP_PIN_ZERO_ON_FREE .... %s\n", ok3 ? "PASS" : "FAIL");
+    printf("[TEST 3/15] ASHMEM_MMAP_PIN_ZERO_ON_FREE .... %s\n", ok3 ? "PASS" : "FAIL");
     passed += ok3;
 
     /* 4. DMA-Heap /dev/dma_heap/system allocation */
@@ -246,7 +264,7 @@ static int cmd_selftest(void) {
         }
         close(dfd);
     }
-    printf("[TEST 4/10] DMA_HEAP_SYSTEM_ALLOC ........... %s\n", ok4 ? "PASS" : "FAIL");
+    printf("[TEST 4/15] DMA_HEAP_SYSTEM_ALLOC ........... %s\n", ok4 ? "PASS" : "FAIL");
     passed += ok4;
 
     /* 5. Immutable ro.* System Properties + Mutable Property Write */
@@ -263,7 +281,7 @@ static int cmd_selftest(void) {
             }
         }
     }
-    printf("[TEST 5/10] RO_PROPERTIES_IMMUTABLE ......... %s\n", ok5 ? "PASS" : "FAIL");
+    printf("[TEST 5/15] RO_PROPERTIES_IMMUTABLE ......... %s\n", ok5 ? "PASS" : "FAIL");
     passed += ok5;
 
     /* 6. Power Wakelocks & PSI */
@@ -276,7 +294,7 @@ static int cmd_selftest(void) {
         strstr(buf, "some avg10=") != NULL) {
         ok6 = 1;
     }
-    printf("[TEST 6/10] POWER_WAKELOCK_AND_PSI .......... %s\n", ok6 ? "PASS" : "FAIL");
+    printf("[TEST 6/15] POWER_WAKELOCK_AND_PSI .......... %s\n", ok6 ? "PASS" : "FAIL");
     passed += ok6;
 
     /* 7. GrapheneOS Hardening Status */
@@ -288,7 +306,7 @@ static int cmd_selftest(void) {
         strstr(buf, "zero_on_free=1") != NULL) {
         ok7 = 1;
     }
-    printf("[TEST 7/10] GRAPHENEOS_HARDENING_STATUS ..... %s\n", ok7 ? "PASS" : "FAIL");
+    printf("[TEST 7/15] GRAPHENEOS_HARDENING_STATUS ..... %s\n", ok7 ? "PASS" : "FAIL");
     passed += ok7;
 
     /* 8. Google Pixel Titan M2 + Shannon Modem IOMMU Telemetry */
@@ -299,7 +317,7 @@ static int cmd_selftest(void) {
         strstr(buf, "modem_iommu_sandbox=enforced") != NULL) {
         ok8 = 1;
     }
-    printf("[TEST 8/10] PIXEL_TITAN_M2_MODEM_IOMMU ...... %s\n", ok8 ? "PASS" : "FAIL");
+    printf("[TEST 8/15] PIXEL_TITAN_M2_MODEM_IOMMU ...... %s\n", ok8 ? "PASS" : "FAIL");
     passed += ok8;
 
     /* 9. Real Cross-Process Binder v8 FD Passing (`BINDER_TYPE_FD`) */
@@ -379,7 +397,7 @@ static int cmd_selftest(void) {
         }
         if (sfd >= 0) close(sfd);
     }
-    printf("[TEST 9/10] BINDER_FD_PASSING_CROSS_PROC .... %s\n", ok9 ? "PASS" : "FAIL");
+    printf("[TEST 9/15] BINDER_FD_PASSING_CROSS_PROC .... %s\n", ok9 ? "PASS" : "FAIL");
     passed += ok9;
 
     /* 10. binderfs BINDER_CTL_ADD + Android 15 ART userfaultfd + membarrier */
@@ -410,13 +428,237 @@ static int cmd_selftest(void) {
         if (mb > 0) mb_ok = 1;
         if (ctl_ok && uffd_ok && mb_ok) ok10 = 1;
     }
-    printf("[TEST 10/10] BINDERFS_USERFAULTFD_MEMBARRIER  %s\n", ok10 ? "PASS" : "FAIL");
+    printf("[TEST 10/15] BINDERFS_USERFAULTFD_MEMBARRIER  %s\n", ok10 ? "PASS" : "FAIL");
     passed += ok10;
+
+    /* 11. Real eBPF (`sys_bpf` 280): Hash Map + Verifier + 64-bit VM Execution + Reject Bad Loop */
+    int ok11 = 0;
+    {
+        uint8_t attr[128];
+        memset(attr, 0, sizeof(attr));
+        uint32_t mtype = 1, ksz = 4, vsz = 8, maxe = 16;
+        memcpy(attr + 0, &mtype, 4);
+        memcpy(attr + 4, &ksz, 4);
+        memcpy(attr + 8, &vsz, 4);
+        memcpy(attr + 12, &maxe, 4);
+        long mfd = syscall(280 /* SYS_bpf */, 0 /* BPF_MAP_CREATE */, attr, 64);
+        int map_ok = 0, prog_ok = 0, rej_ok = 0;
+        if (mfd >= 0) {
+            uint32_t k = 7;
+            uint64_t v = 0x1122334455667788ULL, vout = 0;
+            uint64_t kp = (uint64_t)(uintptr_t)&k, vp = (uint64_t)(uintptr_t)&v, vo = (uint64_t)(uintptr_t)&vout;
+            uint32_t mfd32 = (uint32_t)mfd;
+            memset(attr, 0, sizeof(attr));
+            memcpy(attr + 0, &mfd32, 4);
+            memcpy(attr + 8, &kp, 8);
+            memcpy(attr + 16, &vp, 8);
+            if (syscall(280, 2 /* BPF_MAP_UPDATE_ELEM */, attr, 64) == 0) {
+                memcpy(attr + 16, &vo, 8);
+                if (syscall(280, 1 /* BPF_MAP_LOOKUP_ELEM */, attr, 64) == 0 && vout == v) {
+                    map_ok = 1;
+                }
+            }
+            close((int)mfd);
+        }
+        /* Valid eBPF filter: LDX_B R0,[R1+0]; ADD64 R0,10; EXIT */
+        struct { uint8_t code; uint8_t regs; int16_t off; int32_t imm; } insns[3] = {
+            { 0x71, 0x10, 0, 0 },  /* BPF_LDX | BPF_B | BPF_MEM: dst=0, src=1 */
+            { 0x07, 0x00, 0, 10 }, /* BPF_ALU64 | BPF_ADD | BPF_K: dst=0, imm=10 */
+            { 0x95, 0x00, 0, 0 },  /* BPF_JMP | BPF_EXIT */
+        };
+        memset(attr, 0, sizeof(attr));
+        uint32_t ptype = 1, icnt = 3;
+        uint64_t iptr = (uint64_t)(uintptr_t)insns;
+        memcpy(attr + 0, &ptype, 4);
+        memcpy(attr + 4, &icnt, 4);
+        memcpy(attr + 8, &iptr, 8);
+        long pfd = syscall(280, 5 /* BPF_PROG_LOAD */, attr, 64);
+        if (pfd >= 0) {
+            uint8_t pkt[4] = { 32, 0, 0, 0 };
+            uint32_t pfd32 = (uint32_t)pfd, dsz = 4, retval = 0;
+            uint64_t dptr = (uint64_t)(uintptr_t)pkt;
+            memset(attr, 0, sizeof(attr));
+            memcpy(attr + 0, &pfd32, 4);
+            memcpy(attr + 8, &dsz, 4);
+            memcpy(attr + 16, &dptr, 8);
+            if (syscall(280, 10 /* BPF_PROG_TEST_RUN */, attr, 64) == 0) {
+                memcpy(&retval, attr + 4, 4);
+                if (retval == 42) prog_ok = 1;
+            }
+            close((int)pfd);
+        }
+        /* Malicious backward loop must be rejected by verifier with -EACCES */
+        struct { uint8_t code; uint8_t regs; int16_t off; int32_t imm; } bad[2] = {
+            { 0x05, 0x00, -1, 0 }, /* BPF_JMP | BPF_JA off=-1 */
+            { 0x95, 0x00, 0, 0 },
+        };
+        memset(attr, 0, sizeof(attr));
+        icnt = 2;
+        iptr = (uint64_t)(uintptr_t)bad;
+        memcpy(attr + 0, &ptype, 4);
+        memcpy(attr + 4, &icnt, 4);
+        memcpy(attr + 8, &iptr, 8);
+        errno = 0;
+        if (syscall(280, 5 /* BPF_PROG_LOAD */, attr, 64) < 0 && errno == EACCES) {
+            rej_ok = 1;
+        }
+        if (map_ok && prog_ok && rej_ok) ok11 = 1;
+    }
+    printf("[TEST 11/15] EBPF_SYS_BPF_VERIFY_AND_EXEC ... %s\n", ok11 ? "PASS" : "FAIL");
+    passed += ok11;
+
+    /* 12. Real `dm-verity` SHA-256 Merkle Verification & 1-Bit Tamper Fail-Closed (-EIO) */
+    int ok12 = 0;
+    {
+        int dmfd = open("/dev/mapper/control", O_RDWR | O_CLOEXEC);
+        if (dmfd >= 0) {
+            uint8_t ver[16] = {0};
+            uint32_t maj = 0, minv = 0;
+            int v_ok = (ioctl(dmfd, 0xC138FD00UL /* DM_VERSION */, ver) == 0);
+            memcpy(&maj, ver, 4);
+            memcpy(&minv, ver + 4, 4);
+            char blk[48] = "QYRONEX_ANDROID_15_VERITY_SYSTEM_BLOCK_0";
+            uint8_t req[64];
+            memset(req, 0, sizeof(req));
+            snprintf((char *)req, 32, "system-verity");
+            uint32_t bidx = 0, blen = 40;
+            uint64_t bptr = (uint64_t)(uintptr_t)blk;
+            memcpy(req + 32, &bidx, 4);
+            memcpy(req + 36, &blen, 4);
+            memcpy(req + 40, &bptr, 8);
+            int clean_ok = (ioctl(dmfd, 0xC040FD80UL /* QYRONEX_DM_VERITY_VERIFY_BLOCK */, req) == 0);
+            blk[5] ^= 0x01; /* 1-bit tamper! */
+            errno = 0;
+            int tamper_blocked = (ioctl(dmfd, 0xC040FD80UL, req) < 0 && errno == EIO);
+            if (v_ok && maj == 4 && minv == 48 && clean_ok && tamper_blocked) ok12 = 1;
+            close(dmfd);
+        }
+    }
+    printf("[TEST 12/15] DM_VERITY_MERKLE_FAIL_CLOSED ... %s\n", ok12 ? "PASS" : "FAIL");
+    passed += ok12;
+
+    /* 13. Real Kernel Validation of EROFS + F2FS + super.img LP_METADATA + /dev/fuse Handshake */
+    int ok13 = 0;
+    {
+        int erofs_ok = 0, f2fs_ok = 0, lp_ok = 0, fuse_ok = 0;
+        const char *probes[3] = {
+            "/vendor/etc/qyronex-fs/com.qyronex.android.erofs",
+            "/vendor/etc/qyronex-fs/userdata_probe.f2fs",
+            "/vendor/etc/qyronex-fs/super_lp_probe.img",
+        };
+        int *flags[3] = { &erofs_ok, &f2fs_ok, &lp_ok };
+        for (int i = 0; i < 3; i++) {
+            int pfd = open(probes[i], O_RDONLY | O_CLOEXEC);
+            if (pfd >= 0) {
+                static uint8_t imgbuf[20480];
+                ssize_t n = read(pfd, imgbuf, sizeof(imgbuf));
+                close(pfd);
+                if (n > 0) {
+                    int sfd = open("/sys/kernel/qyronex/android/storage_fs_status", O_WRONLY | O_CLOEXEC);
+                    if (sfd >= 0) {
+                        if (write(sfd, imgbuf, (size_t)n) == n) *flags[i] = 1;
+                        close(sfd);
+                    }
+                }
+            }
+        }
+        int ffd = open("/dev/fuse", O_RDWR | O_CLOEXEC);
+        if (ffd >= 0) {
+            uint8_t finit[64] = {0};
+            if (read(ffd, finit, sizeof(finit)) >= 56) {
+                uint32_t op = 0, fmaj = 0, fmin = 0;
+                memcpy(&op, finit + 4, 4);
+                memcpy(&fmaj, finit + 40, 4);
+                memcpy(&fmin, finit + 44, 4);
+                if (op == 26 && fmaj == 7 && fmin == 39) {
+                    uint8_t rep[32] = {0};
+                    uint32_t rlen = 32;
+                    uint64_t uniq = 1;
+                    memcpy(rep + 0, &rlen, 4);
+                    memcpy(rep + 8, &uniq, 8);
+                    memcpy(rep + 16, &fmaj, 4);
+                    memcpy(rep + 20, &fmin, 4);
+                    if (write(ffd, rep, sizeof(rep)) == (ssize_t)sizeof(rep)) fuse_ok = 1;
+                }
+            }
+            close(ffd);
+        }
+        if (erofs_ok && f2fs_ok && lp_ok && fuse_ok) ok13 = 1;
+    }
+    printf("[TEST 13/15] EROFS_F2FS_SUPER_LP_FUSE ....... %s\n", ok13 ? "PASS" : "FAIL");
+    passed += ok13;
+
+    /* 14. Google Pixel Mali-G715 CSF GPU + Edge TPU + Modem + Camera HAL */
+    int ok14 = 0;
+    {
+        int mfd = open("/dev/mali0", O_RDWR | O_CLOEXEC);
+        int mali_ok = 0, hw_ok = 0;
+        if (mfd >= 0) {
+            uint16_t ver[2] = {0, 0};
+            uint32_t props[4] = {0, 0, 0, 0};
+            if (ioctl(mfd, 0xC0048000UL /* KBASE_IOCTL_VERSION_CHECK */, ver) == 0 &&
+                ioctl(mfd, 0xC0108003UL /* KBASE_IOCTL_GET_GPUPROPS */, props) == 0 &&
+                ver[0] == 1 && props[0] != 0 && props[3] == 1) {
+                mali_ok = 1;
+            }
+            close(mfd);
+        }
+        if (read_entire_file("/sys/bus/platform/drivers/google_pixel/hardware", buf, sizeof(buf)) > 0 &&
+            strstr(buf, "gpu_iommu=enforced") != NULL &&
+            strstr(buf, "edge_tpu_iommu=enforced") != NULL &&
+            strstr(buf, "vendor_boot_v4=supported") != NULL &&
+            access("/dev/edgetpu", F_OK) == 0 &&
+            access("/dev/umts_ipc0", F_OK) == 0) {
+            hw_ok = 1;
+        }
+        if (mali_ok && hw_ok) ok14 = 1;
+    }
+    printf("[TEST 14/15] PIXEL_MALI_GPU_EDGETPU_HAL ..... %s\n", ok14 ? "PASS" : "FAIL");
+    passed += ok14;
+
+    /* 15. Real Android APK/DEX Dalvik VM (`pm install` + `am start` -> `qyronex-art`) */
+    int ok15 = 0;
+    {
+        if (access("/system/app/GrapheneWelcome.apk", R_OK) == 0 &&
+            access("/system/bin/pm", X_OK) == 0 &&
+            access("/system/bin/am", X_OK) == 0) {
+            pid_t p1 = fork();
+            if (p1 == 0) {
+                int nfd = open("/dev/null", O_WRONLY);
+                if (nfd >= 0) { dup2(nfd, 1); dup2(nfd, 2); close(nfd); }
+                execl("/system/bin/pm", "pm", "install", "/system/app/GrapheneWelcome.apk", (char *)NULL);
+                _exit(127);
+            }
+            int st1 = 1;
+            if (p1 > 0) (void)waitpid(p1, &st1, 0);
+
+            pid_t p2 = fork();
+            if (p2 == 0) {
+                int nfd = open("/dev/null", O_WRONLY);
+                if (nfd >= 0) { dup2(nfd, 1); dup2(nfd, 2); close(nfd); }
+                execl("/system/bin/am", "am", "start", "-n",
+                      "org.grapheneos.welcome/org.grapheneos.welcome.MainActivity", (char *)NULL);
+                _exit(127);
+            }
+            int st2 = 1;
+            if (p2 > 0) (void)waitpid(p2, &st2, 0);
+
+            if (WIFEXITED(st1) && WEXITSTATUS(st1) == 0 &&
+                WIFEXITED(st2) && WEXITSTATUS(st2) == 0 &&
+                read_entire_file("/run/user/0/qyronex-activity.txt", buf, sizeof(buf)) > 0 &&
+                strstr(buf, "PACKAGE=org.grapheneos.welcome") != NULL &&
+                strstr(buf, "Dalvik VM Computed Score = 15") != NULL) {
+                ok15 = 1;
+            }
+        }
+    }
+    printf("[TEST 15/15] APK_DEX_DALVIK_VM_PM_AM_EXEC ... %s\n", ok15 ? "PASS" : "FAIL");
+    passed += ok15;
 
     printf("------------------------------------------------------------\n");
     if (passed == total) {
         printf("QYRONEX_ANDROID_SELFTEST: ALL %d/%d PASSED\n", passed, total);
-        android_log_write("I/QyronexSelftest: ALL 10/10 Android 15 / GrapheneOS kernel checks PASSED");
+        android_log_write("I/QyronexSelftest: ALL 15/15 Android 15 / GrapheneOS / APK-DEX checks PASSED");
         return 0;
     } else {
         printf("QYRONEX_ANDROID_SELFTEST: FAILED (%d/%d passed)\n", passed, total);
@@ -437,7 +679,7 @@ static pid_t spawn_daemon(const char *path) {
 static int cmd_android_init(void) {
     printf("\n");
     printf("===================================================================\n");
-    printf("  Qyronex OS - Android 15 / GrapheneOS Native Kernel Edition v0.5.0\n");
+    printf("  Qyronex OS - Android 15 / GrapheneOS Native Kernel Edition v0.6.0\n");
     printf("  Target: Google Pixel (Tensor G1-G4) & QEMU AArch64 Emulator\n");
     printf("===================================================================\n");
     fflush(stdout);

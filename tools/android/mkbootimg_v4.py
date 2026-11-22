@@ -8,9 +8,11 @@ import sys
 from pathlib import Path
 
 BOOT_MAGIC = b"ANDROID!"
+VENDOR_BOOT_MAGIC = b"VNDRBOOT"
 PAGE_SIZE = 4096
 BOOT_HEADER_VERSION_4 = 4
 BOOT_HEADER_SIZE_V4 = 1580
+VENDOR_BOOT_HEADER_SIZE_V4 = 2128
 
 
 def pack_os_version(major: int, minor: int, patch: int, year: int, month: int) -> int:
@@ -90,17 +92,67 @@ def verify_boot_img_v4(img_path: Path) -> None:
     print(f"  cmdline: {cmdline}")
 
 
+def build_vendor_boot_v4(ramdisk_path: Path, cmdline: str, bootconfig: str, out_path: Path) -> None:
+    vramdisk = ramdisk_path.read_bytes()
+    bc_bytes = bootconfig.encode("utf-8")
+    # Minimal FDT header stub (valid DTB magic 0xd00dfeed) for vendor_boot v4 compliance
+    dtb = struct.pack(">IIIIIIIIII", 0xD00DFEED, 64, 48, 56, 40, 17, 16, 0, 0, 8) + b"\x00" * 24
+    # 1 vendor ramdisk table entry (108 bytes)
+    vramdisk_table = struct.pack("<III", len(vramdisk), 0, 1) + b"qyronex-vendor-dlkm".ljust(32, b"\x00") + b"\x00" * 64
+    assert len(vramdisk_table) == 108
+
+    hdr = bytearray(PAGE_SIZE)
+    hdr[0:8] = VENDOR_BOOT_MAGIC
+    struct.pack_into("<IIIII", hdr, 8, 4, PAGE_SIZE, 0x00008000, 0x01000000, len(vramdisk))
+    cb = cmdline.encode("utf-8")[:2047]
+    hdr[28 : 28 + len(cb)] = cb
+    struct.pack_into("<I", hdr, 2076, 0x00000100)  # tags_addr
+    hdr[2080:2094] = b"qyronex_vendor"
+    struct.pack_into(
+        "<IIQIIII",
+        hdr,
+        2096,
+        VENDOR_BOOT_HEADER_SIZE_V4,
+        len(dtb),
+        0x01F00000,
+        len(vramdisk_table),
+        1,
+        108,
+        len(bc_bytes),
+    )
+
+    image = bytes(hdr) + align_page(vramdisk) + align_page(dtb) + align_page(vramdisk_table) + align_page(bc_bytes)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(image)
+    if image[:8] != VENDOR_BOOT_MAGIC or struct.unpack_from("<I", image, 2096)[0] != VENDOR_BOOT_HEADER_SIZE_V4:
+        sys.exit("ERROR: vendor_boot v4 verification failed")
+    print(
+        f"VERIFIED Vendor Boot Image v4: {out_path} ({len(image)} bytes, magic=VNDRBOOT v4 "
+        f"hdr={VENDOR_BOOT_HEADER_SIZE_V4}B ramdisk={len(vramdisk)}B dtb={len(dtb)}B bootconfig={len(bc_bytes)}B)"
+    )
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="Build/verify AOSP Boot Image v4 for Qyronex Pixel")
+    p = argparse.ArgumentParser(description="Build/verify AOSP Boot & Vendor Boot Image v4 for Qyronex Pixel")
     p.add_argument("--kernel", type=Path)
     p.add_argument("--ramdisk", type=Path)
+    p.add_argument("--vendor-boot", action="store_true", help="Build AOSP VNDRBOOT v4 vendor_boot.img")
     p.add_argument(
         "--cmdline",
         default="console=ttyAMA0 androidboot.hardware=zumapro androidboot.selinux=enforcing androidboot.verifiedbootstate=green",
     )
+    p.add_argument(
+        "--bootconfig",
+        default="androidboot.hardware=zumapro\nandroidboot.dynamic_partitions=true\nandroidboot.selinux=enforcing\nandroidboot.dm_verity=enforcing\n",
+    )
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--verify-only", action="store_true")
     args = p.parse_args()
+    if args.vendor_boot:
+        if not args.ramdisk:
+            sys.exit("ERROR: --ramdisk is required for --vendor-boot")
+        build_vendor_boot_v4(args.ramdisk, args.cmdline, args.bootconfig, args.out)
+        return
     if args.verify_only:
         verify_boot_img_v4(args.out)
         return

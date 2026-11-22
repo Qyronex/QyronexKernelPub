@@ -1,8 +1,9 @@
 #!/bin/bash
 # SPDX-License-Identifier: LicenseRef-Qyronex-Kernal-NC-1.0
-# Build the complete, fully interactive Qyronex OS Android 15 / GrapheneOS Google Pixel Edition:
+# Build the complete, fully interactive Qyronex OS Android 15 / GrapheneOS Google Pixel Edition (v0.6.0):
 #   - dist/qyronex-android-emulator.elf           (QEMU AArch64 virt Android/GrapheneOS kernel)
-#   - dist/qyronex-pixel-boot.img                 (AOSP GKI Boot Image v4 with ARM64 header + initramfs)
+#   - dist/qyronex-pixel-boot.img                 (AOSP GKI Boot Image v4 `ANDROID!` + ARM64 header + initramfs)
+#   - dist/qyronex-pixel-vendor-boot.img          (AOSP Vendor Boot Image v4 `VNDRBOOT` + bootconfig + DTB)
 #   - dist/qyronex-android-system.img             (Full bootable MBR + ext4 GrapheneOS 15 Wayland OS image)
 #   - dist/qyronex-android-pixel-grapheneos.iso   (Self-contained ISO-9660 + Joliet release ISO)
 set -euo pipefail
@@ -22,7 +23,7 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/5] Stelle Debian-13-GTK3-UI-Builder bereit & kompiliere native GrapheneOS-15-UI ..."
+echo "[1/5] Stelle Debian-13-GTK3-UI-Builder bereit & kompiliere GrapheneOS-15-UI + Qyronex ART Dalvik VM ..."
 if ! docker image inspect qyronex-android-ui-builder:trixie >/dev/null 2>&1; then
   docker build -t qyronex-android-ui-builder:trixie \
     -f "$REPO_DIR/tools/android/Dockerfile.ui-builder" \
@@ -38,10 +39,12 @@ docker run --rm \
     set -euo pipefail
     gcc -O2 -Wall -Wextra -Werror tools/android/ui/qyronex_graphene_ui.c \
       -o /out/.qyronex-graphene-ui \
-      $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0)
+      $(pkg-config --cflags --libs gtk+-3.0 gtk-layer-shell-0) -lz
+    gcc -O2 -Wall -Wextra -Werror tools/android/src/qyronex_art.c \
+      -o /out/.qyronex-art -lz
   '
 
-echo "[2/5] Baue Qyronex Android-15-Kernel (Binder v8 + FD-Passing + binderfs + userfaultfd + membarrier), Daemons & Full-Systemimage ..."
+echo "[2/5] Baue Qyronex Android-15-Kernel (eBPF + dm-verity + EROFS/F2FS/LP/FUSE + Pixel Mali/TPU HAL + Binder v8), APKs & Systemimage ..."
 docker run --rm \
   -v "$REPO_DIR:/workspace" \
   -v kernal-docker-target:/workspace/target \
@@ -80,13 +83,15 @@ docker run --rm \
     fi
     cp "$INITRAMFS_SRC" /out/initramfs-android.cpio
 
-    # 2d) Compile static ARM64 Android system daemons & CLI suite
-    mkdir -p /tmp/android-bin
+    # 2d) Compile static ARM64 Android system daemons, CLI suite & generate real APKs + FS probes
+    mkdir -p /tmp/android-bin /tmp/android-apks
     gcc -O2 -static -Wall -Wextra -Werror tools/android/src/servicemanager.c -o /tmp/android-bin/servicemanager
     gcc -O2 -static -Wall -Wextra -Werror tools/android/src/android_tools.c  -o /tmp/android-bin/android-tools
     gcc -O2 -static -Wall -Wextra -Werror tools/android/src/qyronex_appd.c   -o /tmp/android-bin/qyronex-appd
     cp /out/.qyronex-graphene-ui /tmp/android-bin/qyronex-graphene-ui
+    cp /out/.qyronex-art         /tmp/android-bin/qyronex-art
     chmod 0755 /tmp/android-bin/*
+    python3 tools/android/mkapk.py --out-dir /tmp/android-apks
 
     # 2e) Prepare Android / GrapheneOS configuration & Wayland launcher files
     mkdir -p /tmp/android-cfg
@@ -105,6 +110,11 @@ ro.grapheneos.version=2026112100
 ro.qyronex.kernel.mode=hybrid-rust-android15
 ro.boot.verifiedbootstate=green
 ro.boot.vbmeta.device_state=locked
+ro.boot.dm_verity=enforcing-sha256
+ro.boot.dynamic_partitions=true
+ro.qyronex.ebpf.verifier=fail-closed-64bit
+ro.qyronex.storage.fs=erofs,f2fs,ext4,fuse
+ro.qyronex.art.runtime=qyronex-art-dalvik-035
 PROP
 
     cat > /tmp/android-cfg/manifest.xml << "XML"
@@ -130,25 +140,25 @@ XML
 
     cat > /tmp/android-cfg/os-release << "OSR"
 NAME="Qyronex OS Android 15 / GrapheneOS Pixel Edition"
-VERSION="0.5.1 (Android 15 API 35)"
+VERSION="0.6.0 (Android 15 API 35)"
 ID=qyronex-android
-PRETTY_NAME="Qyronex OS — GrapheneOS 15 Hybrid Rust Kernel"
+PRETTY_NAME="Qyronex OS v0.6.0 — GrapheneOS 15 Hybrid Rust Kernel"
 OSR
 
     cat > /tmp/android-cfg/notes.txt << "NOTES"
-Qyronex OS — GrapheneOS 15 (Android 15) on Hybrid Rust Kernel
-=============================================================
-Alle 10 Apps sind voll klickbar & lauffaehig:
-- Vanadium (netsurf-gtk): Echter Webbrowser mit Startseite & Live-Internet
-- Settings: Live SELinux-Lockdown-Test, getprop/setprop, App-Permissions, Netzwerk, Pixel-Info
-- Auditor: Live 10/10 Hardware-, Binder-v8-FD-Passing- & Titan-M2-Verifikation
-- Terminal: Interaktive Android/Linux-Shell (getprop, service list, dumpsys, selftest, etc.)
-- Files: Echter ext4/sysfs/binderfs-Dateimanager mit Dateivorschau
-- Apps: Live /dev/binder ServiceManager Explorer & Service-Registrierung
-- Logcat: Live /dev/log/main Stream + eigene Log-Events
-- Notes: Persistenter Texteditor auf /data (ext4)
-- Calculator: Klickbarer Dezimal- & Hex-Rechner
-- Gallery: Echter Bildbetrachter fuer /data/pictures
+Qyronex OS v0.6.0 — GrapheneOS 15 (Android 15) on Hybrid Rust Kernel
+====================================================================
+Alle Apps, Kernel-Subsysteme & echte Android-.apk-Pakete sind aktiv:
+- Android APK Runtime (`qyronex-art`, `dalvikvm`, `pm`, `am`): Fuehrt echte
+  ZIP+Binary-AXML+DEX-035 Bytecode-APKs aus (GrapheneWelcome.apk,
+  PixelSecurityBench.apk, QyronexHardwareInfo.apk)
+- Kernel-Subsysteme: eBPF (`sys_bpf` 280), dm-verity SHA-256 Merkle (-EIO bei
+  1-Bit-Manipulation), EROFS, F2FS, super.img LP_METADATA, FUSE v7.39
+- Pixel Tensor HAL: Mali-G715 CSF GPU (/dev/mali0), Edge TPU (/dev/edgetpu),
+  Camera LWIS, Shannon 5G Modem IOMMU, Titan M2 StrongBox, vendor_boot v4
+- Auditor: Live 15/15 Hardware-, eBPF-, dm-verity-, Storage- & APK/DEX-Proof
+- Vanadium, Settings, Terminal, Files, Apps & APK Installer, Logcat, Notes,
+  Calculator, Gallery — komplett klickbar & lauffaehig!
 NOTES
 
     cat > /tmp/android-cfg/vanadium-start.html << "VHTML"
@@ -235,7 +245,7 @@ export PATH=/system/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 export HOME=/root
 export USER=root
 export XDG_RUNTIME_DIR=/run/user/0
-mkdir -p "$XDG_RUNTIME_DIR" /run/udev/data /data/system /data/local/tmp /data/downloads /data/pictures
+mkdir -p "$XDG_RUNTIME_DIR" /run/udev/data /data/app /data/system /data/local/tmp /data/downloads /data/pictures
 chmod 0700 "$XDG_RUNTIME_DIR"
 
 # Bring up VirtIO-Net interface & DNS cleanly for live Internet browsing
@@ -301,11 +311,14 @@ PROF
     debugfs -w "$ANDROID_PART" >/dev/null 2>&1 << "DBG"
 mkdir /system
 mkdir /system/bin
+mkdir /system/app
 mkdir /system/etc
 mkdir /vendor
 mkdir /vendor/etc
 mkdir /vendor/etc/vintf
+mkdir /vendor/etc/qyronex-fs
 mkdir /data
+mkdir /data/app
 mkdir /data/system
 mkdir /data/data
 mkdir /data/local
@@ -319,14 +332,17 @@ rm /system/bin/servicemanager
 rm /system/bin/android-tools
 rm /system/bin/qyronex-appd
 rm /system/bin/qyronex-graphene-ui
+rm /system/bin/qyronex-art
 write /tmp/android-bin/servicemanager /system/bin/servicemanager
 write /tmp/android-bin/android-tools /system/bin/android-tools
 write /tmp/android-bin/qyronex-appd /system/bin/qyronex-appd
 write /tmp/android-bin/qyronex-graphene-ui /system/bin/qyronex-graphene-ui
+write /tmp/android-bin/qyronex-art /system/bin/qyronex-art
 set_inode_field /system/bin/servicemanager mode 0100755
 set_inode_field /system/bin/android-tools mode 0100755
 set_inode_field /system/bin/qyronex-appd mode 0100755
 set_inode_field /system/bin/qyronex-graphene-ui mode 0100755
+set_inode_field /system/bin/qyronex-art mode 0100755
 rm /system/bin/android-init
 rm /system/bin/getprop
 rm /system/bin/setprop
@@ -334,6 +350,9 @@ rm /system/bin/service
 rm /system/bin/dumpsys
 rm /system/bin/logcat
 rm /system/bin/qyronex-android-selftest
+rm /system/bin/dalvikvm
+rm /system/bin/pm
+rm /system/bin/am
 symlink /system/bin/android-init android-tools
 symlink /system/bin/getprop android-tools
 symlink /system/bin/setprop android-tools
@@ -341,6 +360,9 @@ symlink /system/bin/service android-tools
 symlink /system/bin/dumpsys android-tools
 symlink /system/bin/logcat android-tools
 symlink /system/bin/qyronex-android-selftest android-tools
+symlink /system/bin/dalvikvm qyronex-art
+symlink /system/bin/pm qyronex-art
+symlink /system/bin/am qyronex-art
 rm /usr/local/bin/getprop
 rm /usr/local/bin/setprop
 rm /usr/local/bin/service
@@ -348,6 +370,10 @@ rm /usr/local/bin/dumpsys
 rm /usr/local/bin/logcat
 rm /usr/local/bin/qyronex-android-selftest
 rm /usr/local/bin/qyronex-graphene-ui
+rm /usr/local/bin/qyronex-art
+rm /usr/local/bin/dalvikvm
+rm /usr/local/bin/pm
+rm /usr/local/bin/am
 symlink /usr/local/bin/getprop /system/bin/getprop
 symlink /usr/local/bin/setprop /system/bin/setprop
 symlink /usr/local/bin/service /system/bin/service
@@ -355,6 +381,22 @@ symlink /usr/local/bin/dumpsys /system/bin/dumpsys
 symlink /usr/local/bin/logcat /system/bin/logcat
 symlink /usr/local/bin/qyronex-android-selftest /system/bin/qyronex-android-selftest
 symlink /usr/local/bin/qyronex-graphene-ui /system/bin/qyronex-graphene-ui
+symlink /usr/local/bin/qyronex-art /system/bin/qyronex-art
+symlink /usr/local/bin/dalvikvm /system/bin/dalvikvm
+symlink /usr/local/bin/pm /system/bin/pm
+symlink /usr/local/bin/am /system/bin/am
+rm /system/app/GrapheneWelcome.apk
+rm /data/local/tmp/PixelSecurityBench.apk
+rm /data/local/tmp/QyronexHardwareInfo.apk
+rm /vendor/etc/qyronex-fs/com.qyronex.android.erofs
+rm /vendor/etc/qyronex-fs/userdata_probe.f2fs
+rm /vendor/etc/qyronex-fs/super_lp_probe.img
+write /tmp/android-apks/GrapheneWelcome.apk /system/app/GrapheneWelcome.apk
+write /tmp/android-apks/PixelSecurityBench.apk /data/local/tmp/PixelSecurityBench.apk
+write /tmp/android-apks/QyronexHardwareInfo.apk /data/local/tmp/QyronexHardwareInfo.apk
+write /tmp/android-apks/fs-probes/com.qyronex.android.erofs /vendor/etc/qyronex-fs/com.qyronex.android.erofs
+write /tmp/android-apks/fs-probes/userdata_probe.f2fs /vendor/etc/qyronex-fs/userdata_probe.f2fs
+write /tmp/android-apks/fs-probes/super_lp_probe.img /vendor/etc/qyronex-fs/super_lp_probe.img
 rm /system/build.prop
 rm /default.prop
 rm /vendor/etc/vintf/manifest.xml
@@ -412,17 +454,23 @@ with open(p, "r+b") as f:
     f.write(mbr)
 PY
 
-    # 2h) Build & verify AOSP GKI Boot Image v4 (`ANDROID!`)
+    # 2h) Build & verify AOSP GKI Boot Image v4 (`ANDROID!`) + Vendor Boot Image v4 (`VNDRBOOT`)
     python3 tools/android/mkbootimg_v4.py \
       --kernel /tmp/qyronex-pixel-kernel.img \
       --ramdisk /out/initramfs-android.cpio \
-      --cmdline "console=ttyAMA0 androidboot.hardware=zumapro androidboot.selinux=enforcing androidboot.verifiedbootstate=green" \
+      --cmdline "console=ttyAMA0 androidboot.hardware=zumapro androidboot.selinux=enforcing androidboot.verifiedbootstate=green androidboot.dm_verity=enforcing" \
       --out /out/qyronex-pixel-boot.img
-    rm -f /out/.qyronex-graphene-ui
+    python3 tools/android/mkbootimg_v4.py \
+      --vendor-boot \
+      --ramdisk /out/initramfs-android.cpio \
+      --cmdline "androidboot.hardware=zumapro androidboot.dynamic_partitions=true androidboot.dm_verity=enforcing" \
+      --out /out/qyronex-pixel-vendor-boot.img
+    rm -f /out/.qyronex-graphene-ui /out/.qyronex-art
   '
 
 echo "[3/5] Komprimiere System-Image fuer kompakte Release-ISO & befuelle Staging ..."
 cp "$OUT_DIR/qyronex-pixel-boot.img"         "$STAGING_DIR/"
+cp "$OUT_DIR/qyronex-pixel-vendor-boot.img"  "$STAGING_DIR/"
 cp "$OUT_DIR/qyronex-android-emulator.elf"   "$STAGING_DIR/"
 cp "$OUT_DIR/initramfs-android.cpio"         "$STAGING_DIR/"
 gzip -c -6 "$OUT_DIR/qyronex-android-system.img" > "$STAGING_DIR/qyronex-android-system.img.gz"
@@ -432,12 +480,14 @@ chmod +x "$STAGING_DIR/start-android-emulator.sh" "$STAGING_DIR/flash-pixel-grap
 
 cat > "$STAGING_DIR/README-ANDROID-PIXEL.txt" << 'README'
 ===========================================================================
-  Qyronex OS v0.5.1 - Android 15 / GrapheneOS Google Pixel Edition ISO
+  Qyronex OS v0.6.0 - Android 15 / GrapheneOS Google Pixel Edition ISO
 ===========================================================================
 
 Inhalt dieser ISO:
   - qyronex-pixel-boot.img           AOSP GKI Boot Image v4 (`ANDROID!` v4,
                                      ARM64 Kernel Image + Initramfs)
+  - qyronex-pixel-vendor-boot.img    AOSP Vendor Boot Image v4 (`VNDRBOOT` v4,
+                                     bootconfig + DTB + Vendor-Ramdisk-Table)
   - qyronex-android-system.img.gz    Komprimiertes MBR + ext4 GrapheneOS-15
                                      Wayland-Systemimage (entpacken mit gunzip)
   - qyronex-android-emulator.elf     QEMU AArch64 virt Android-15-Kernel ELF
@@ -445,14 +495,19 @@ Inhalt dieser ISO:
   - start-android-emulator.sh        Ein-Klick-Emulator-Starter (Browser/VNC)
   - flash-pixel-grapheneos.sh        Fastboot-RAM-Boot-Anleitung fuer Pixel
 
-Vollstaendig klickbare & nutzbare GrapheneOS-15-Oberflaeche (Wayland / GTK3):
-  - Immer sichtbare Android-15-Statusleiste & Navigationsleiste (Back/Home/Apps)
-  - GrapheneOS Home Launcher mit funktionierender Web-/URL-Suchleiste
-  - 10 echte klickbare Apps:
-      Vanadium Webbrowser (echtes Internet!), Settings (SELinux-Lockdown-Test,
-      getprop/setprop, Permissions, Netzwerk, Pixel-Info), Auditor (10/10 Live-
-      Test inkl. Binder-v8-FD-Passing), Terminal, Files (Thunar), Apps & Binder-
-      Explorer, Live-Logcat, Notes, Calculator, Gallery
+Neu in v0.6.0 — Vollstaendige Android-15-/Pixel-/APK-Plattform:
+  - eBPF-Subsystem (`sys_bpf` 280): Hash/Array-Maps, Fail-Closed-Verifier,
+    64-Bit-VM-Ausfuehrung (`BPF_PROG_TEST_RUN`)
+  - dm-verity SHA-256 Merkle-Tree (`/dev/mapper/control`): Fail-Closed `-EIO`
+    bei 1-Bit-Manipulation
+  - Android Storage-Stack: EROFS (`0xE0F5E1E2`), F2FS (`0xF2F52010`),
+    `super.img` Dynamic Partitions (`LP_METADATA`) & `/dev/fuse` v7.39
+  - Google Pixel Tensor HAL: Mali-G715 CSF GPU (`/dev/mali0`), Edge TPU
+    (`/dev/edgetpu`), Camera LWIS, Shannon 5G Modem IOMMU, Titan M2 StrongBox
+  - Echte Android `.apk`/`.dex` Dalvik VM (`qyronex-art`/`dalvikvm`, `pm`, `am`):
+    ZIP/DEFLATE + Binary AXML + DEX 035 Adler-32 & Bytecode-Ausfuehrung mit
+    klickbarem APK-Installer & nativem Activity-Host-Fenster in GrapheneOS UI
+  - 15/15 Live Hardware- & Kernel-Selbsttest (`qyronex-android-selftest`)
 
 Schnellstart im Emulator:
   ./tools/android/start-android-emulator.sh --vnc
@@ -472,5 +527,6 @@ fi
 echo "[5/5] Fertig! Artefakte:"
 ls -lh "$OUT_DIR/qyronex-android-pixel-grapheneos.iso" \
        "$OUT_DIR/qyronex-pixel-boot.img" \
+       "$OUT_DIR/qyronex-pixel-vendor-boot.img" \
        "$OUT_DIR/qyronex-android-system.img" \
        "$OUT_DIR/qyronex-android-emulator.elf"

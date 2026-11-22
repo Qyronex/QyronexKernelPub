@@ -11,14 +11,18 @@ cat <<'EOF'
   Qyronex OS - Google Pixel / GrapheneOS Boot Image v4 Helper
 ===========================================================================
 WICHTIGER HINWEIS ZU PHYSISCHER PIXEL-HARDWARE:
-  - Dieses `qyronex-pixel-boot.img` ist ein echtes AOSP GKI Boot Image v4
-    (`ANDROID!` Header v4, ARM64 Image-Header, Android-15-Initramfs).
+  - Dieses Paket enthaelt sowohl `qyronex-pixel-boot.img` (AOSP GKI Boot Image v4,
+    `ANDROID!` Header v4) als auch `qyronex-pixel-vendor-boot.img` (`VNDRBOOT` v4
+    mit bootconfig, DTB & Vendor-Ramdisk-Table).
   - Der sichere Test auf einem entsperrten Google Pixel (Pixel 6/7/8/9)
     erfolgt NICHT-DESTRUKTIV im RAM per `fastboot boot`:
       fastboot boot qyronex-pixel-boot.img
-  - Fuer ein vollstaendiges Daily-Driver-GrapheneOS (ART/Java system_server,
-    proprietaere Google Tensor vendor_boot / vendor_dlkm / Mali GPU /
-    Shannon-Modem-Firmware) sind zusaetzliche Pixel-Vendor-Treiber noetig.
+  - Hinweis zu proprietaeren Blobs: Die Open-Source-HALs fuer Mali-G715 CSF GPU,
+    Tensor Edge TPU, Camera LWIS, Shannon 5G Modem IOMMU, eBPF, dm-verity, EROFS/F2FS
+    und die Qyronex-ART-Dalvik-VM (`pm`/`am`) sind enthalten. Signierte, proprietaere
+    Google/ARM/Samsung-Binaerfirmwares und das komplette AOSP-Java-`system_server`
+    muessen fuer Stock-Pixel-Factory-Images separat aus dem Factory-Image extrahiert
+    werden.
   - Teste das System daher IMMER zuerst im Qyronex Android-Emulator:
       ./start-android-emulator.sh
 ===========================================================================
